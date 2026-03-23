@@ -306,6 +306,25 @@ async function initQflush(options = {}) {
  * @returns {Promise<object>} Result of the flow
  */
 async function runQflushFlow(flow, payload) {
+  const remoteUrl = process.env.QFLUSH_REMOTE_URL;
+  if (remoteUrl) {
+    // Use remote qflush service
+    try {
+      const response = await fetch(`${remoteUrl}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ flow, payload })
+      });
+      if (!response.ok) {
+        throw new Error(`Remote qflush error: ${response.status} ${response.statusText}`);
+      }
+      return await response.json();
+    } catch (e) {
+      console.error('[QFLUSH] Remote call failed:', e.message);
+      throw e;
+    }
+  }
+
   // Try Node module first
   try {
     const qflush = require('@funeste38/qflush');

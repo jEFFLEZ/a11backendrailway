@@ -45,6 +45,9 @@ const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
 
+// Set remote qflush URL for production
+process.env.QFLUSH_REMOTE_URL = 'https://qflush-production.up.railway.app';
+
 // -------------------
 
 // --- Compilation automatique de openai.ts ---
@@ -219,7 +222,7 @@ function saveMemo(type, data) {
     fsMem.writeFileSync(memoFile, JSON.stringify(entry, null, 2), 'utf8');
 
     // Index JSONL (append)
-    fsMem.appendFileSync(A11_MEMO_INDEX, JSON.stringify(entry) + '\n', 'utf8');
+    fsMem.appendFileSync(ALL_MEMO_INDEX, JSON.stringify(entry) + '\n', 'utf8');
 
     return entry;
   } catch (e) {

@@ -64,6 +64,7 @@
     "@funeste38/envaptex": "latest",
     "@funeste38/freeland": "latest",
     "@funeste38/nezlephant": "latest",
+    "@funeste38/qflush": "^3.1.7",
     "@funeste38/rome": "latest",
     "csv-stringify": "^6.6.0",
     "js-yaml": "^4.1.0",
