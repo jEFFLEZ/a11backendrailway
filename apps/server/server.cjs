@@ -462,120 +462,49 @@ try {
   console.warn('[A11] Could not initialize /legacy static middleware for web public:', e && e.message);
 }
 
-// Ajout des routes /healthz et / (404)
+// Ajout des routes /healthz et /
 app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now() }));
-app.get('/', (_req, res) => res.status(404).json({ ok: false, error: 'not_found' }));
+app.get('/', (_req, res) => res.status(200).json({ ok: true, service: 'a11-api' }));
 
-// Explicit route to support legacy OpenAI-style completions endpoint
-app.all('/v1/chat/completions', async (req, res) => {
-  // Only POST is supported
-  if (req.method === 'GET' || req.method === 'HEAD') {
-    return res.status(405).json({ ok: false, error: 'method_not_allowed', allowed: 'POST' });
+function getOpenAICompletionsUrl() {
+  const base = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+  return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+}
+
+function buildOpenAIProxyHeaders(reqHeaders) {
+  const headers = Object.assign({}, reqHeaders || {});
+  delete headers.host;
+  headers['content-type'] = 'application/json';
+  if (!headers.authorization && process.env.OPENAI_API_KEY) {
+    headers.authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
   }
+  return headers;
+}
 
-  if (!DEFAULT_UPSTREAM) {
-    return res.status(502).json({ ok: false, error: 'no_upstream_configured' });
-  }
+async function proxyChatToOpenAI(req, res) {
+  const upstreamUrl = getOpenAICompletionsUrl();
+  console.log('[A11] Proxying chat ->', upstreamUrl);
 
-  // Prefer a local LLM router (Cerbère) if available on 4545 for dev setups
-  let resolvedUpstream = DEFAULT_UPSTREAM;
   try {
-    // If LLM_ROUTER_URL env is set, prefer it (DEFAULT_UPSTREAM already handles that),
-    // otherwise probe the common dev router port 4545 (Cerbère).
-    if (!process.env.LLM_ROUTER_URL) {
-      const probeUrl = 'http://127.0.0.1:4545/api/stats';
-      const controller = new AbortController();
-      const id = setTimeout(() => controller.abort(), 800);
-      try {
-        const p = await fetch(probeUrl, { method: 'GET', signal: controller.signal });
-        clearTimeout(id);
-        if (p && p.ok) {
-          resolvedUpstream = 'http://127.0.0.1:4545';
-          console.log('[A11] Detected local LLM router at 127.0.0.1:4545, using it as upstream for /v1/chat/completions');
-        }
-      } catch (e) {
-        // ignore probe errors, keep DEFAULT_UPSTREAM
-      }
-    }
-  } catch (e) { /* ignore */ }
-
-  const upstreamUrl = (String(resolvedUpstream).replace(/\/$/, '')) + '/v1/chat/completions';
-  try {
-    const forwardHeaders = Object.assign({}, req.headers);
-    // Remove host header to avoid conflicts
-    delete forwardHeaders.host;
-
     const upstreamRes = await axios({
       method: 'post',
       url: upstreamUrl,
-      headers: forwardHeaders,
-      data: req.body && Object.keys(req.body).length ? req.body : undefined,
-      responseType: 'stream',
-      timeout: 60000,
-    });
-
-    // Forward status and headers
-    res.status(upstreamRes.status);
-    Object.entries(upstreamRes.headers || {}).forEach(([k, v]) => {
-      try { res.setHeader(k, v); } catch (e) { /* ignore */ }
-    });
-    // Pipe response stream
-    upstreamRes.data.pipe(res);
-  } catch (err) {
-    console.error('[A11] Error proxying /v1/chat/completions ->', upstreamUrl, err && (err.message || err.toString()));
-    if (err.response && err.response.data) {
-      // try to forward error body
-      try {
-        const buf = await streamToBuffer(err.response.data);
-        res.status(err.response.status || 502).send(buf);
-      } catch (e) {
-        res.status(err.response.status || 502).json({ ok: false, error: 'upstream_error', message: String(err.message) });
-      }
-    } else {
-      res.status(502).json({ ok: false, error: 'upstream_unreachable', message: String(err && err.message) });
-    }
-  }
-});
-
-// Proxy endpoint used by the frontend for simple chat requests
-app.post('/api/llm/chat', async (req, res) => {
-  if (!DEFAULT_UPSTREAM) {
-    return res.status(502).json({ ok: false, error: 'no_upstream_configured' });
-  }
-
-  const upstreamHost = (process.env.LLM_ROUTER_URL && process.env.LLM_ROUTER_URL.trim()) ? process.env.LLM_ROUTER_URL.trim() : DEFAULT_UPSTREAM;
-  const upstreamUrl = String(upstreamHost).replace(/\/$/, '') + '/v1/chat/completions';
-  console.log('[A11] Proxying /api/llm/chat ->', upstreamUrl);
-
-  try {
-    const forwardHeaders = Object.assign({}, req.headers);
-    delete forwardHeaders.host;
-    forwardHeaders['content-type'] = 'application/json';
-
-    const upstreamRes = await axios({
-      method: 'post',
-      url: upstreamUrl,
-      headers: forwardHeaders,
+      headers: buildOpenAIProxyHeaders(req.headers),
       data: req.body && Object.keys(req.body).length ? req.body : undefined,
       timeout: 60000,
     });
 
     const data = upstreamRes.data;
 
-    // --- MEMOIRE: log du tour de conversation ---
     try {
       const body = req.body || {};
-      const convId =
-        body.conversationId ||
-        body.convId ||
-        body.sessionId ||
-        'default';
+      const convId = body.conversationId || body.convId || body.sessionId || 'default';
       const messages = Array.isArray(body.messages) ? body.messages : [];
       appendConversationLog({
         type: 'chat_turn',
         conversationId: convId,
         request: {
-          model: body.model || 'llama3.2:latest',
+          model: body.model || 'gpt-4o-mini',
           messages
         },
         response: data
@@ -583,11 +512,10 @@ app.post('/api/llm/chat', async (req, res) => {
     } catch (e) {
       console.warn('[A11][memory] log chat_turn failed:', e && e.message);
     }
-    // --------------------------------------------
 
-    res.status(upstreamRes.status).json(data);
+    return res.status(upstreamRes.status).json(data);
   } catch (err) {
-    console.error('[A11] Error proxying /api/llm/chat ->', upstreamUrl, err && (err.message || err.toString()));
+    console.error('[A11] Error proxying chat ->', upstreamUrl, err && (err.message || err.toString()));
     if (err.response && err.response.data) {
       try {
         return res.status(err.response.status || 502).json(err.response.data);
@@ -595,7 +523,17 @@ app.post('/api/llm/chat', async (req, res) => {
     }
     return res.status(502).json({ ok: false, error: 'upstream_unreachable', message: String(err && err.message) });
   }
-});
+}
+
+// Canonical OpenAI-like route
+app.post('/v1/chat/completions', proxyChatToOpenAI);
+
+// Existing frontend route
+app.post('/api/llm/chat', proxyChatToOpenAI);
+
+// Compatibility aliases used by older frontend builds
+app.post('/api/ai', proxyChatToOpenAI);
+app.post('/api/completions', proxyChatToOpenAI);
 
 // helper to collect stream into buffer
 function streamToBuffer(stream) {
