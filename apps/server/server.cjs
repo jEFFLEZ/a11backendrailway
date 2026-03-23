@@ -681,15 +681,31 @@ const qflush = require('qflush');
 
 app.post('/ai', async (req, res) => {
   try {
-    const { input } = req.body || {};
+    const { input, mode } = req.body || {};
     if (!input) {
       return res.status(400).json({ error: 'Missing input' });
     }
 
-    const output = qflush.process(input);
+    let output;
+    if (mode === 'qflush') {
+      // Mode Qflush : utiliser l'orchestrateur
+      output = qflush.process(input);
+    } else {
+      // Mode LLM : proxy vers le LLM router
+      const upstreamHost = (process.env.LLM_ROUTER_URL && process.env.LLM_ROUTER_URL.trim()) ? process.env.LLM_ROUTER_URL.trim() : DEFAULT_UPSTREAM;
+      const upstreamUrl = String(upstreamHost).replace(/\/$/, '') + '/v1/chat/completions';
+
+      const upstreamRes = await axios.post(upstreamUrl, {
+        model: 'llama3.2:latest',
+        messages: [{ role: 'user', content: input }],
+        stream: false
+      }, { timeout: 60000 });
+
+      output = upstreamRes.data.choices?.[0]?.message?.content || 'Réponse LLM vide';
+    }
 
     res.json({ output });
-  } catch ( e) {
+  } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
