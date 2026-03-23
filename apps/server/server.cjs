@@ -1,6 +1,6 @@
 // --- .env first ---
 const path = require('node:path');
-const { fileURLToPath } = require('node:url');
+const { fileURLToPath } } = require('node:url');
 const fs = require('node:fs');
 const dotenv = require('dotenv');
 
@@ -44,7 +44,6 @@ console.log('[NEZ ENV] NEZ_ALLOWED_TOKEN=', process.env.NEZ_ALLOWED_TOKEN);
 const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
-const HOST_BIND = '0.0.0.0';
 
 // -------------------
 
@@ -299,7 +298,6 @@ const corsOptions = {
 
 // Use CORS middleware globally
 app.use(cors(corsOptions));
-// Ensure preflight requests are handled
 app.options('*', cors(corsOptions));
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
@@ -970,3 +968,16 @@ app.use(a11HistoryRouter);
 // Ajout du routeur Cerbère (llm-router.cjs)
 const llmRouter = require('./llm-router.cjs');
 app.use(llmRouter);
+
+// Fallback: ensure server starts
+if (!LISTENING) {
+  try {
+    app.listen(PORT, '0.0.0.0', () => {
+      LISTENING = true;
+      console.log(`[A11] Server listening on http://0.0.0.0:${PORT}`);
+    });
+  } catch (e) {
+    console.error('[A11] Failed to start server:', e && e.message);
+    process.exit(1);
+  }
+}
