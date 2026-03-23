@@ -677,7 +677,7 @@ app.post("/api/tools/run", async (req, res) => {
 });
 
 // Nouveau endpoint IA avec Qflush
-const qflush = require('qflush');
+const qflush = require('@funeste38/qflush');
 
 app.post('/ai', async (req, res) => {
   try {
