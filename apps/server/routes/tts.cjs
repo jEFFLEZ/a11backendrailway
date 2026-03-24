@@ -235,33 +235,62 @@ router.get('/tts/models', (req, res) => {
 
 router.post('/tts/piper', async (req, res) => {
   try {
-    const response = await fetch('http://127.0.0.1:5002/api/tts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
-    });
-    let data;
+    const text = String(req.body?.text || '').trim();
+    const voice = String(req.body?.voice || req.body?.model || '').trim();
+
+    if (!text) {
+      return res.status(400).json({ error: 'missing_text' });
+    }
+
+    let remoteError = null;
+
     try {
-      data = await response.json();
-    } catch {
-      // fallback: try to get text (path)
-      const txt = await response.text();
-      // if it's a path to wav, wrap it
-      if (typeof txt === 'string' && txt.endsWith('.wav')) {
-        return res.json({ audio_url: txt.startsWith('/tts/') ? txt : '/tts/' + path.basename(txt) });
+      const ttsBaseUrl = String(process.env.TTS_BASE_URL || `http://127.0.0.1:${process.env.TTS_PORT || 5002}`).replace(/\/$/, '');
+      const response = await fetch(`${ttsBaseUrl}/api/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        const txt = await response.text();
+        if (typeof txt === 'string' && txt.endsWith('.wav')) {
+          return res.json({ audio_url: txt.startsWith('/tts/') ? txt : '/tts/' + path.basename(txt), via: 'http-text' });
+        }
+        throw new Error(`invalid_http_tts_response: ${txt}`);
       }
-      return res.status(500).json({ error: 'Invalid Piper response', detail: txt });
+
+      const audioUrl = data.audio_url || data.audioUrl || data.url || data.path || data.file || data.wav || null;
+      if (audioUrl) {
+        return res.json({
+          audio_url: audioUrl.startsWith('/tts/') ? audioUrl : '/tts/' + path.basename(audioUrl),
+          via: 'http',
+        });
+      }
+
+      if (typeof data === 'string' && data.endsWith('.wav')) {
+        return res.json({ audio_url: data.startsWith('/tts/') ? data : '/tts/' + path.basename(data), via: 'http-string' });
+      }
+
+      throw new Error('No audio_url in Piper response');
+    } catch (error_) {
+      remoteError = String(error_?.message || error_);
+      console.warn('[TTS][Piper] HTTP backend unavailable, trying local spawn:', remoteError);
     }
-    // always return audio_url
-    const audioUrl = data.audio_url || data.audioUrl || data.url || data.path || data.file || data.wav || null;
-    if (audioUrl) {
-      return res.json({ audio_url: audioUrl.startsWith('/tts/') ? audioUrl : '/tts/' + path.basename(audioUrl) });
+
+    try {
+      const local = await spawnPiperLocal(text, voice || null);
+      return res.json({ ...local, via: 'spawn' });
+    } catch (spawnError) {
+      return res.status(503).json({
+        error: 'tts_unavailable',
+        remoteError,
+        localError: String(spawnError?.message || spawnError),
+      });
     }
-    // fallback: if body is a string path
-    if (typeof data === 'string' && data.endsWith('.wav')) {
-      return res.json({ audio_url: data.startsWith('/tts/') ? data : '/tts/' + path.basename(data) });
-    }
-    return res.status(500).json({ error: 'No audio_url in Piper response', detail: data });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
