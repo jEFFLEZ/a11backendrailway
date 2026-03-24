@@ -1,11 +1,14 @@
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "python311"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = [
+	"npm install",
+	"python3 -m pip install --no-cache-dir piper-tts"
+]
 
 [phases.build]
 cmds = ["echo 'no build step'"]
 
 [start]
-cmd = "node server.cjs"
+cmd = "bash start.sh"

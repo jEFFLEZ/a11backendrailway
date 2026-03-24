@@ -1,9 +1,138 @@
 const path = require('node:path');
 const fs = require('node:fs');
-const { spawn } = require('node:child_process');
-const http = require('node:http');
+const { spawn, spawnSync } = require('node:child_process');
 const express = require('express');
 const router = express.Router();
+
+const commandAvailabilityCache = new Map();
+
+function isCommandAvailable(command) {
+  const key = String(command || '').trim();
+  if (!key) return false;
+  if (commandAvailabilityCache.has(key)) return commandAvailabilityCache.get(key);
+
+  const checker = process.platform === 'win32' ? 'where' : 'which';
+  const probe = spawnSync(checker, [key], { stdio: 'ignore' });
+  const ok = probe.status === 0;
+  commandAvailabilityCache.set(key, ok);
+  return ok;
+}
+
+function parseHttpUrl(value, fallback) {
+  const input = String(value || '').trim();
+  if (!input) return fallback;
+  try {
+    return new URL(input.includes('://') ? input : `http://${input}`);
+  } catch {
+    return fallback;
+  }
+}
+
+function getLocalTtsConfig() {
+  const fallback = new URL('http://127.0.0.1:5002');
+  const baseUrl = parseHttpUrl(process.env.TTS_BASE_URL, null);
+  const hostUrl = parseHttpUrl(process.env.TTS_HOST, null);
+
+  const selected = baseUrl || hostUrl || fallback;
+  const hostname = selected.hostname || '127.0.0.1';
+  const selectedPort = Number(process.env.TTS_PORT || selected.port || 5002);
+  const port = Number.isFinite(selectedPort) && selectedPort > 0 ? selectedPort : 5002;
+
+  return {
+    host: hostname,
+    port,
+    baseUrl: `${selected.protocol}//${hostname}:${port}`,
+  };
+}
+
+function getWorkspaceRoot() {
+  return path.resolve(__dirname, '..', '..', '..');
+}
+
+function getPublicTtsDir() {
+  return path.join(getWorkspaceRoot(), 'public', 'tts');
+}
+
+function ensurePublicTtsDir() {
+  const ttsDir = getPublicTtsDir();
+  fs.mkdirSync(ttsDir, { recursive: true });
+  return ttsDir;
+}
+
+function resolvePiperBinary() {
+  const workspaceRoot = getWorkspaceRoot();
+  const configured = String(process.env.PIPER_BIN || process.env.PIPER_EXE || '').trim();
+  const candidates = [
+    configured,
+    path.join(workspaceRoot, 'piper', 'piper.exe'),
+    path.join(workspaceRoot, 'piper', 'piper'),
+    'piper'
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    // Command name on PATH (for example "piper")
+    if (!candidate.includes(path.sep) && !candidate.includes('/')) {
+      if (isCommandAvailable(candidate)) {
+        return { command: candidate, cwd: workspaceRoot };
+      }
+      continue;
+    }
+
+    const resolved = path.resolve(candidate);
+    if (fs.existsSync(resolved)) {
+      return { command: resolved, cwd: path.dirname(resolved) };
+    }
+  }
+
+  return null;
+}
+
+function resolvePiperModel(requestedModel) {
+  const workspaceRoot = getWorkspaceRoot();
+  const explicitModelPath = String(process.env.TTS_MODEL_PATH || process.env.PIPER_MODEL_PATH || '').trim();
+  const modelsDirEnv = String(process.env.TTS_MODELS_DIR || process.env.PIPER_MODELS_DIR || '').trim();
+
+  const modelCandidates = [];
+  if (requestedModel) modelCandidates.push(String(requestedModel).trim());
+  if (explicitModelPath) modelCandidates.push(explicitModelPath);
+  modelCandidates.push('fr_FR-medium.onnx', 'fr_FR-siwis-medium.onnx');
+
+  const baseDirs = [
+    modelsDirEnv,
+    path.join(workspaceRoot, 'piper', 'models'),
+    path.join(workspaceRoot, 'tts'),
+    '/app/tts',
+    '/data/tts'
+  ].filter(Boolean);
+
+  for (const candidate of modelCandidates) {
+    if (!candidate) continue;
+
+    const looksAbsolute = path.isAbsolute(candidate) || /^[A-Za-z]:\\/.test(candidate);
+    if (looksAbsolute && fs.existsSync(candidate)) {
+      return candidate;
+    }
+
+    for (const dir of baseDirs) {
+      const modelPath = path.join(dir, candidate);
+      if (fs.existsSync(modelPath)) {
+        return modelPath;
+      }
+    }
+  }
+
+  return null;
+}
+
+function getSpawnReadiness(requestedModel) {
+  const piper = resolvePiperBinary();
+  const modelPath = resolvePiperModel(requestedModel);
+  return {
+    ready: Boolean(piper && modelPath),
+    piperCommand: piper?.command || null,
+    modelPath: modelPath || null,
+  };
+}
 
 function listOnnxFiles(modelsDir) {
   const results = [];
@@ -27,90 +156,94 @@ function listOnnxFiles(modelsDir) {
   return results;
 }
 
-// Try to call a local Piper HTTP service. Tries several common paths.
-function callPiperHttp(text, model) {
-  return new Promise((resolve, reject) => {
-    if (!text) return reject(new Error('missing_text'));
-    const host = '127.0.0.1';
-    const port = Number(process.env.TTS_PORT || 5002);
-    const candidates = ['/', '/synthesize', '/api/tts', '/tts', '/generate'];
-    let tried = 0;
+function parseJsonMaybe(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
 
-    function tryPath(p) {
-      tried++;
-      const payload = JSON.stringify({ text, model });
-      const opts = {
-        hostname: host,
-        port,
-        path: p,
-        method: 'POST',
-        timeout: 10000,
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload)
-        }
-      };
+function toPublicAudioUrl(value) {
+  const audioUrl = String(value || '').trim();
+  if (!audioUrl) return null;
+  return audioUrl.startsWith('/tts/') ? audioUrl : '/tts/' + path.basename(audioUrl);
+}
 
-      const req = http.request(opts, (res) => {
-        let body = '';
-        res.on('data', (chunk) => (body += chunk.toString()));
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            // try parse JSON, otherwise return raw
-            try {
-              const json = JSON.parse(body);
-              return resolve({ path: p, body: json });
-            } catch {
-              return resolve({ path: p, body });
-            }
-          }
-          // non-2xx -> try next candidate or fail
-          if (tried < candidates.length) return tryPath(candidates[tried]);
-          return reject(new Error(`piper_http_error ${res.statusCode} ${res.statusMessage || ''} ${body.slice ? body.slice(0,200) : ''}`));
-        });
-      });
-
-      req.on('error', (err) => {
-        // try next candidate if any
-        if (tried < candidates.length) return tryPath(candidates[tried]);
-        return reject(new Error('piper_unreachable: ' + err.message));
-      });
-
-      req.on('timeout', () => {
-        req.destroy();
-        if (tried < candidates.length) return tryPath(candidates[tried]);
-        return reject(new Error('piper_timeout'));
-      });
-
-      req.write(payload);
-      req.end();
-    }
-
-    tryPath(candidates[0]);
+async function requestRemoteTts(payload) {
+  const ttsBaseUrl = String(process.env.TTS_BASE_URL || getLocalTtsConfig().baseUrl).replace(/\/$/, '');
+  const response = await fetch(`${ttsBaseUrl}/api/tts`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   });
+
+  const textBody = await response.text();
+  const parsed = parseJsonMaybe(textBody);
+
+  if (typeof parsed === 'string' && parsed.endsWith('.wav')) {
+    return { audio_url: toPublicAudioUrl(parsed), via: 'http-string' };
+  }
+
+  const audioUrl = parsed?.audio_url || parsed?.audioUrl || parsed?.url || parsed?.path || parsed?.file || parsed?.wav || null;
+  if (!audioUrl) {
+    throw new Error(`invalid_http_tts_response: ${String(textBody).slice(0, 300)}`);
+  }
+
+  return {
+    audio_url: toPublicAudioUrl(audioUrl),
+    via: 'http',
+  };
+}
+
+// Try to call a local Piper HTTP service. Tries several common paths.
+async function callPiperHttp(text, model) {
+  if (!text) throw new Error('missing_text');
+
+  const { baseUrl } = getLocalTtsConfig();
+  const candidates = ['/', '/synthesize', '/api/tts', '/tts', '/generate'];
+  let lastError = null;
+
+  for (const p of candidates) {
+    try {
+      const response = await fetch(`${baseUrl}${p}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, model }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const raw = await response.text();
+      if (!response.ok) {
+        lastError = new Error(`piper_http_error ${response.status} ${response.statusText || ''} ${String(raw).slice(0, 200)}`);
+        continue;
+      }
+      return { path: p, body: parseJsonMaybe(raw) };
+    } catch (error_) {
+      lastError = error_;
+    }
+  }
+
+  if (lastError?.name === 'TimeoutError') {
+    throw new Error('piper_timeout');
+  }
+  throw new Error('piper_unreachable: ' + String(lastError?.message || lastError || 'unknown_error'));
 }
 
 function spawnPiperLocal(text, model) {
   return new Promise((resolve, reject) => {
     try {
-      const baseDir = path.resolve(__dirname, '..', '..', '..');
-      const piperExe = path.join(baseDir, 'piper', 'piper.exe');
-      const modelsDir = path.join(baseDir, 'piper', 'models');
+      const piper = resolvePiperBinary();
+      const modelPath = resolvePiperModel(model);
 
-      // Default to siwis model
-      const modelPath = model ? path.join(modelsDir, model) : path.join(modelsDir, 'fr_FR-siwis-medium.onnx');
-
-      if (!fs.existsSync(piperExe)) {
-        return reject(new Error('piper not installed'));
+      if (!piper) {
+        return reject(new Error('piper binary not found (set PIPER_BIN)'));
       }
-      if (!fs.existsSync(modelPath)) {
-        return reject(new Error('piper model not found: ' + modelPath));
+      if (!modelPath) {
+        return reject(new Error('piper model not found (set TTS_MODEL_PATH or TTS_MODELS_DIR)'));
       }
 
-      const publicDir = path.join(baseDir, 'public');
-      const ttsDir = path.join(publicDir, 'tts');
+      const ttsDir = ensurePublicTtsDir();
       try {
-        if (!fs.existsSync(publicDir)) fs.mkdirSync(publicDir, { recursive: true });
         if (!fs.existsSync(ttsDir)) fs.mkdirSync(ttsDir, { recursive: true });
       } catch (error_) {
         console.warn('[TTS][Piper] failed to prepare output directory:', error_.message);
@@ -125,8 +258,8 @@ function spawnPiperLocal(text, model) {
         '--output_file', outFile
       ];
 
-      const p = spawn(piperExe, args, {
-        cwd: path.dirname(piperExe),
+      const p = spawn(piper.command, args, {
+        cwd: piper.cwd,
         stdio: ['pipe', 'ignore', 'inherit'],
         windowsHide: true
       });
@@ -162,71 +295,60 @@ function spawnPiperLocal(text, model) {
 
 
 // GET /api/tts/health -> probe local Piper service (try multiple endpoints)
-router.get('/tts/health', (req, res) => {
-  const host = '127.0.0.1';
-  const port = Number(process.env.TTS_PORT || 5002);
+router.get('/tts/health', async (req, res) => {
+  const { host, port, baseUrl } = getLocalTtsConfig();
   const candidates = ['/health', '/api/tts', '/', '/synthesize', '/tts'];
-  let tried = 0;
+  let lastHttpStatus = null;
+  let lastBody = '';
+  let lastError = null;
 
-  function tryPath(idx) {
-    const p = candidates[idx];
-    const options = {
-      hostname: host,
-      port,
-      path: p,
-      method: 'GET',
-      timeout: 3000
-    };
-
-    const reqProbe = http.request(options, (r) => {
-      const { statusCode } = r;
-      let body = '';
-      r.on('data', (chunk) => (body += chunk.toString()));
-      r.on('end', () => {
-        if (statusCode >= 200 && statusCode < 300) {
-          // successful probe
-          try {
-            const json = JSON.parse(body || '{}');
-            return res.json({ ok: true, statusCode, path: p, body: json });
-          } catch {
-            return res.json({ ok: true, statusCode, path: p, body });
-          }
-        }
-        // not OK -> try next
-        tried++;
-        if (tried < candidates.length) return tryPath(tried);
-        return res.status(502).json({ ok: false, error: 'piper_unhealthy', statusCode, body });
+  for (const p of candidates) {
+    try {
+      const response = await fetch(`${baseUrl}${p}`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(3000),
       });
-    });
-
-    reqProbe.on('error', (err) => {
-      tried++;
-      if (tried < candidates.length) return tryPath(tried);
-      return res.status(503).json({ ok: false, error: 'tts_unreachable', message: String(err?.message) });
-    });
-
-    reqProbe.on('timeout', () => {
-      reqProbe.destroy();
-      tried++;
-      if (tried < candidates.length) return tryPath(tried);
-      return res.status(504).json({ ok: false, error: 'tts_timeout' });
-    });
-
-    reqProbe.end();
+      const raw = await response.text();
+      if (response.ok) {
+        return res.json({ ok: true, statusCode: response.status, path: p, body: parseJsonMaybe(raw) });
+      }
+      lastHttpStatus = response.status;
+      lastBody = raw;
+    } catch (error_) {
+      lastError = error_;
+    }
   }
 
-  tryPath(0);
+  const spawn = getSpawnReadiness();
+  if (spawn.ready) {
+    return res.json({
+      ok: true,
+      mode: 'spawn-ready',
+      warning: lastError?.name === 'TimeoutError' ? 'piper_http_timeout' : 'piper_http_unreachable',
+      host,
+      port,
+      piperCommand: spawn.piperCommand,
+      modelPath: spawn.modelPath,
+    });
+  }
+
+  if (lastHttpStatus) {
+    return res.status(502).json({ ok: false, error: 'piper_unhealthy', statusCode: lastHttpStatus, body: String(lastBody).slice(0, 300), host, port });
+  }
+  if (lastError?.name === 'TimeoutError') {
+    return res.status(504).json({ ok: false, error: 'tts_timeout', host, port });
+  }
+  return res.status(503).json({ ok: false, error: 'tts_unreachable', message: String(lastError?.message || 'unknown_error'), host, port });
 });
 
 // GET /api/tts/models -> list available models under piper/models
 router.get('/tts/models', (req, res) => {
   try {
-    // baseDir should point to repository root (move up three levels)
-    const baseDir = path.resolve(__dirname, '..', '..', '..');
-    const modelsDir = path.join(baseDir, 'piper', 'models');
+    const configuredDir = String(process.env.TTS_MODELS_DIR || process.env.PIPER_MODELS_DIR || '').trim();
+    const modelsDir = configuredDir || path.join(getWorkspaceRoot(), 'piper', 'models');
     if (!fs.existsSync(modelsDir)) return res.json({ models: [] });
     const models = listOnnxFiles(modelsDir);
-    return res.json({ models });
+    return res.json({ models, modelsDir });
   } catch (err) {
     console.error('[TTS][Piper] list models error', err);
     return res.status(500).json({ error: 'list_models_failed' });
@@ -245,37 +367,8 @@ router.post('/tts/piper', async (req, res) => {
     let remoteError = null;
 
     try {
-      const ttsBaseUrl = String(process.env.TTS_BASE_URL || `http://127.0.0.1:${process.env.TTS_PORT || 5002}`).replace(/\/$/, '');
-      const response = await fetch(`${ttsBaseUrl}/api/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req.body),
-      });
-
-      let data;
-      try {
-        data = await response.json();
-      } catch {
-        const txt = await response.text();
-        if (typeof txt === 'string' && txt.endsWith('.wav')) {
-          return res.json({ audio_url: txt.startsWith('/tts/') ? txt : '/tts/' + path.basename(txt), via: 'http-text' });
-        }
-        throw new Error(`invalid_http_tts_response: ${txt}`);
-      }
-
-      const audioUrl = data.audio_url || data.audioUrl || data.url || data.path || data.file || data.wav || null;
-      if (audioUrl) {
-        return res.json({
-          audio_url: audioUrl.startsWith('/tts/') ? audioUrl : '/tts/' + path.basename(audioUrl),
-          via: 'http',
-        });
-      }
-
-      if (typeof data === 'string' && data.endsWith('.wav')) {
-        return res.json({ audio_url: data.startsWith('/tts/') ? data : '/tts/' + path.basename(data), via: 'http-string' });
-      }
-
-      throw new Error('No audio_url in Piper response');
+      const remote = await requestRemoteTts(req.body);
+      return res.json(remote);
     } catch (error_) {
       remoteError = String(error_?.message || error_);
       console.warn('[TTS][Piper] HTTP backend unavailable, trying local spawn:', remoteError);
