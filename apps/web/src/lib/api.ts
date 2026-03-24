@@ -6,21 +6,49 @@ const API_BASE = (import.meta.env?.VITE_API_BASE_URL) || '';
 // Router URL (can be overridden via Vite env)
 const LLM_ROUTER_URL = (import.meta.env?.VITE_LLM_ROUTER_URL) || 'http://127.0.0.1:4545';
 
-// Liste des endpoints pour chaque moteur (gardé pour référence mais frontkit uses router)
-const ENGINE_BASES = {
-  local: 'http://127.0.0.1:8000',    // llama.cpp (NOT used directly in browser to avoid CORS)
-  ollama: 'http://127.0.0.1:11434', // Ollama
-  openai: 'https://api.openai.com/v1' // OpenAI (exemple)
-};
-
 // Nezlephant token (optionnel)
 const NEZ_TOKEN = (import.meta.env?.VITE_A11_NEZ_TOKEN) || '';
+
+// ✅ AUTH HELPERS
+export function getAuthToken() {
+  return localStorage.getItem('a11-auth-token');
+}
+
+export function setAuthToken(token: string) {
+  localStorage.setItem('a11-auth-token', token);
+}
+
+export function clearAuthToken() {
+  localStorage.removeItem('a11-auth-token');
+}
+
+export async function login(username: string, password: string) {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  });
+
+  const data = await res.json();
+  if (data.success) {
+    setAuthToken(data.token);
+    return data;
+  }
+  throw new Error(data.error || 'Login failed');
+}
+
+export function logout() {
+  clearAuthToken();
+}
+
+function dispatchBrowserEvent(event: Event) {
+  globalThis.dispatchEvent(event);
+}
 
 export const TTS_API =
     import.meta.env.VITE_TTS_API ||
     (API_BASE ? `${API_BASE}/api/tts/piper` : '/api/tts/piper');
 
-// export const TTS_VOICES = ['fr_FR-siwis-medium', 'fr_FR-siwis-sd', 'fr_FR-williwaw', 'fr_FR-barkly'];
 export const TTS_VOICES = ['fr_FR-siwis-medium'];
 
 export type Provider = "local" | "ollama" | "openai";
@@ -44,16 +72,19 @@ export type ChatResponse = {
   output?: string;
 };
 
-// Appel générique POST JSON : désormais on passe toujours via le LLM router
-async function apiPost(path: string, body: unknown, provider: Provider = 'local') {
-  // Always call the LLM router endpoint for chat completions to centralize upstreams
-  const routerBase = LLM_ROUTER_URL.replace(/\/$/, '');
-  const url = `${routerBase}/v1/chat/completions`;
+// Appel générique POST JSON : pass via backend auth gateway
+async function apiPost(body: unknown) {
+  // Route through the protected backend chat endpoint.
+  const url = `${API_BASE}/api/ai`;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  if (NEZ_TOKEN) headers['X-NEZ-TOKEN'] = NEZ_TOKEN;
+  
+  // ✅ Inject auth token if available
+  const token = getAuthToken();
+  if (token) headers['X-NEZ-TOKEN'] = token;
+  else if (NEZ_TOKEN) headers['X-NEZ-TOKEN'] = NEZ_TOKEN;
 
   const fetchOptions: any = {
     method: 'POST',
@@ -65,7 +96,7 @@ async function apiPost(path: string, body: unknown, provider: Provider = 'local'
   try {
     const routerUrlObj = new URL(routerBase);
     if (routerUrlObj.origin === location.origin) fetchOptions.credentials = 'include';
-  } catch (e) {
+  } catch {
     // ignore
   }
 
@@ -87,15 +118,15 @@ async function apiPost(path: string, body: unknown, provider: Provider = 'local'
           const payload = line.slice(5).trim(); // after 'data:'
           if (!payload) return;
           if (payload === '[DONE]') {
-            try { window.dispatchEvent(new CustomEvent('a11:assistant.done')); } catch (e) {}
+            dispatchBrowserEvent(new CustomEvent('a11:assistant.done'));
             return;
           }
           let parsed = null;
-          try { parsed = JSON.parse(payload); } catch (e) { return; }
+          try { parsed = JSON.parse(payload); } catch { return; }
           const chunk = parsed?.choices?.[0]?.delta?.content ?? parsed?.choices?.[0]?.message?.content ?? parsed?.response ?? '';
           if (chunk) {
             aggregated += String(chunk);
-            try { window.dispatchEvent(new CustomEvent('a11:assistant.delta', { detail: String(chunk) })); } catch (e) {}
+            dispatchBrowserEvent(new CustomEvent('a11:assistant.delta', { detail: String(chunk) }));
           }
         };
 
@@ -135,8 +166,8 @@ async function apiPost(path: string, body: unknown, provider: Provider = 'local'
           choices: [{ message: { role: 'assistant', content: aggregated } }]
         };
       }
-    } catch (e) {
-      console.warn('[A11][STREAM] streaming parse failed, falling back to full read', e);
+    } catch (error_) {
+      console.warn('[A11][STREAM] streaming parse failed, falling back to full read', error_);
       // fallthrough to full-text handling
     }
   }
@@ -165,7 +196,7 @@ async function apiPost(path: string, body: unknown, provider: Provider = 'local'
           const parsed = JSON.parse(lastJsonStr);
           const chunk = parsed?.choices?.[0]?.delta?.content ?? parsed?.choices?.[0]?.message?.content ?? parsed?.response ?? null;
           if (chunk) parts.push(String(chunk));
-        } catch (e) {
+        } catch {
           // ignore
         }
       }
@@ -216,7 +247,7 @@ export async function chatCompletion(
   // Filtre les tokens spéciaux Llama (<|...|>) dans tous les messages
   msgs = msgs.map(m => ({
     ...m,
-    content: typeof m.content === 'string' ? m.content.replace(/<\|.*?\|>/g, '') : ''
+    content: typeof m.content === 'string' ? m.content.replaceAll(/<\|.*?\|>/g, '') : ''
   }));
 
   const payload = {
@@ -230,7 +261,7 @@ export async function chatCompletion(
   };
 
   // Always post to router (apiPost ignores the path and uses router endpoint)
-  const data = await apiPost('/v1/chat/completions', payload, provider);
+  const data = await apiPost(payload);
 
   // On essaie de lire réponse façon OpenAI
   const content =
@@ -247,11 +278,11 @@ export async function chat(message: string, history: Msg[] = [], provider: Provi
     { role: 'system', content: systemPrompt || 'Tu es AlphaOnze (A-11), un assistant IA français unique et attachant.' },
     { role: 'user', content: message }
   ];
-  try { window.dispatchEvent(new Event('conversation:start')); } catch {}
+  dispatchBrowserEvent(new Event('conversation:start'));
   try {
     return await chatCompletion(messages, provider, systemPrompt);
   } finally {
-    try { window.dispatchEvent(new Event('conversation:end')); } catch {}
+    dispatchBrowserEvent(new Event('conversation:end'));
   }
 }
 
@@ -281,7 +312,7 @@ export async function ttsSpeak(text: string, voice: string = 'fr_FR-siwis-medium
     // essayer de parser JSON d'erreur
     if (contentType.includes('application/json')) {
       const err = await res.json();
-      throw new Error(err && err.error ? String(err.error) : JSON.stringify(err));
+      throw new Error(err?.error ? String(err.error) : JSON.stringify(err));
     }
     const textErr = await res.text();
     throw new Error(textErr || `TTS request failed with status ${res.status}`);
@@ -298,7 +329,7 @@ export async function ttsSpeak(text: string, voice: string = 'fr_FR-siwis-medium
   try {
     const data = await res.json();
     return data;
-  } catch (e) {
+  } catch {
     // fallback: retourner le texte brut
     const txt = await res.text();
     return { success: true, text: txt };
@@ -344,20 +375,6 @@ export async function callA11Agent(messages: A11ChatMessage[], devMode?: boolean
   }
   return res.json();
 }
-
-// Exemple d'utilisation :
-// const result = await callA11Agent([{ role: 'user', content: 'Va lire https://example.com' }]);
-// if (result.type === 'tool-result') { /* afficher result.result */ }
-/// else if (result.type === 'text') { /* afficher result.content */ }
-
-// quick test payload (left for dev) - POST to router
-// Removed unsolicited quick test to avoid network errors in browser during module import
-// fetch(`${LLM_ROUTER_URL.replace(/\/$/, '')}/v1/chat/completions`, {
-//   method: 'POST',
-//   headers: { 'Content-Type': 'application/json' },
-//   credentials: 'include',
-//   body: JSON.stringify({ provider: 'ollama', model: getModelForProvider('ollama'), messages: [{ role: 'user', content: 'salut' }], stream: true })
-// });
 
 // === A11 Conversation History (backend) ===
 export async function fetchA11HistoryList() {
