@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
-import { fetchA11HistoryList, fetchA11Conversation, login, logout, getAuthToken } from "./lib/api";
+import { fetchA11HistoryList, fetchA11Conversation, login, logout, getAuthToken, forgotPassword, resetPassword } from "./lib/api";
 import { A11HistoryPanel } from "./components/A11HistoryPanel";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
@@ -9,6 +9,8 @@ import {
   stopMic,
   speak,
   cancelSpeech,
+  setSpeechMuted,
+  isSpeechMuted,
 } from "./lib/speech";
 import handleImportFiles from "./lib/importer";
 import { chatCompletion, type Provider } from "./lib/api";
@@ -36,8 +38,12 @@ const DEFAULT_SYSTEM_NINDO =
 function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void }) {
   const [username, setUsername] = useState("admin");
   const [password, setPassword] = useState("1234");
+  const [forgotEmail, setForgotEmail] = useState("");
+  const [forgotSent, setForgotSent] = useState(false);
   const [error, setError] = useState("");
+  const [forgotError, setForgotError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [forgotLoading, setForgotLoading] = useState(false);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -49,6 +55,25 @@ function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void })
       setError((err as Error).message || "Login failed");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleForgot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setForgotError("");
+    setForgotSent(false);
+    if (!forgotEmail.trim()) {
+      setForgotError("Email requis");
+      return;
+    }
+    setForgotLoading(true);
+    try {
+      await forgotPassword(forgotEmail.trim());
+      setForgotSent(true);
+    } catch (err) {
+      setForgotError((err as Error).message || "Erreur forgot password");
+    } finally {
+      setForgotLoading(false);
     }
   };
 
@@ -89,27 +114,149 @@ function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void })
         </button>
         {error && <div style={{ color: "red", fontSize: "14px" }}>{error}</div>}
       </form>
+      <form onSubmit={handleForgot} style={{ display: "flex", flexDirection: "column", gap: "10px", minWidth: "300px", marginTop: "10px" }}>
+        <div style={{ fontSize: "13px", color: "#94a3b8" }}>Mot de passe oublié ?</div>
+        <input
+          type="email"
+          placeholder="Ton email"
+          value={forgotEmail}
+          onChange={(e) => setForgotEmail(e.target.value)}
+          disabled={forgotLoading}
+          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+        />
+        <button
+          type="submit"
+          disabled={forgotLoading}
+          style={{
+            padding: "10px 20px",
+            borderRadius: "4px",
+            border: "1px solid #334155",
+            background: "#0f172a",
+            color: "#e2e8f0",
+            cursor: "pointer",
+            fontWeight: "bold"
+          }}
+        >
+          {forgotLoading ? "Envoi..." : "Envoyer le lien de reset"}
+        </button>
+        {forgotError && <div style={{ color: "red", fontSize: "13px" }}>{forgotError}</div>}
+        {forgotSent && <div style={{ color: "#22c55e", fontSize: "13px" }}>Si l'email existe, un lien a ete envoye.</div>}
+      </form>
       <p style={{ fontSize: "12px", color: "#999" }}>Demo: admin / 1234</p>
+    </div>
+  );
+}
+
+function ResetPasswordPanel() {
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const token = useMemo(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('token') || '';
+  }, []);
+
+  const handleReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setSuccess(false);
+
+    if (!token) {
+      setError("Token manquant dans l'URL");
+      return;
+    }
+    if (password.length < 4) {
+      setError("Mot de passe trop court");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Les mots de passe ne correspondent pas");
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await resetPassword(token, password);
+      setSuccess(true);
+    } catch (err) {
+      setError((err as Error).message || "Reset impossible");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: "20px" }}>
+      <h1>Reset Password</h1>
+      <form onSubmit={handleReset} style={{ display: "flex", flexDirection: "column", gap: "12px", minWidth: "320px" }}>
+        <input
+          type="password"
+          placeholder="Nouveau mot de passe"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          disabled={loading}
+          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+        />
+        <input
+          type="password"
+          placeholder="Confirmer le mot de passe"
+          value={confirmPassword}
+          onChange={(e) => setConfirmPassword(e.target.value)}
+          disabled={loading}
+          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+        />
+        <button
+          type="submit"
+          disabled={loading}
+          style={{
+            padding: "10px 20px",
+            borderRadius: "4px",
+            border: "none",
+            background: "#16a34a",
+            color: "white",
+            cursor: "pointer",
+            fontWeight: "bold"
+          }}
+        >
+          {loading ? "Reset..." : "Valider"}
+        </button>
+        {error && <div style={{ color: "red", fontSize: "14px" }}>{error}</div>}
+        {success && (
+          <div style={{ color: "#22c55e", fontSize: "14px" }}>
+            Mot de passe modifie. Tu peux revenir sur la page de login.
+          </div>
+        )}
+      </form>
     </div>
   );
 }
 // MuteButton : icône seule, contrôle global du son
 function MuteButton() {
-  const [muted, setMuted] = useState(false);
+  const [muted, setMuted] = useState(isSpeechMuted());
 
   useEffect(() => {
-    if (!muted) {
-      if ((globalThis as any).a11_speak_orig) {
-        (globalThis as any).speak = (globalThis as any).a11_speak_orig;
-      }
-      return;
+    try {
+      const saved = localStorage.getItem('a11:muted');
+      if (saved === '1') setMuted(true);
+    } catch {
+      // ignore storage access errors
     }
-    if (!(globalThis as any).a11_speak_orig) (globalThis as any).a11_speak_orig = speak;
-    (globalThis as any).speak = () => {};
-    cancelSpeech();
-    return () => {
-      if ((globalThis as any).a11_speak_orig) (globalThis as any).speak = (globalThis as any).a11_speak_orig;
-    };
+  }, []);
+
+  useEffect(() => {
+    setSpeechMuted(muted);
+    if (muted) {
+      cancelSpeech();
+    }
+
+    try {
+      localStorage.setItem('a11:muted', muted ? '1' : '0');
+    } catch {
+      // ignore storage access errors
+    }
   }, [muted]);
 
   return (
@@ -130,6 +277,7 @@ function MuteButton() {
 
 export function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isResetRoute, setIsResetRoute] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -146,6 +294,8 @@ export function App() {
     if (token) {
       setIsAuthenticated(true);
     }
+    const pathname = window.location.pathname.toLowerCase();
+    setIsResetRoute(pathname.includes('/reset-password') || pathname.includes('/reset'));
   }, []);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -316,10 +466,8 @@ export function App() {
         return nm;
       });
 
-      // play TTS for every bot response unless muted
-      if (typeof (globalThis as any).speak === "function") {
-        (globalThis as any).speak(String(assistantText), { lang: "fr-FR" });
-      }
+      // Pipeline auto: LLM reply -> TTS playback
+      speak(String(assistantText), { lang: "fr-FR" });
     } catch (err: any) {
       const errMsg: ChatMessage = {
         id: `e-${Date.now()}`,
@@ -560,6 +708,10 @@ RÈGLES STRICTES :
   // HEADER avec bouton Mode DEV centré, select modèle à droite, mute à l'extrême droite
   
   // ✅ Check authentication
+  if (isResetRoute) {
+    return <ResetPasswordPanel />;
+  }
+
   if (!isAuthenticated) {
     return <LoginPanel onLoginSuccess={() => setIsAuthenticated(true)} />;
   }

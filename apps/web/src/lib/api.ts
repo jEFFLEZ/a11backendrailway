@@ -1,7 +1,7 @@
 // @ts-nocheck
 
 // API Base URL for production (can be overridden via Vite env)
-const API_BASE = (import.meta.env?.VITE_API_BASE_URL) || '';
+const API_BASE = (import.meta.env?.VITE_API_BASE_URL) || (import.meta.env?.VITE_API_URL) || '';
 
 function getApiUrl(path: string) {
   const base = API_BASE.replace(/\/$/, '');
@@ -48,6 +48,48 @@ export async function login(username: string, password: string) {
     return data;
   }
   throw new Error(data.error || 'Login failed');
+}
+
+export async function forgotPassword(email: string) {
+  const res = await fetch(getApiUrl('/api/auth/forgot-password'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    throw new Error(data.error || `Forgot password failed (${res.status})`);
+  }
+
+  return data;
+}
+
+export async function resetPassword(token: string, password: string) {
+  const res = await fetch(getApiUrl('/api/auth/reset-password'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, password })
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    throw new Error(data.error || `Reset password failed (${res.status})`);
+  }
+
+  return data;
 }
 
 export function logout() {
@@ -306,7 +348,7 @@ export async function ttsSpeak(text: string, voice: string = 'fr_FR-siwis-medium
     voice,
     provider
   };
-  // On suppose que le backend écoute sur /api/tts/speak
+  // Backend route is mounted at /api/tts/piper
   const fetchOptions: any = {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -315,7 +357,7 @@ export async function ttsSpeak(text: string, voice: string = 'fr_FR-siwis-medium
   // same-origin proxy should include credentials
   fetchOptions.credentials = 'include';
 
-  const url = API_BASE ? `${API_BASE}/api/tts/speak` : '/api/tts/speak';
+  const url = API_BASE ? `${API_BASE}/api/tts/piper` : '/api/tts/piper';
   const res = await fetch(url, fetchOptions);
 
   // Si le backend renvoie JSON (erreur ou métadonnées)
