@@ -41,6 +41,6 @@ build/
 venv/
 env/
 .env
-.vscode/
+########################################
 .idea/
 node_modules/
