@@ -19,6 +19,7 @@
     "dev:router": "node llm-router.cjs",
     "test": "echo 'No tests specified for server'",
     "lint": "echo 'No linting configured for server'"
+    ,"railway:build": "echo 'No build step needed for backend'"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1015.0",
