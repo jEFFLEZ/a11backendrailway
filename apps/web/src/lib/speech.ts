@@ -5,15 +5,52 @@
 
 let speechQueue: Array<{ text: string; options: any }> = [];
 let isProcessingQueue = false;
+let speechMuted = false;
+
+const API_BASE = (import.meta as any)?.env?.VITE_API_BASE_URL || (import.meta as any)?.env?.VITE_API_URL || '';
+const TTS_ENDPOINT = (import.meta as any)?.env?.VITE_TTS_API || (API_BASE ? `${String(API_BASE).replace(/\/$/, '')}/api/tts/piper` : '/api/tts/piper');
 
 // Mode: true = queue TTS (mode vocal/mic), false = pas de queue (mode normal)
 export let ttsQueueEnabled = false;
 export function setTtsQueueEnabled(val: boolean) { ttsQueueEnabled = val; }
+export function setSpeechMuted(val: boolean) {
+  speechMuted = Boolean(val);
+  if (speechMuted) {
+    cancelSpeech();
+  }
+}
+export function isSpeechMuted() { return speechMuted; }
 
 let currentAudio: HTMLAudioElement | null = null;
 
 function emitEvent(name: string) {
-  try { window.dispatchEvent(new Event(name)); } catch (e) { /* ignore */ }
+  const dispatcher = (globalThis as any)?.dispatchEvent;
+  if (typeof dispatcher === 'function') {
+    dispatcher.call(globalThis, new Event(name));
+  }
+}
+
+function getApiOrigin(): string {
+  const currentOrigin = (globalThis as any)?.location?.origin || 'http://localhost';
+  if (!API_BASE) return currentOrigin;
+  try {
+    return new URL(API_BASE, currentOrigin).origin;
+  } catch (error) {
+    console.warn('[speech] Invalid VITE_API_BASE_URL/VITE_API_URL, falling back to current origin', error);
+    return currentOrigin;
+  }
+}
+
+function resolveAudioUrl(audioUrl: string): string {
+  const value = String(audioUrl || '').trim();
+  if (!value) return value;
+  if (value.startsWith('blob:') || value.startsWith('data:') || /^https?:\/\//i.test(value)) return value;
+  if (value.startsWith('/')) return `${getApiOrigin()}${value}`;
+  try {
+    return new URL(value, TTS_ENDPOINT).toString();
+  } catch {
+    return value;
+  }
 }
 
 function stopCurrentAudio() {
@@ -52,6 +89,11 @@ export function speak(
     onError?: (error: Error) => void;
   } = {}
 ): void {
+  if (speechMuted || !String(text || '').trim()) {
+    options.onEnd?.();
+    return;
+  }
+
   if (ttsQueueEnabled) {
     // Ajoute à la queue et traite en séquence
     speechQueue.push({ text, options });
@@ -81,6 +123,11 @@ export function queueSpeech(
     onError?: (error: Error) => void;
   } = {}
 ): void {
+  if (speechMuted || !String(text || '').trim()) {
+    options.onEnd?.();
+    return;
+  }
+
   if (ttsQueueEnabled) {
     speechQueue.push({ text, options });
     if (!isProcessingQueue && !currentAudio) {
@@ -117,15 +164,16 @@ export function queueLength(): number {
 
 async function fetchAndPlayPiperTTS(text: string, options: any = {}, onEnd?: () => void): Promise<void> {
   try {
-    const res = await fetch('http://127.0.0.1:5002/api/tts', {
+    const res = await fetch(TTS_ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ text, ...options })
     });
     if (!res.ok) throw new Error('Piper TTS server error');
     const data = await res.json();
     if (!data.audio_url) throw new Error('No audio_url in Piper response');
-    const audio = new Audio(data.audio_url);
+    const audio = new Audio(resolveAudioUrl(data.audio_url));
     currentAudio = audio;
     audio.onended = () => {
       emitEvent('a11:speechend');
@@ -140,7 +188,14 @@ async function fetchAndPlayPiperTTS(text: string, options: any = {}, onEnd?: () 
       if (currentAudio === audio) currentAudio = null;
     };
     emitEvent('a11:speechstart');
-    audio.play();
+    const playPromise = audio.play();
+    playPromise.catch((error) => {
+      console.error('[speech] audio.play() failed', error);
+      emitEvent('a11:speechend');
+      options.onError?.(new Error(`Audio playback blocked: ${String(error?.message || error)}`));
+      onEnd?.();
+      if (currentAudio === audio) currentAudio = null;
+    });
   } catch (err: any) {
     emitEvent('a11:speechend');
     options.onError?.(err);
