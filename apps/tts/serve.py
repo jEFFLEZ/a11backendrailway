@@ -23,6 +23,7 @@ else:
 
 
 # --- DOWNLOAD MODEL IF MISSING ---
+
 if not os.path.exists(MODEL_PATH):
     if not MODEL_URL:
         print("[TTS] ❌ MODEL_URL manquant")
@@ -31,6 +32,13 @@ if not os.path.exists(MODEL_PATH):
     try:
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("[TTS] ✅ Model ready")
+        # Télécharge aussi le .json si besoin
+        JSON_PATH = MODEL_PATH + ".json"
+        JSON_URL = MODEL_URL + ".json"
+        if not os.path.exists(JSON_PATH):
+            print(f"[TTS] ⬇️ Download config from {JSON_URL}")
+            urllib.request.urlretrieve(JSON_URL, JSON_PATH)
+            print("[TTS] ✅ Config ready")
     except Exception as e:
         print("[TTS] ❌ Download failed:", e)
         raise SystemExit(1)
