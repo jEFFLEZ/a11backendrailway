@@ -1,43 +1,19 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import urllib.parse
-import json
 import os
-import subprocess
-import uuid
-import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-ROOT_DIR = os.path.dirname(__file__)
+# --- Railway-compatible HTTP server ---
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'TTS service is running')
 
-# --- CONFIG ---
-MODEL_PATH = os.path.join(ROOT_DIR, "model.onnx")
-MODEL_URL = os.environ.get("MODEL_URL", "")
-ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
-OUT_DIR = os.path.join(ROOT_DIR, "out")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-
-# --- PIPER EXECUTABLE PATH (LINUX/RAILWAY) ---
-PIPER_EXE = os.path.join(ROOT_DIR, "piper", "piper")
-
-
-# --- DOWNLOAD MODEL IF MISSING ---
-
-MODEL_URL = os.environ.get("MODEL_URL", "")
-    if not MODEL_URL:
-        print("[TTS] ❌ MODEL_URL manquant")
-        raise SystemExit(1)
-    print(f"[TTS] ⬇️ Download model from {MODEL_URL}")
-PIPER_EXE = os.environ.get("PIPER_PATH", os.path.join(ROOT_DIR, "piper", "piper"))
-        print("[TTS] ✅ Model ready")
-# --- AUTO-DOWNLOAD DU MODÈLE SI URL ---
-        # Télécharge aussi le .json si besoin
-        JSON_PATH = MODEL_PATH + ".json"
-        JSON_URL = MODEL_URL + ".json"
-        if not os.path.exists(JSON_PATH):
-            print(f"[TTS] ⬇️ Download config from {JSON_URL}")
-            urllib.request.urlretrieve(JSON_URL, JSON_PATH)
-            print("[TTS] ✅ Config ready")
-    except Exception as e:
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"Server running on port {port}")
+    server.serve_forever()
         print("[TTS] ❌ Download failed:", e)
         raise SystemExit(1)
 
