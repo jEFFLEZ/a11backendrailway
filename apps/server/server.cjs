@@ -1979,12 +1979,45 @@ function getLocalLlamaCompletionUrl() {
   return `${base.replace(/\/$/, '')}/completion`;
 }
 
+function normalizeChatRole(role) {
+  const normalized = String(role || '').trim().toLowerCase();
+  if (normalized === 'system' || normalized === 'assistant' || normalized === 'user') return normalized;
+  return null;
+}
+
+function sanitizePromptMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+
+  const sanitized = [];
+  for (const message of messages) {
+    const role = normalizeChatRole(message?.role);
+    const content = typeof message?.content === 'string' ? message.content.trim() : '';
+    if (!role || !content) continue;
+
+    const previous = sanitized[sanitized.length - 1];
+    // Drop accidental adjacent duplicates that can create echo effects.
+    if (previous && previous.role === role && previous.content === content) continue;
+
+    sanitized.push({ role, content });
+  }
+
+  // Keep a bounded history to reduce prompt drift and self-referential loops.
+  return sanitized.slice(-24);
+}
+
 function buildPromptFromMessages(messages) {
-  if (!Array.isArray(messages) || messages.length === 0) return '';
-  return messages
-    .map((m) => (typeof m?.content === 'string' ? m.content : ''))
-    .filter(Boolean)
-    .join('\n');
+  const sanitized = sanitizePromptMessages(messages);
+  if (sanitized.length === 0) return '';
+
+  const lines = sanitized.map((message) => `${message.role}: ${message.content}`);
+
+  // Force one assistant turn completion and avoid continuing previous assistant text.
+  const lastRole = sanitized[sanitized.length - 1]?.role;
+  if (lastRole !== 'assistant') {
+    lines.push('assistant:');
+  }
+
+  return lines.join('\n');
 }
 
 function extractLocalCompletionContent(payload) {
