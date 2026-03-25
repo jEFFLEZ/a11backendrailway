@@ -12,3 +12,7 @@ echo "Extracting Piper..."
 tar -xvf piper_linux_x86_64.tar.gz
 
 echo "Done."
+
+# Move and chmod piper binary for Railway
+mv piper apps/tts/piper
+chmod +x apps/tts/piper
