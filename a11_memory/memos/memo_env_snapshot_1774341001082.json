@@ -1,0 +1,14 @@
+{
+  "id": "memo_env_snapshot_1774341001082",
+  "ts": "2026-03-24T08:30:01.081Z",
+  "type": "env_snapshot",
+  "data": {
+    "ts": 1774341001080,
+    "env": {},
+    "qflush": {
+      "available": true,
+      "module": false,
+      "exePath": null
+    }
+  }
+}

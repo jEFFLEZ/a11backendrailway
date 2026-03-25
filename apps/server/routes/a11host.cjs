@@ -25,6 +25,46 @@ let headlessConfig = {
   shellCwd: process.env.A11_SHELL_CWD || null
 };
 
+const PROTECTED_PATH_SEGMENTS = new Set([
+  'node_modules',
+  '.git',
+  '.env',
+  '.a11_backups',
+  '.qflash',
+  '.qflush'
+]);
+
+const SAFE_MODE = String(process.env.A11_SAFE_MODE ?? 'true').toLowerCase() !== 'false';
+
+function hasDeleteConfirmation(input = {}) {
+  const token = String(input.confirm || input.confirmation || '').trim();
+  return input.confirmDelete === true && token === 'DELETE';
+}
+
+function isProtectedPath(targetPath) {
+  const normalized = path.resolve(String(targetPath || '')).toLowerCase();
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  return parts.some((segment) => PROTECTED_PATH_SEGMENTS.has(segment));
+}
+
+function assertDeleteAllowed(targetPath, input = {}) {
+  console.log('[A11 ACTION]', {
+    action: 'delete',
+    path: targetPath,
+    user: input.user || input.requestedBy || 'unknown',
+    timestamp: Date.now()
+  });
+  if (SAFE_MODE) {
+    throw new Error('DeleteFile refused: SAFE_MODE is enabled');
+  }
+  if (!hasDeleteConfirmation(input)) {
+    throw new Error('DeleteFile refused: explicit confirmation required (confirmDelete=true and confirm="DELETE")');
+  }
+  if (isProtectedPath(targetPath)) {
+    throw new Error(`DeleteFile refused on protected path: ${targetPath}`);
+  }
+}
+
 /**
  * Initialize A11Host bridge (called by VSIX when available)
  */
@@ -59,7 +99,8 @@ const headlessHost = {
   /**
    * DeleteFile : suppression directe côté FS
    */
-  async DeleteFile(absPath) {
+  async DeleteFile(absPath, options = {}) {
+    assertDeleteAllowed(absPath, options);
     await fs.unlink(absPath);
     return true;
   },
@@ -307,12 +348,33 @@ function registerA11HostRoutes(router) {
       if (!filePath || typeof filePath !== 'string') {
         return res.status(400).json({ ok: false, error: 'missing_path_parameter' });
       }
+      if (!hasDeleteConfirmation(req.body || {})) {
+        return res.status(400).json({
+          ok: false,
+          error: 'missing_delete_confirmation',
+          message: 'Explicit confirmation is required (confirmDelete=true and confirm="DELETE").'
+        });
+      }
+      if (SAFE_MODE) {
+        return res.status(403).json({
+          ok: false,
+          error: 'safe_mode_delete_disabled',
+          message: 'Delete is disabled while A11_SAFE_MODE is enabled.'
+        });
+      }
       
       // Get workspace root for validation
       const workspaceRoot = await callA11Host('GetWorkspaceRoot');
       const validatedPath = validatePath(filePath, workspaceRoot);
+      if (isProtectedPath(validatedPath)) {
+        return res.status(403).json({
+          ok: false,
+          error: 'protected_path_denied',
+          path: validatedPath
+        });
+      }
       
-      const success = await callA11Host('DeleteFile', validatedPath);
+      const success = await callA11Host('DeleteFile', validatedPath, req.body || {});
       console.log(`[A11Host] DeleteFile: ${validatedPath} - ${success ? 'success' : 'failed'}`);
       res.json({ ok: true, success, path: validatedPath });
     } catch (err) {

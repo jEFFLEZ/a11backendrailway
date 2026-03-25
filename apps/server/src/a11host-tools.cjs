@@ -508,7 +508,7 @@ async function handleA11HostToolCall(toolCall, a11fs) {
 
       // File management
       case 'delete_file':
-        return { success: await a11fs.deleteFile(args.path), path: args.path };
+        return { success: await a11fs.deleteFile(args.path, args), path: args.path };
       
       case 'rename_file':
         return { 

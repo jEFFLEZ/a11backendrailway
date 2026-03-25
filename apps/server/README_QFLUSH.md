@@ -100,7 +100,42 @@ NODE_ENV=development             # Requis pour frontend supervision
 # Configuration du superviseur
 MAX_RESTARTS=3                   # Nombre max de redémarrages auto
 RESTART_DELAY=3000               # Délai entre redémarrages (ms)
+
+# Chat Qflush
+QFLUSH_CHAT_FLOW=a11.chat.v1     # Flow principal chat si tu passes par Qflush
+
+# Mémoire logique utilisateur
+QFLUSH_MEMORY_SUMMARY_FLOW=a11.memory.summary.v1   # Flow de résumé logique
+MEMORY_SUMMARY_PROVIDER=local    # local|openai, optionnel
+MEMORY_SUMMARY_MODEL=            # optionnel, sinon modèle par défaut
+CHAT_MEMORY_LIMIT=15             # nombre de messages relus avant réponse
+LOGICAL_MEMORY_UPDATE_EVERY=3    # mise à jour du résumé tous les 3 messages user
+
+# Stockage fichiers générés (Cloudflare R2 / S3 compatible)
+R2_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com
+R2_ACCESS_KEY=xxx
+R2_SECRET_KEY=xxx
+R2_BUCKET=a11-files
+R2_PUBLIC_BASE_URL=https://files.ton-domaine.tld   # optionnel mais recommandé
+FILE_UPLOAD_MAX_BYTES=10485760                     # 10 Mo par défaut
 ```
+
+### Flow mémoire logique par défaut
+
+Le backend A11 réserve un flow logique stable:
+
+```bash
+QFLUSH_MEMORY_SUMMARY_FLOW=a11.memory.summary.v1
+```
+
+Si ce flow n'existe pas côté service Qflush distant, le backend exécute un fallback intégré:
+
+- relit la mémoire logique existante
+- relit les 15 derniers messages
+- appelle le backend LLM local ou OpenAI
+- produit un résumé court et structuré
+
+Si tu implémentes plus tard un vrai flow distant du même nom dans Qflush, A11 pourra l'utiliser en configurant simplement la variable d'environnement.
 
 ### Désactiver la supervision complète
 
@@ -132,6 +167,19 @@ GET /api/qflush/status
 ```
 
 Retourne l'état de tous les services supervisés.
+
+Retourne aussi:
+
+- `chatFlow`
+- `memorySummaryFlow`
+- `memorySummaryBuiltIn`
+
+### Endpoints fichiers (R2)
+
+Authentifiés par JWT:
+
+- `POST /api/files/upload` : upload base64 vers R2, enregistre en DB, envoi email optionnel
+- `GET /api/files/my?limit=20` : liste les fichiers de l'utilisateur connecté
 
 ### Redémarrer un service (TODO)
 ```bash

@@ -225,6 +225,48 @@ function assertPathAllowed(p, label = 'path') {
   }
 }
 
+const PROTECTED_PATH_SEGMENTS = new Set([
+  'node_modules',
+  '.git',
+  '.env',
+  '.a11_backups',
+  '.qflash',
+  '.qflush'
+]);
+
+const SAFE_MODE = String(process.env.A11_SAFE_MODE ?? 'true').toLowerCase() !== 'false';
+
+function hasDeleteConfirmation(args = {}) {
+  const token = String(args.confirm || args.confirmation || '').trim();
+  return args.confirmDelete === true && token === 'DELETE';
+}
+
+function isProtectedPath(targetPath) {
+  const normalized = path.resolve(String(targetPath || '')).toLowerCase();
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  return parts.some((segment) => PROTECTED_PATH_SEGMENTS.has(segment));
+}
+
+function assertDeleteGuards(targetPath, args = {}) {
+  console.log('[A11 ACTION]', {
+    action: 'delete',
+    path: targetPath,
+    user: args.user || args.requestedBy || 'unknown',
+    timestamp: Date.now()
+  });
+  if (SAFE_MODE) {
+    throw new Error('delete operation refused: SAFE_MODE is enabled');
+  }
+  if (!hasDeleteConfirmation(args)) {
+    throw new Error(
+      'delete operation refused: explicit confirmation required (confirmDelete=true and confirm="DELETE")'
+    );
+  }
+  if (isProtectedPath(targetPath)) {
+    throw new Error(`delete operation refused on protected path: ${targetPath}`);
+  }
+}
+
 function ensureToolAvailable(name) {
   const spec = TOOL_MANIFEST[name];
   if (!spec) {
@@ -312,6 +354,7 @@ async function t_fs_stat(args = {}) {
 async function t_fs_delete(args = {}) {
   const { path: p } = args;
   assertPathAllowed(p, 'fs_delete.path');
+  assertDeleteGuards(p, args);
   if (!fsSync.existsSync(p)) {
     return { ok: true, deleted: false, reason: 'not_exists', path: p };
   }
@@ -1016,6 +1059,35 @@ async function runActionsEnvelope(envelope) {
           arguments: args
         });
         break; // Stop batch if download_file is incomplete
+      }
+    }
+    if (name === 'fs_delete') {
+      if (SAFE_MODE) {
+        results.push({
+          action: name,
+          ok: false,
+          error: 'fs_delete: SAFE_MODE is enabled',
+          arguments: args
+        });
+        break;
+      }
+      if (!hasDeleteConfirmation(args)) {
+        results.push({
+          action: name,
+          ok: false,
+          error: 'fs_delete: explicit confirmation required (confirmDelete=true and confirm="DELETE")',
+          arguments: args
+        });
+        break;
+      }
+      if (isProtectedPath(args.path)) {
+        results.push({
+          action: name,
+          ok: false,
+          error: `fs_delete: protected path denied (${args.path})`,
+          arguments: args
+        });
+        break;
       }
     }
     try {

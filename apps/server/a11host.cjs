@@ -25,6 +25,46 @@ let headlessConfig = {
   shellCwd: process.env.A11_SHELL_CWD || null
 };
 
+const PROTECTED_PATH_SEGMENTS = new Set([
+  'node_modules',
+  '.git',
+  '.env',
+  '.a11_backups',
+  '.qflash',
+  '.qflush'
+]);
+
+const SAFE_MODE = String(process.env.A11_SAFE_MODE ?? 'true').toLowerCase() !== 'false';
+
+function hasDeleteConfirmation(input = {}) {
+  const token = String(input.confirm || input.confirmation || '').trim();
+  return input.confirmDelete === true && token === 'DELETE';
+}
+
+function isProtectedPath(targetPath) {
+  const normalized = path.resolve(String(targetPath || '')).toLowerCase();
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  return parts.some((segment) => PROTECTED_PATH_SEGMENTS.has(segment));
+}
+
+function assertDeleteAllowed(targetPath, input = {}) {
+  console.log('[A11 ACTION]', {
+    action: 'delete',
+    path: targetPath,
+    user: input.user || input.requestedBy || 'unknown',
+    timestamp: Date.now()
+  });
+  if (SAFE_MODE) {
+    throw new Error('DeleteFile refused: SAFE_MODE is enabled');
+  }
+  if (!hasDeleteConfirmation(input)) {
+    throw new Error('DeleteFile refused: explicit confirmation required (confirmDelete=true and confirm="DELETE")');
+  }
+  if (isProtectedPath(targetPath)) {
+    throw new Error(`DeleteFile refused on protected path: ${targetPath}`);
+  }
+}
+
 /**
  * Initialize A11Host bridge (called by VSIX when available)
  */
@@ -59,7 +99,8 @@ const headlessHost = {
   /**
    * DeleteFile : suppression directe côté FS
    */
-  async DeleteFile(absPath) {
+  async DeleteFile(absPath, options = {}) {
+    assertDeleteAllowed(absPath, options);
     await fs.unlink(absPath);
     return true;
   },

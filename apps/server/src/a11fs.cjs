@@ -2,6 +2,28 @@ const fs = require('fs/promises');
 const path = require('path');
 const { exec } = require('child_process');
 
+const PROTECTED_PATH_SEGMENTS = new Set([
+  'node_modules',
+  '.git',
+  '.env',
+  '.a11_backups',
+  '.qflash',
+  '.qflush'
+]);
+
+const SAFE_MODE = String(process.env.A11_SAFE_MODE ?? 'true').toLowerCase() !== 'false';
+
+function hasDeleteConfirmation(options = {}) {
+  const token = String(options.confirm || options.confirmation || '').trim();
+  return options.confirmDelete === true && token === 'DELETE';
+}
+
+function isProtectedPath(targetPath) {
+  const normalized = path.resolve(String(targetPath || '')).toLowerCase();
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  return parts.some((segment) => PROTECTED_PATH_SEGMENTS.has(segment));
+}
+
 const a11fs = {
   // Analyse & édition
   async getCompilationErrors() { return []; },
@@ -13,7 +35,25 @@ const a11fs = {
   async replaceSelection(newText) { return true; },
 
   // Fichiers
-  async deleteFile(filePath) { await fs.unlink(filePath); return true; },
+  async deleteFile(filePath, options = {}) {
+    console.log('[A11 ACTION]', {
+      action: 'delete',
+      path: filePath,
+      user: options.user || options.requestedBy || 'unknown',
+      timestamp: Date.now()
+    });
+    if (SAFE_MODE) {
+      throw new Error('delete_file refused: SAFE_MODE is enabled');
+    }
+    if (!hasDeleteConfirmation(options)) {
+      throw new Error('delete_file refused: explicit confirmation required (confirmDelete=true and confirm="DELETE")');
+    }
+    if (isProtectedPath(filePath)) {
+      throw new Error(`delete_file refused on protected path: ${filePath}`);
+    }
+    await fs.unlink(filePath);
+    return true;
+  },
   async renameFile(oldPath, newPath) { await fs.rename(oldPath, newPath); return true; },
 
   // VS Integration
