@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import uuid
-import urllib.request
+import requests
 
 ROOT_DIR = os.path.dirname(__file__)
 
@@ -15,23 +15,21 @@ ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- PIPER AUTO DETECT ---
-if os.name == "nt":
-    PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
-else:
-    PIPER_EXE = "piper"
+
+# --- PIPER EXECUTABLE PATH (LINUX/RAILWAY) ---
+PIPER_EXE = os.path.join(ROOT_DIR, "piper", "piper")
 
 
 # --- DOWNLOAD MODEL IF MISSING ---
 
-if not os.path.exists(MODEL_PATH):
+MODEL_URL = os.environ.get("MODEL_URL", "")
     if not MODEL_URL:
         print("[TTS] ❌ MODEL_URL manquant")
         raise SystemExit(1)
     print(f"[TTS] ⬇️ Download model from {MODEL_URL}")
-    try:
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+PIPER_EXE = os.environ.get("PIPER_PATH", os.path.join(ROOT_DIR, "piper", "piper"))
         print("[TTS] ✅ Model ready")
+# --- AUTO-DOWNLOAD DU MODÈLE SI URL ---
         # Télécharge aussi le .json si besoin
         JSON_PATH = MODEL_PATH + ".json"
         JSON_URL = MODEL_URL + ".json"
@@ -45,7 +43,8 @@ if not os.path.exists(MODEL_PATH):
 
 # --- CHECK .onnx.json CONFIG ---
 CONFIG_PATH = MODEL_PATH + ".json"
-if not os.path.exists(CONFIG_PATH):
+MODEL_PATH_ENV = os.environ.get("MODEL_PATH")
+MODEL_PATH = ensure_model()
     print(f"[TTS] ❌ Fichier de configuration Piper manquant : {CONFIG_PATH}\nTélécharge le .onnx.json correspondant sur R2 !")
     raise SystemExit(1)
 
