@@ -1,3 +1,4 @@
+import os
 import uuid
 import subprocess
 import json
@@ -5,13 +6,16 @@ import urllib.parse
 
 # Placeholder values for required variables
 OUT_DIR = "out"
-ESPEAK_DATA = "/usr/share/espeak-ng-data"  # Adjust as needed
-# Use 'piper' for global binary (installed in /usr/local/bin)
-PIPER_EXE = "piper"
+ESPEAK_DATA = "./espeak-ng-data"  # Windows/local compatible
+# Use 'piper.exe' for Windows local dev (no './')
+if os.name == "nt":
+    PIPER_EXE = os.path.abspath("piper.exe")
+else:
+    PIPER_EXE = "./piper"
+
 def ensure_model():
-    # Dummy implementation, replace with actual model setup
-    return "model.onnx"
-import os
+    # Use the actual model filename present in apps/tts/
+    return "fr_FR-siwis-medium.onnx"
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # --- Railway-compatible HTTP server ---
@@ -57,11 +61,13 @@ def synthesize(text):
 
     print("[TTS] ▶", text)
 
+    # Always use shell=False, and PIPER_EXE is absolute on Windows
     result = subprocess.run(
         cmd,
         input=text.encode("utf-8"),
         capture_output=True,
-        env=env
+        env=env,
+        shell=False
     )
 
     print("[TTS] stdout:", result.stdout.decode(errors="ignore"))
@@ -123,12 +129,17 @@ class Handler(BaseHTTPRequestHandler):
 
             try:
                 fname = synthesize(text)
-                host = self.headers.get("Host")
+                # Use BASE_URL env var if set, else just return the path
+                BASE_URL = os.environ.get("BASE_URL", "")
+                if BASE_URL:
+                    audio_url = f"{BASE_URL}/out/{fname}"
+                else:
+                    audio_url = f"/out/{fname}"
 
                 self._send_json(200, {
                     "status": "ok",
                     "text": text,
-                    "audio_url": f"https://{host}/out/{fname}"
+                    "audio_url": audio_url
                 })
 
             except Exception as e:
