@@ -146,6 +146,36 @@ function resolvePiperModel(requestedModel) {
   return null;
 }
 
+function ensurePiperModelSidecars(modelPath) {
+  const resolvedModelPath = String(modelPath || '').trim();
+  if (!resolvedModelPath || !fs.existsSync(resolvedModelPath)) {
+    return { modelJsonPath: null, modelJsonExists: false };
+  }
+
+  const preferred = `${resolvedModelPath}.json`;
+  const legacy = resolvedModelPath.replace(/\.onnx$/i, '.json');
+  const existing = [preferred, legacy].find((candidate) => fs.existsSync(candidate)) || null;
+
+  if (fs.existsSync(preferred) && fs.existsSync(legacy)) {
+    return { modelJsonPath: preferred, modelJsonExists: true };
+  }
+
+  if (existing) {
+    const missing = preferred === existing ? legacy : preferred;
+    try {
+      fs.copyFileSync(existing, missing);
+    } catch (error_) {
+      console.warn('[TTS][Piper] failed to mirror model sidecar:', error_.message);
+    }
+    return {
+      modelJsonPath: fs.existsSync(preferred) ? preferred : existing,
+      modelJsonExists: fs.existsSync(preferred) || fs.existsSync(legacy),
+    };
+  }
+
+  return { modelJsonPath: null, modelJsonExists: false };
+}
+
 function getSpawnReadiness(requestedModel) {
   const piper = resolvePiperBinary();
   const modelPath = resolvePiperModel(requestedModel);
@@ -155,8 +185,9 @@ function getSpawnReadiness(requestedModel) {
         modelPath.replace(/\.onnx$/i, '.json'),
       ]
     : [];
-  const modelJsonPath = modelJsonCandidates.find((candidate) => fs.existsSync(candidate)) || null;
-  const modelJsonExists = Boolean(modelJsonPath);
+  const ensuredSidecar = ensurePiperModelSidecars(modelPath);
+  const modelJsonPath = ensuredSidecar.modelJsonPath || modelJsonCandidates.find((candidate) => fs.existsSync(candidate)) || null;
+  const modelJsonExists = ensuredSidecar.modelJsonExists || Boolean(modelJsonPath);
   return {
     ready: Boolean(piper && modelPath && modelJsonExists),
     piperCommand: piper?.command || null,
@@ -322,6 +353,7 @@ function spawnPiperLocal(text, model) {
     try {
       const piper = resolvePiperBinary();
       const modelPath = resolvePiperModel(model);
+      ensurePiperModelSidecars(modelPath);
 
       if (!piper) {
         return reject(new Error('piper binary not found (set PIPER_BIN)'));
