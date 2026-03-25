@@ -1,59 +1,100 @@
-# serve.py — Piper HTTP TTS server (Linux/Railway compatible)
-
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
+import json
+import os
 import subprocess
 import uuid
-import os
-import json
-import threading
-import time
+import urllib.request
 
-_dir = os.path.dirname(os.path.abspath(__file__))
-MODEL = os.environ.get("TTS_MODEL_PATH", os.path.join(_dir, "fr_FR-siwis-medium.onnx"))
-PIPER = os.environ.get("PIPER_BIN", "piper")
-# On Railway: set TTS_OUT_DIR=/app/public/tts so Node's express.static serves the files at /tts/<name>
-# Locally:   defaults to <serve.py dir>/out/ (served by serve.py itself at /out/<name>)
-OUT_DIR = os.environ.get("TTS_OUT_DIR", os.path.join(_dir, "out"))
-AUDIO_URL_PREFIX = os.environ.get("TTS_AUDIO_URL_PREFIX", "/tts")  # must match Node's static route
-PORT = int(os.environ.get("PIPER_HTTP_PORT", "5002"))
-TTL_SECONDS = 60 * 10  # 10 minutes
+ROOT_DIR = os.path.dirname(__file__)
 
+# --- CONFIG ---
+MODEL_PATH = os.path.join(ROOT_DIR, "model.onnx")
+MODEL_URL = os.environ.get("MODEL_URL", "")
+ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
+OUT_DIR = os.path.join(ROOT_DIR, "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-def cleanup_wav():
-    while True:
-        now = time.time()
-        for fname in os.listdir(OUT_DIR):
-            fpath = os.path.join(OUT_DIR, fname)
-            if not fname.endswith(".wav"):
-                continue
-            try:
-                mtime = os.path.getmtime(fpath)
-                if now - mtime > TTL_SECONDS:
-                    os.remove(fpath)
-                    print("[CLEANUP] Deleted:", fpath)
-            except Exception as e:
-                print("[CLEANUP] Error deleting", fpath, e)
-        time.sleep(60)
+# --- PIPER AUTO DETECT ---
+if os.name == "nt":
+    PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
+else:
+    PIPER_EXE = "piper"
 
+
+# --- DOWNLOAD MODEL IF MISSING ---
+if not os.path.exists(MODEL_PATH):
+    if not MODEL_URL:
+        print("[TTS] ❌ MODEL_URL manquant")
+        raise SystemExit(1)
+    print(f"[TTS] ⬇️ Download model from {MODEL_URL}")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("[TTS] ✅ Model ready")
+    except Exception as e:
+        print("[TTS] ❌ Download failed:", e)
+        raise SystemExit(1)
+
+# --- CHECK .onnx.json CONFIG ---
+CONFIG_PATH = MODEL_PATH + ".json"
+if not os.path.exists(CONFIG_PATH):
+    print(f"[TTS] ❌ Fichier de configuration Piper manquant : {CONFIG_PATH}\nTélécharge le .onnx.json correspondant sur R2 !")
+    raise SystemExit(1)
+
+# --- CLEAN TEXT ---
+def clean_text(text):
+    import re
+    text = re.sub(r'<\|.*?\|>', '', text)
+    text = re.sub(r'[\*_~`|#>\[\]{}]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+# --- SYNTH ---
 def synthesize(text):
-    out_file = os.path.join(OUT_DIR, f"{uuid.uuid4()}.wav")
-    cmd = [PIPER, "-m", MODEL, "--output_file", out_file]
-    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    p.communicate(text.encode("utf-8"))
-    if p.returncode != 0 or not os.path.exists(out_file):
-        raise RuntimeError(f"piper exited with code {p.returncode}")
-    return out_file
+    text = clean_text(text)
+    if not text:
+        text = "Bonjour"
 
+    fname = f"{uuid.uuid4().hex}.wav"
+    out_path = os.path.join(OUT_DIR, fname)
+
+    env = os.environ.copy()
+    env["ESPEAK_DATA_PATH"] = ESPEAK_DATA
+
+    cmd = [
+        PIPER_EXE,
+        "-m", MODEL_PATH,
+        "--output_file", out_path,
+    ]
+
+    print("[TTS] ▶", text)
+
+    result = subprocess.run(
+        cmd,
+        input=text.encode("utf-8"),
+        capture_output=True,
+        env=env
+    )
+
+    print("[TTS] stdout:", result.stdout.decode(errors="ignore"))
+    print("[TTS] stderr:", result.stderr.decode(errors="ignore"))
+
+    if result.returncode != 0:
+        raise RuntimeError("Piper error")
+
+    return fname
+
+# --- SERVER ---
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        print("[PIPER]", format % args)
 
-    def _send_json(self, code, obj):
-        body = json.dumps(obj).encode()
+    def log_message(self, format, *args):
+        print("[TTS]", format % args)
+
+    def _send_json(self, code, data):
+        body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -61,88 +102,83 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
 
-        # Serve WAV files: GET /out/<filename>
+        # HEALTH CHECK
+        if parsed.path == "/health":
+            self._send_json(200, {"ok": True})
+            return
+
+        # AUDIO FILE
         if parsed.path.startswith("/out/"):
             fname = os.path.basename(parsed.path)
             fpath = os.path.join(OUT_DIR, fname)
-            if not os.path.exists(fpath) or not fname.endswith(".wav"):
+
+            if not os.path.exists(fpath):
                 self.send_response(404)
                 self.end_headers()
                 return
+
             with open(fpath, "rb") as f:
                 data = f.read()
+
             self.send_response(200)
             self.send_header("Content-Type", "audio/wav")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
             return
 
-        # GET /api/tts?text=... (legacy compat)
+        # TTS
         if parsed.path == "/api/tts":
             q = urllib.parse.parse_qs(parsed.query)
-            text = q.get("text", [""])[0].strip()
-            if not text:
-                self._send_json(400, {"error": "missing text"})
-                return
+            text = q.get("text", [""])[0]
+
             try:
-                out_file = synthesize(text)
+                fname = synthesize(text)
+                host = self.headers.get("Host")
+
+                self._send_json(200, {
+                    "status": "ok",
+                    "text": text,
+                    "audio_url": f"https://{host}/out/{fname}"
+                })
+
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
-                return
-            self._send_json(200, {
-                "status": "ok",
-                "text": text,
-                "audio_url": f"/out/{os.path.basename(out_file)}"
-            })
             return
 
         self.send_response(404)
         self.end_headers()
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/api/tts":
-            self.send_response(404)
-            self.end_headers()
-            return
-
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
+
         try:
             data = json.loads(body)
-            text = str(data.get("text", "")).strip()
-        except Exception:
-            self._send_json(400, {"error": "invalid JSON"})
+            text = data.get("text", "")
+        except:
+            self._send_json(400, {"error": "invalid json"})
             return
 
-        if not text:
-            self._send_json(400, {"error": "missing text"})
-            return
-
-        print("[PIPER] Texte reçu :", text)
         try:
-            out_file = synthesize(text)
+            fname = synthesize(text)
+            host = self.headers.get("Host")
+
+            self._send_json(200, {
+                "status": "ok",
+                "text": text,
+                "audio_url": f"https://{host}/out/{fname}"
+            })
+
         except Exception as e:
             self._send_json(500, {"error": str(e)})
-            return
 
-        # Return JSON with audio_url — Node.js requestRemoteTts picks up audio_url
-        # and serves the file via its own express.static at /tts/<name>
-        audio_url = f"{AUDIO_URL_PREFIX}/{os.path.basename(out_file)}"
-        self._send_json(200, {
-            "status": "ok",
-            "text": text,
-            "audio_url": audio_url
-        })
-
+# --- RUN ---
 def run():
-    threading.Thread(target=cleanup_wav, daemon=True).start()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[PIPER] Serveur TTS lancé sur http://0.0.0.0:{PORT}")
-    print(f"[PIPER] Modèle : {MODEL}")
-    print(f"[PIPER] Binaire : {PIPER}")
-    server.serve_forever()
+    PORT = int(os.environ.get("PORT", 5002))
+    print(f"[TTS] 🚀 Running on port {PORT}")
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 if __name__ == "__main__":
     run()

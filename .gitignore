@@ -1,71 +1,31 @@
-# Local Netlify folder
+# Local Netlify
 .netlify
+
+# Models (OK)
 apps/server/tts/*.onnx
-# Local environment variables
+
+# Env
 .env
-# Per-app local env files (do not commit secrets)
 apps/server/.env.local
 apps/web/.env.local
-
-# Encrypted env output (machine-protected)
 .env.enc
 
-# IDE files
+# IDE
 .vscode/
 .vs/
 
-# Visual Studio
-*.suo
-*.user
-*.userosscache
-*.sln.docstates
-
-# Web build output and legacy public assets
+# Build
 apps/web/dist/
-apps/web/public/legacy/
-
-# Misc
-tools/qflush-vsix/
-Qflush.A11/.vs/
-
-# TTS output
-tts/out/
 
 # Logs
 *.log
 logs/
- 
-# Dumps, logs, temp, debug
-*.log
-*.log.*
-apps/server/tts/*.onnx
+
+# Temp
 *.tmp
 *.bak
 *.swp
-*.ps1
-*.out
-*.txt
-*.json
-*.svg
 
-# Fichiers/dossiers spécifiques à ignorer
-cleanup*.log
-fix-install*.log
-run_*_logs.txt
-temp_out*.txt
-decoded_brotli_red_80.json
-dump-*.ps1
-qflush-code-dump.txt
-st.txt
-tart skeleton*
-tmp/
-tmp-pem/
-.git-rewrite/
-dist/
-build.log
-Cartes de pirate au coucher du soleil.png
-Logo et personnage Funesterie.png
-
-# OS files
+# OS
 .DS_Store
 Thumbs.db
