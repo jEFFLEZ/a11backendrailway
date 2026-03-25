@@ -1,31 +1,7 @@
-# Local Netlify
-.netlify
-
-# Models (OK)
-apps/server/tts/*.onnx
-
-# Env
-.env
-apps/server/.env.local
-apps/web/.env.local
-.env.enc
-
-# IDE
+node_modules/
+dist/
 .vscode/
+.idea/
 .vs/
-
-# Build
-apps/web/dist/
-
-# Logs
-*.log
-logs/
-
-# Temp
-*.tmp
-*.bak
-*.swp
-
-# OS
 .DS_Store
 Thumbs.db
