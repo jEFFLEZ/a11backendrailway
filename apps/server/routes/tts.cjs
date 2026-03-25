@@ -147,12 +147,20 @@ function resolvePiperModel(requestedModel) {
 function getSpawnReadiness(requestedModel) {
   const piper = resolvePiperBinary();
   const modelPath = resolvePiperModel(requestedModel);
-  const modelJsonPath = modelPath ? `${modelPath}.json` : null;
-  const modelJsonExists = Boolean(modelJsonPath && fs.existsSync(modelJsonPath));
+  const modelJsonCandidates = modelPath
+    ? [
+        `${modelPath}.json`,
+        modelPath.replace(/\.onnx$/i, '.json'),
+      ]
+    : [];
+  const modelJsonPath = modelJsonCandidates.find((candidate) => fs.existsSync(candidate)) || null;
+  const modelJsonExists = Boolean(modelJsonPath);
   return {
     ready: Boolean(piper && modelPath && modelJsonExists),
     piperCommand: piper?.command || null,
     modelPath: modelPath || null,
+    requestedModel: requestedModel || null,
+    modelJsonCandidates,
     modelJsonPath,
     modelJsonExists,
   };
@@ -217,6 +225,60 @@ async function requestRemoteTts(payload) {
   return {
     audio_url: toPublicAudioUrl(audioUrl),
     via: 'http',
+  };
+}
+
+async function probePiperHttpHealth(baseUrl, enabled) {
+  const candidates = ['/health', '/api/tts', '/', '/synthesize', '/tts'];
+  let lastHttpStatus = null;
+  let lastBody = '';
+  let lastError = null;
+
+  if (!enabled) {
+    return {
+      ok: false,
+      statusCode: null,
+      path: null,
+      body: null,
+      lastHttpStatus,
+      lastBody,
+      lastError,
+    };
+  }
+
+  for (const candidatePath of candidates) {
+    try {
+      const response = await fetch(`${baseUrl}${candidatePath}`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(3000),
+      });
+      const raw = await response.text();
+      if (response.ok) {
+        return {
+          ok: true,
+          statusCode: response.status,
+          path: candidatePath,
+          body: parseJsonMaybe(raw),
+          lastHttpStatus,
+          lastBody,
+          lastError,
+        };
+      }
+      lastHttpStatus = response.status;
+      lastBody = raw;
+    } catch (error_) {
+      lastError = error_;
+    }
+  }
+
+  return {
+    ok: false,
+    statusCode: null,
+    path: null,
+    body: null,
+    lastHttpStatus,
+    lastBody,
+    lastError,
   };
 }
 
@@ -322,38 +384,34 @@ function spawnPiperLocal(text, model) {
 router.get('/tts/health', async (req, res) => {
   const { host, port, baseUrl } = getLocalTtsConfig();
   const preferHttpTts = envBool('ENABLE_PIPER_HTTP', false);
-  const candidates = ['/health', '/api/tts', '/', '/synthesize', '/tts'];
-  let lastHttpStatus = null;
-  let lastBody = '';
-  let lastError = null;
+  const rawRequestedVoice = req.query && typeof req.query === 'object'
+    ? (req.query.voice ?? req.query.model ?? '')
+    : '';
+  const requestedVoice = typeof rawRequestedVoice === 'string' ? (rawRequestedVoice.trim() || null) : null;
+  const httpProbe = await probePiperHttpHealth(baseUrl, preferHttpTts);
+  const { lastHttpStatus, lastBody, lastError } = httpProbe;
 
-  if (preferHttpTts) {
-    for (const p of candidates) {
-      try {
-        const response = await fetch(`${baseUrl}${p}`, {
-          method: 'GET',
-          signal: AbortSignal.timeout(3000),
-        });
-        const raw = await response.text();
-        if (response.ok) {
-          return res.json({ ok: true, mode: 'http', statusCode: response.status, path: p, body: parseJsonMaybe(raw) });
-        }
-        lastHttpStatus = response.status;
-        lastBody = raw;
-      } catch (error_) {
-        lastError = error_;
-      }
-    }
+  if (httpProbe.ok) {
+    return res.json({ ok: true, mode: 'http', statusCode: httpProbe.statusCode, path: httpProbe.path, body: httpProbe.body });
   }
 
-  const spawn = getSpawnReadiness();
+  const spawn = getSpawnReadiness(requestedVoice || 'fr_FR-siwis-medium');
+  let httpWarning = null;
+  if (preferHttpTts) {
+    if (lastError?.name === 'TimeoutError') {
+      httpWarning = 'piper_http_timeout';
+    } else {
+      httpWarning = 'piper_http_unreachable';
+    }
+  }
   if (spawn.ready) {
     return res.json({
       ok: true,
       mode: 'spawn-ready',
-      warning: preferHttpTts ? (lastError?.name === 'TimeoutError' ? 'piper_http_timeout' : 'piper_http_unreachable') : null,
+      warning: httpWarning,
       host,
       port,
+      requestedModel: spawn.requestedModel,
       piperCommand: spawn.piperCommand,
       modelPath: spawn.modelPath,
       modelJsonPath: spawn.modelJsonPath,
@@ -364,7 +422,9 @@ router.get('/tts/health', async (req, res) => {
     return res.status(503).json({
       ok: false,
       error: 'model_json_missing',
+      requestedModel: spawn.requestedModel,
       modelPath: spawn.modelPath,
+      modelJsonCandidates: spawn.modelJsonCandidates,
       modelJsonPath: spawn.modelJsonPath,
     });
   }
