@@ -1,23 +1,23 @@
+import uuid
+import subprocess
+import json
+import urllib.parse
+
+# Placeholder values for required variables
+OUT_DIR = "out"
+ESPEAK_DATA = "/usr/share/espeak-ng-data"  # Adjust as needed
+# Use 'piper' for global binary (installed in /usr/local/bin)
+PIPER_EXE = "piper"
+def ensure_model():
+    # Dummy implementation, replace with actual model setup
+    return "model.onnx"
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # --- Railway-compatible HTTP server ---
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'TTS service is running')
 
-if __name__ == "__main__":
-    try:
-        port = int(os.environ.get("PORT", 8080))
-        server = HTTPServer(("0.0.0.0", port), Handler)
-        print(f"Server running on port {port}")
-        server.serve_forever()
-    except Exception as e:
-        print("[TTS] ❌ Download failed:", e)
-        raise SystemExit(1)
+
+
 
 # --- CHECK .onnx.json CONFIG ---
 MODEL_PATH_ENV = os.environ.get("MODEL_PATH")
@@ -145,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = json.loads(body)
             text = data.get("text", "")
-        except:
+        except Exception:
             self._send_json(400, {"error": "invalid json"})
             return
 
@@ -164,6 +164,8 @@ class Handler(BaseHTTPRequestHandler):
 
 # --- RUN ---
 def run():
+    # Ensure output directory exists (important for Railway)
+    os.makedirs(OUT_DIR, exist_ok=True)
     PORT = int(os.environ.get("PORT", 5002))
     print(f"[TTS] 🚀 Running on port {PORT}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
