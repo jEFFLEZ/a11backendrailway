@@ -20,9 +20,12 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
 # --- CHECK .onnx.json CONFIG ---
-CONFIG_PATH = MODEL_PATH + ".json"
 MODEL_PATH_ENV = os.environ.get("MODEL_PATH")
-MODEL_PATH = ensure_model()
+try:
+    MODEL_PATH = ensure_model()
+    CONFIG_PATH = MODEL_PATH + ".json"
+except Exception:
+    CONFIG_PATH = MODEL_PATH_ENV + ".json" if MODEL_PATH_ENV else "(unknown)"
     print(f"[TTS] ❌ Fichier de configuration Piper manquant : {CONFIG_PATH}\nTélécharge le .onnx.json correspondant sur R2 !")
     raise SystemExit(1)
 
