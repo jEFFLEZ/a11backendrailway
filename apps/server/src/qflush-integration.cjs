@@ -259,7 +259,10 @@ async function setupA11Supervisor() {
 
 function findTTSScript() {
   const BASE = path.resolve(__dirname, '../..');
+  const WORKSPACE_ROOT = path.resolve(BASE, '..', '..');
   const candidates = [
+    path.join(WORKSPACE_ROOT, 'apps', 'tts', 'serve.py'),
+    path.join(WORKSPACE_ROOT, 'apps', 'tts', 'server.py'),
     path.join(BASE, 'tts', 'serve.py'),
     path.join(BASE, 'tts', 'server.py'),
     path.join(BASE, 'piper', 'serve.py'),

@@ -111,10 +111,10 @@ function resolvePiperModel(requestedModel) {
 
   const baseDirs = [
     modelsDirEnv,
-    path.join(workspaceRoot, 'apps', 'server', 'tts'),
+    path.join(workspaceRoot, 'apps', 'tts'),
     path.join(workspaceRoot, 'piper', 'models'),
     path.join(workspaceRoot, 'tts'),
-    '/app/apps/server/tts',
+    '/app/apps/tts',
     '/app/tts',
     '/data/tts'
   ].filter(Boolean);
