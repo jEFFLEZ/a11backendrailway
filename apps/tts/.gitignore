@@ -29,7 +29,6 @@ espeak-ng-data/
 *.md
 *.json
 *.txt
-*.sh
 *.bat
 *.cmd
 *.ps1

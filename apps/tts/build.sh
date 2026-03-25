@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+echo "Installing dependencies..."
+apt-get update
+apt-get install -y wget unzip
+
+echo "Downloading Piper..."
+wget https://github.com/rhasspy/piper/releases/download/2023.11.14/piper_linux_x86_64.tar.gz
+
+echo "Extracting Piper..."
+tar -xvf piper_linux_x86_64.tar.gz
+
+echo "Done."
