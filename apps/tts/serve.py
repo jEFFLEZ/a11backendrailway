@@ -10,10 +10,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b'TTS service is running')
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"Server running on port {port}")
-    server.serve_forever()
+    try:
+        port = int(os.environ.get("PORT", 8080))
+        server = HTTPServer(("0.0.0.0", port), Handler)
+        print(f"Server running on port {port}")
+        server.serve_forever()
+    except Exception as e:
         print("[TTS] ❌ Download failed:", e)
         raise SystemExit(1)
 
