@@ -1,6 +1,6 @@
 # Local Netlify folder
 .netlify
-
+apps/server/tts/*.onnx
 # Local environment variables
 .env
 # Per-app local env files (do not commit secrets)
@@ -38,6 +38,7 @@ logs/
 # Dumps, logs, temp, debug
 *.log
 *.log.*
+apps/server/tts/*.onnx
 *.tmp
 *.bak
 *.swp
