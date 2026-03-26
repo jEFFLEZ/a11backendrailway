@@ -294,6 +294,11 @@ except Exception:
     _HAS_REQUESTS = False
 
 def notify_a11_avatar(gif_path: str, endpoint: str = "http://127.0.0.1:3000/api/avatar/update"):
+    # Utilise l'URL interne Railway du backend par défaut
+    # (remplace localhost par le nom du service Railway)
+    # Exemple : http://a11backendrailway.railway.internal:3000/api/avatar/update
+    if endpoint == "http://127.0.0.1:3000/api/avatar/update":
+        endpoint = "http://a11backendrailway.railway.internal:3000/api/avatar/update"
     try:
         payload = json.dumps({"gif_path": gif_path}).encode("utf-8")
         if _HAS_REQUESTS:
