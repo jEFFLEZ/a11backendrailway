@@ -421,10 +421,10 @@ class TTSHandler(BaseHTTPRequestHandler):
                 resp["gif_url"] = f"http://127.0.0.1:5002/out/{os.path.basename(gif_path)}"
                 resp["gif_duration_ms"] = gif_ms
             self._send_json(resp, 200)
-            except Exception as e:
-                print("[TTS] Erreur:", e)
-                traceback.print_exc()
-                self._send_json({"status": "error", "error": str(e)}, 500)
+        except Exception as e:
+            print("[TTS] Erreur:", e)
+            traceback.print_exc()
+            self._send_json({"status": "error", "error": str(e)}, 500)
 
 
 if __name__ == "__main__":
