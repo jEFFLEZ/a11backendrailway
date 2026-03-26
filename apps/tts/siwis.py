@@ -16,17 +16,20 @@ from pathlib import Path
 
 
 ROOT_DIR = os.path.dirname(__file__)
-# Choix du binaire Piper selon l'OS
-if os.name == "nt":
-    PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
-else:
-    PIPER_EXE = "/usr/local/bin/piper"
+
+# ENV override (Railway)
 MODEL_PATH = os.environ.get(
-    "TTS_MODEL_PATH",
-    os.path.join(ROOT_DIR, "apps/tts/fr_FR-siwis-medium.onnx")
+    "MODEL_PATH",
+    os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
+)
+PIPER_EXE = os.environ.get(
+    "PIPER_PATH",
+    os.path.join(ROOT_DIR, "piper.exe") if os.name == "nt" else "/usr/local/bin/piper"
 )
 print("[TTS] MODEL_PATH:", MODEL_PATH)
-print("[TTS] EXISTS:", os.path.exists(MODEL_PATH))
+print("[TTS] MODEL EXISTS:", os.path.exists(MODEL_PATH))
+print("[TTS] PIPER_EXE:", PIPER_EXE)
+print("[TTS] PIPER EXISTS:", os.path.exists(PIPER_EXE))
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
 
@@ -240,12 +243,18 @@ def synthesize(text: str) -> str:
             capture_output=True,
             env=env
         )
-        print("[TTS] Piper stdout:", result.stdout.decode(errors="ignore"))
-        print("[TTS] Piper stderr:", result.stderr.decode(errors="ignore"))
+
+        print("=== PIPER DEBUG ===")
+        print("RETURN CODE:", result.returncode)
+        print("STDOUT:", result.stdout.decode(errors="ignore"))
+        print("STDERR:", result.stderr.decode(errors="ignore"))
+        print("===================")
+
         if result.returncode != 0:
-            raise RuntimeError(f"Piper a retourné le code {result.returncode}")
+            raise RuntimeError("Piper failed")
+
     except Exception as e:
-        print("[TTS] Erreur appel Piper:", e)
+        print("🔥 CRASH TTS:", e)
         traceback.print_exc()
         raise
 
