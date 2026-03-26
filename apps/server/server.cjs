@@ -863,13 +863,19 @@ async function refreshLogicalUserMemory(userId, latestUserMessage, recentMessage
   }
 
   const previousSummary = await getLogicalUserMemory(normalizedUserId);
-  const summaryResult = await runLogicalMemorySummaryFlow({
-    flow: summaryFlow,
-    userId: normalizedUserId,
-    previousSummary,
-    latestUserMessage: normalizedLatestMessage,
-    recentMessages,
-  });
+  let summaryResult = null;
+  try {
+    summaryResult = await runLogicalMemorySummaryFlow({
+      flow: summaryFlow,
+      userId: normalizedUserId,
+      previousSummary,
+      latestUserMessage: normalizedLatestMessage,
+      recentMessages,
+    });
+  } catch (error_) {
+    console.warn('[A11][memory] logical summary refresh skipped:', error_?.message || error_);
+    return previousSummary;
+  }
 
   const nextSummary = extractAssistantText(summaryResult).trim() || previousSummary;
   if (!nextSummary) return '';
@@ -2908,7 +2914,7 @@ function isRecursiveOpenAIUpstream(req, upstreamUrl) {
 }
 
 function getLocalCompletionsUrl() {
-  const base = String(process.env.LLAMA_BASE || '').trim();
+  const base = String(process.env.LLAMA_BASE || process.env.LLM_URL || '').trim();
   if (!base) return null;
   const normalized = base.replace(/\/$/, '');
   return normalized.endsWith('/v1') ? `${normalized}/chat/completions` : `${normalized}/v1/chat/completions`;
