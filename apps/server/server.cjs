@@ -338,7 +338,6 @@ const defaultCorsOrigins = [
   'https://a11backendrailway.up.railway.app',
   'https://a11backendrailway.railway.app',
   'https://funesterie.pro',
-  'https://alphaonze.netlify.app',
   'https://a11.funesterie.pro'
 ];
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/$/, '');
