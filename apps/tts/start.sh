@@ -1,4 +1,4 @@
-    #!/bin/bash
+#!/bin/bash
 set -e
 
 # Download Piper if not present
