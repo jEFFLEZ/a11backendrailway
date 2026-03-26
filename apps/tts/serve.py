@@ -11,7 +11,7 @@ ESPEAK_DATA = "./espeak-ng-data"  # Windows/local compatible
 if os.name == "nt":
     PIPER_EXE = os.path.abspath("piper.exe")
 else:
-    PIPER_EXE = "./piper"
+    PIPER_EXE = "/app/piper/piper"
 
 def ensure_model():
     # Use the actual model filename present in apps/tts/

@@ -4,24 +4,22 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Installer dépendances système, copier les fichiers et télécharger Piper en une seule couche
+# Install system dependencies only — Piper binary is downloaded at runtime
 RUN apt-get update \
-    && apt-get install -y wget unzip \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz \
-    && tar -xvf piper_linux_x86_64.tar.gz \
-    && mv piper /app/piper \
-    && chmod +x /app/piper \
-    && rm piper_linux_x86_64.tar.gz
+    && apt-get install -y wget tar \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copier les fichiers de l'app après l'installation système
+# Copy application files
 COPY . /app
 
 # Install Python dependencies if requirements.txt exists
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
+# Make the startup script executable
+RUN chmod +x /app/startup.sh
+
 # Expose port (change if your app uses a different port)
 EXPOSE 5000
 
-# Command to run your TTS server (adjust as needed)
-CMD ["python", "serve.py"]
+# Run the startup script, which downloads Piper if needed then starts the server
+CMD ["/app/startup.sh"]
