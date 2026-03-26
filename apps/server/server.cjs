@@ -1,3 +1,5 @@
+// --- Endpoint de healthcheck Railway ---
+app.get('/health', (req, res) => res.json({ ok: true }));
 // --- Endpoint API TTS universel --- (déplacé après la création de app)
 // --- .env first ---
 const path = require('node:path');
@@ -312,6 +314,13 @@ setHeadlessConfig({
   buildCommand: process.env.A11_BUILD_COMMAND || null,
   // Répertoire courant pour ExecuteShell (sinon workspaceRoot)
   shellCwd: process.env.A11_SHELL_CWD || null
+});
+
+
+// --- Listen sur le port Railway ---
+const listenPort = process.env.PORT || 8080;
+app.listen(listenPort, () => {
+  console.log(`[A11] Server listening on port ${listenPort}`);
 });
 
 // Last generated GIF path (absolute on disk)
