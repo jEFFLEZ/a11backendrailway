@@ -285,9 +285,8 @@ app.post('/api/tts', async (req, res) => {
     if (!text) {
       return res.status(400).json({ error: 'Texte manquant' });
     }
-    const audio = await callTTS(text);
-    res.setHeader('Content-Type', 'audio/wav');
-    res.send(audio);
+    const result = await callTTS(text);
+    res.json(result);
   } catch (e) {
     res.status(500).json({ error: 'TTS error', details: String(e) });
   }
