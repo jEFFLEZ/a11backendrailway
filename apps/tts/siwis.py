@@ -17,7 +17,8 @@ from pathlib import Path
 
 ROOT_DIR = os.path.dirname(__file__)
 
-
+# --- Config Railway/Local ---
+PORT = int(os.environ.get("PORT", 8080))
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
     os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
@@ -26,15 +27,17 @@ PIPER_EXE = os.environ.get(
     "PIPER_PATH",
     "/usr/local/bin/piper" if os.name != "nt" else os.path.join(ROOT_DIR, "piper.exe")
 )
-print("[TTS] MODEL_PATH:", MODEL_PATH)
-print("[TTS] MODEL EXISTS:", os.path.exists(MODEL_PATH))
-print("[TTS] PIPER_EXE:", PIPER_EXE)
-print("[TTS] PIPER EXISTS:", os.path.exists(PIPER_EXE))
+BASE_URL = os.environ.get("BASE_URL", f"http://127.0.0.1:{PORT}")
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
 
-# Railway public URL for serving files (set BASE_URL in Railway env)
-BASE_URL = os.environ.get("BASE_URL", "https://ttssiwis-production.up.railway.app")
+print(f"[TTS] PORT: {PORT}")
+print(f"[TTS] MODEL_PATH: {MODEL_PATH}")
+print(f"[TTS] MODEL EXISTS: {os.path.exists(MODEL_PATH)}")
+print(f"[TTS] PIPER_EXE: {PIPER_EXE}")
+print(f"[TTS] PIPER EXISTS: {os.path.exists(PIPER_EXE)}")
+print(f"[TTS] BASE_URL: {BASE_URL}")
+print(f"[TTS] ESPEAK_DATA: {ESPEAK_DATA}")
 
 # GIF template: try local tts folder, fallback to frontend assets
 GIF_TEMPLATE_CANDIDATES = [
@@ -448,12 +451,8 @@ class TTSHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    railway_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "a11backendrailway.up.railway.app")
-    print(f"[TTS] siwis.py (Piper) lancé sur https://{railway_domain} (Railway) ou http://0.0.0.0:{port} ...")
-    print(f"[TTS] MODELE: {MODEL_PATH}")
-    print(f"[TTS] ESPEAK_DATA_PATH: {ESPEAK_DATA}")
-    server = HTTPServer(("0.0.0.0", port), TTSHandler)
+    print(f"[TTS] siwis.py (Piper) lancé sur http://0.0.0.0:{PORT} ...")
+    server = HTTPServer(("0.0.0.0", PORT), TTSHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
