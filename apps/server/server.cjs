@@ -334,7 +334,13 @@ function _find_idle_asset() {
 }
 
 // CORS configuration: allow local dev origins and production origin
-const defaultCorsOrigins = ['http://127.0.0.1:3000', 'http://localhost:5173', 'http://localhost:3000', 'https://funesterie.pro', 'https://alphaonze.netlify.app', 'https://a11.funesterie.pro'];
+const defaultCorsOrigins = [
+  'https://a11backendrailway.up.railway.app',
+  'https://a11backendrailway.railway.app',
+  'https://funesterie.pro',
+  'https://alphaonze.netlify.app',
+  'https://a11.funesterie.pro'
+];
 const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/$/, '');
 const envCorsOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -1852,7 +1858,7 @@ app.get('/api/llm/stats', async (req, res) => {
       return res.json(__stats_cache);
     }
 
-    const upstreamHost = process.env.LLM_ROUTER_URL?.trim() || DEFAULT_UPSTREAM || 'http://127.0.0.1:4545';
+    const upstreamHost = process.env.LLM_ROUTER_URL?.trim() || DEFAULT_UPSTREAM || 'http://a11llm.railway.internal:8080';
     const probeUrl = String(upstreamHost).replace(/\/$/, '') + '/api/stats';
     console.log('[A11] Proxying /api/llm/stats ->', probeUrl);
 
@@ -3073,9 +3079,10 @@ app.use(llmRouter);
 // Fallback: ensure server starts
 if (!LISTENING) {
   try {
-    app.listen(PORT, '0.0.0.0', () => {
+    app.listen(PORT, process.env.RAILWAY ? '0.0.0.0' : '127.0.0.1', () => {
       LISTENING = true;
-      console.log(`[A11] Server listening on http://0.0.0.0:${PORT}`);
+      const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN || 'a11backendrailway.up.railway.app';
+      console.log(`[A11] Server listening on ${process.env.RAILWAY ? `https://${railwayDomain}` : `http://127.0.0.1:${PORT}`}`);
     });
   } catch (e) {
     console.error('[A11] Failed to start server:', e?.message);
