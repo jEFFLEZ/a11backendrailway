@@ -89,7 +89,8 @@ def generate_gif_for_wav(wav_path: str, gif_template: str = None) -> str:
             d = frame.info.get("duration", im.info.get("duration", 100))
             durations.append(d)
             total_ms += d
-        loop_sec = max(0.001, total_ms / 1000.0)
+        # loop_sec inutilisé, supprimé
+        # loop_sec = max(0.001, total_ms / 1000.0)
 
         wav_sec = get_wav_duration(wav_path)
         wav_ms = int(max(1, round(wav_sec * 1000)))
@@ -263,7 +264,7 @@ def synthesize(text: str) -> str:
     except Exception as e:
         print("[TTS] Erreur lors de la génération automatique du GIF:", e)
 
-    return out_path, fname, gif_path, gif_ms
+    return out_path, fname, gif_path, gif_ms  # type: ignore
 
 
 # Notify A-11 Node server about generated GIF
@@ -318,6 +319,7 @@ class TTSHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        # TODO: Refactor cette méthode pour réduire la complexité
         # Simple health endpoint for probes
         if parsed.path == "/health":
             try:
@@ -331,7 +333,7 @@ class TTSHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             text = query.get("text", [""])[0]
             try:
-                out_path, fname, gif_path, gif_ms = synthesize(text)
+                _, fname, gif_path, gif_ms = synthesize(text)
                 audio_url = f"http://127.0.0.1:5002/out/{fname}"
                 resp = {
                     "status": "ok",
@@ -398,7 +400,7 @@ class TTSHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print("[TTS] Erreur parse JSON:", e)
         try:
-            out_path, fname, gif_path, gif_ms = synthesize(text)
+            _, fname, gif_path, gif_ms = synthesize(text)
             audio_url = f"http://127.0.0.1:5002/out/{fname}"
             resp = {
                 "status": "ok",
