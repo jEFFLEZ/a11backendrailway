@@ -1,8 +1,10 @@
-// --- Endpoint API TTS universel --- (déplacé après la création de app)
-// ...existing code...
+// --- Express setup: always at the very top ---
+const express = require('express');
+const app = express();
 
 // --- Endpoint de healthcheck Railway ---
 app.get('/health', (req, res) => res.json({ ok: true }));
+// ...existing code...
 // --- .env first ---
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -78,7 +80,6 @@ try {
 
 // Import all required modules at the top
 const { spawn } = require('node:child_process');
-const express = require('express');
 const { Router } = require('express');
 const { registerOpenAIRoutes } = require('./src/routes/llm-openai');
 const cors = require('cors');
@@ -279,7 +280,7 @@ const upload = multer({
 });
 const { WebSocketServer } = require('ws');
 
-const app = express();
+// ...existing code...
 
 // --- Endpoint API TTS universel --- (corrigé)
 const { callTTS } = require('./tts-call.js');
