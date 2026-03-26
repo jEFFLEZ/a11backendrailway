@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT_DIR = os.path.dirname(__file__)
 
+
 # ENV override (Railway)
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
@@ -32,6 +33,9 @@ print("[TTS] PIPER_EXE:", PIPER_EXE)
 print("[TTS] PIPER EXISTS:", os.path.exists(PIPER_EXE))
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
+
+# Railway public URL for serving files (set BASE_URL in Railway env)
+BASE_URL = os.environ.get("BASE_URL", "https://ttssiwis-production.up.railway.app")
 
 # GIF template: try local tts folder, fallback to frontend assets
 GIF_TEMPLATE_CANDIDATES = [
@@ -360,15 +364,14 @@ class TTSHandler(BaseHTTPRequestHandler):
             text = query.get("text", [""])[0]
             try:
                 _, fname, gif_path, gif_ms = synthesize(text)
-                host = self.headers.get("Host", "localhost")
-                audio_url = f"https://{host}/out/{fname}"
+                audio_url = f"{BASE_URL}/out/{fname}"
                 resp = {
                     "status": "ok",
                     "text": text,
                     "audio_url": audio_url,
                 }
                 if gif_path:
-                    resp["gif_url"] = f"https://{host}/out/{os.path.basename(gif_path)}"
+                    resp["gif_url"] = f"{BASE_URL}/out/{os.path.basename(gif_path)}"
                     resp["gif_duration_ms"] = gif_ms
                 self._send_json(resp, 200)
             except Exception as e:
@@ -429,15 +432,14 @@ class TTSHandler(BaseHTTPRequestHandler):
             print("[TTS] Erreur parse JSON:", e)
         try:
             _, fname, gif_path, gif_ms = synthesize(text)
-            host = self.headers.get("Host", "localhost")
-            audio_url = f"https://{host}/out/{fname}"
+            audio_url = f"{BASE_URL}/out/{fname}"
             resp = {
                 "status": "ok",
                 "text": text,
                 "audio_url": audio_url,
             }
             if gif_path:
-                resp["gif_url"] = f"https://{host}/out/{os.path.basename(gif_path)}"
+                resp["gif_url"] = f"{BASE_URL}/out/{os.path.basename(gif_path)}"
                 resp["gif_duration_ms"] = gif_ms
             self._send_json(resp, 200)
         except Exception as e:
