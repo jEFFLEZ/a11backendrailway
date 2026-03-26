@@ -5,8 +5,9 @@ from pathlib import Path
 
 from PIL import Image, ImageSequence  # pip install pillow
 
-OUT_DIR = Path(r"D:\a11\tts\out")
-GIF_TEMPLATE = Path(r"D:\A11\apps\web\public\assets\A11_talking_smooth_8s.gif")
+ROOT_DIR = Path(__file__).resolve().parent
+OUT_DIR = ROOT_DIR / "out"
+GIF_TEMPLATE = ROOT_DIR / "A11_talking_smooth_8s.gif"
 
 
 def get_wav_duration(path: Path) -> float:

@@ -4,8 +4,9 @@ import wave
 from pathlib import Path
 from PIL import Image, ImageSequence
 
-OUT_DIR = Path(r"D:\a11\tts\out")
-GIF_PATH = Path(r"D:\a11\apps\web\public\assets\A11_talking_smooth_8s.gif")
+ROOT_DIR = Path(__file__).resolve().parent
+OUT_DIR = ROOT_DIR / "out"
+GIF_PATH = ROOT_DIR / "A11_talking_smooth_8s.gif"
 
 def get_wav_duration(path: Path) -> float:
     """Durée du WAV en secondes."""

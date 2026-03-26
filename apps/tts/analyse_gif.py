@@ -1,7 +1,8 @@
 from PIL import Image
 import os
 
-GIF_PATH = "d:/a11/apps/web/public/assets/A11_talking_smooth_8s.gif"
+ROOT_DIR = os.path.dirname(__file__)
+GIF_PATH = os.path.join(ROOT_DIR, "A11_talking_smooth_8s.gif")
 
 def get_gif_loop_count(path):
     try:

@@ -39,7 +39,7 @@
     },
     "web": {
       "command": "npm run dev",
-      "cwd": "apps/web",
+      "cwd": "../a11frontendnetlify/apps/web",
       "detach": true,
       "restart": "always"
     },

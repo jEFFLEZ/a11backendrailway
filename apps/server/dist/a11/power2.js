@@ -128,9 +128,11 @@ const path = __importStar(require("node:path"));
     });
 });
 (0, horn_1.registerHorn)("a11d.netlify.deploy", async () => {
+    const frontendDist = process.env.A11_FRONTEND_DIST ||
+        path.resolve(process.cwd(), "..", "a11frontendnetlify", "dist");
     return await (0, horn_1.scream)("a11d.shell.run", {
         cmd: "netlify",
-        args: ["deploy", "--dir", "apps/web/dist", "--prod"],
+        args: ["deploy", "--dir", frontendDist, "--prod"],
     });
 });
 // Exemple de fonction exportée pour le backend

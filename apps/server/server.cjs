@@ -544,13 +544,12 @@ setHeadlessConfig({
 let lastGifPath = null;
 
 function _find_idle_asset() {
-  // try server local public assets, then web public assets
+  // Keep backend avatar assets self-contained now that the frontend lives in a separate repo.
   const cand = [
     path.join(__dirname, 'public', 'assets', 'a11_static.png'),
     path.join(__dirname, 'public', 'assets', 'A11_idle.png'),
-    path.resolve(__dirname, '..', 'web', 'public', 'assets', 'a11_static.png'),
-    path.resolve(__dirname, '..', 'web', 'public', 'assets', 'A11_idle.png'),
-    path.resolve(__dirname, '..', 'web', 'public', 'assets', 'A11_talking_smooth_8s.gif')
+    path.join(__dirname, 'public', 'assets', 'A11_talking_smooth_8s.gif'),
+    path.resolve(__dirname, '..', 'tts', 'A11_talking_smooth_8s.gif')
   ];
   for (const p of cand) {
     try { if (fs.existsSync(p)) return p; } catch {};

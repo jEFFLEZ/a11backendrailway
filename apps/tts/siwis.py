@@ -72,8 +72,8 @@ print(f"[TTS] ESPEAK_DATA: {ESPEAK_DATA}")
 GIF_TEMPLATE_CANDIDATES = [
     os.path.join(ROOT_DIR, "A11_talking_smooth_8s.gif"),
     os.path.join(ROOT_DIR, "A11_talking.gif"),
-    os.path.join(ROOT_DIR, "../apps/web/public/assets/A11_talking_smooth_8s.gif"),
-    os.path.join(ROOT_DIR, "../apps/web/public/assets/A11_talking_smooth.gif"),
+    os.path.join(ROOT_DIR, "../server/public/assets/A11_talking_smooth_8s.gif"),
+    os.path.join(ROOT_DIR, "../server/public/assets/A11_talking_smooth.gif"),
 ]
 
 os.makedirs(OUT_DIR, exist_ok=True)
