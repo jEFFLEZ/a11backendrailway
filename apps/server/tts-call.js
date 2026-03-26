@@ -2,7 +2,7 @@
 // Appel TTS universel compatible Railway
 
 const TTS_URL = process.env.TTS_URL || "http://ttssiwis.railway.internal:8080";
-const fetch = require("node-fetch");
+const fetch = (...args) => import('node-fetch').then(mod => mod.default(...args));
 
 /**
  * Appelle le service TTS (Python) et retourne un Buffer audio
