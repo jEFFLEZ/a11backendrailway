@@ -21,7 +21,10 @@ if os.name == "nt":
     PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
 else:
     PIPER_EXE = "/usr/local/bin/piper"
-MODEL_PATH = os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
+MODEL_PATH = os.environ.get(
+    "TTS_MODEL_PATH",
+    os.path.join(ROOT_DIR, "apps/tts/fr_FR-siwis-medium.onnx")
+)
 print("[TTS] MODEL_PATH:", MODEL_PATH)
 print("[TTS] EXISTS:", os.path.exists(MODEL_PATH))
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
@@ -343,14 +346,15 @@ class TTSHandler(BaseHTTPRequestHandler):
             text = query.get("text", [""])[0]
             try:
                 _, fname, gif_path, gif_ms = synthesize(text)
-                audio_url = f"http://127.0.0.1:5002/out/{fname}"
+                host = self.headers.get("Host", "localhost")
+                audio_url = f"https://{host}/out/{fname}"
                 resp = {
                     "status": "ok",
                     "text": text,
                     "audio_url": audio_url,
                 }
                 if gif_path:
-                    resp["gif_url"] = f"http://127.0.0.1:5002/out/{os.path.basename(gif_path)}"
+                    resp["gif_url"] = f"https://{host}/out/{os.path.basename(gif_path)}"
                     resp["gif_duration_ms"] = gif_ms
                 self._send_json(resp, 200)
             except Exception as e:
@@ -411,14 +415,15 @@ class TTSHandler(BaseHTTPRequestHandler):
             print("[TTS] Erreur parse JSON:", e)
         try:
             _, fname, gif_path, gif_ms = synthesize(text)
-            audio_url = f"http://127.0.0.1:5002/out/{fname}"
+            host = self.headers.get("Host", "localhost")
+            audio_url = f"https://{host}/out/{fname}"
             resp = {
                 "status": "ok",
                 "text": text,
                 "audio_url": audio_url,
             }
             if gif_path:
-                resp["gif_url"] = f"http://127.0.0.1:5002/out/{os.path.basename(gif_path)}"
+                resp["gif_url"] = f"https://{host}/out/{os.path.basename(gif_path)}"
                 resp["gif_duration_ms"] = gif_ms
             self._send_json(resp, 200)
         except Exception as e:
