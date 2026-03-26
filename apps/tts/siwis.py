@@ -13,9 +13,13 @@ import wave
 import math
 from pathlib import Path
 
-ROOT_DIR = os.path.dirname(__file__)
 
-PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
+ROOT_DIR = os.path.dirname(__file__)
+# Choix du binaire Piper selon l'OS
+if os.name == "nt":
+    PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
+else:
+    PIPER_EXE = os.path.join(ROOT_DIR, "piper")
 MODEL_PATH = os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
