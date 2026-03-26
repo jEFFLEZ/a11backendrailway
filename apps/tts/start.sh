@@ -27,7 +27,7 @@ if [ ! -f "apps/tts/fr_FR-siwis-medium.onnx.json" ]; then
     wget -O apps/tts/fr_FR-siwis-medium.onnx.json "$MODEL_URL_BASE/fr_FR-siwis-medium.onnx.json"
 fi
 
-python3 siwis.py
+python siwis.py
 
 # (optionnel) Lancer le backend Node après le TTS si besoin
 # node server.cjs

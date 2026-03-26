@@ -417,10 +417,11 @@ class TTSHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print("[TTS] siwis.py (Piper) lancé sur http://0.0.0.0:5002 ...")
+    port = int(os.environ.get("PORT", 8080))
+    print(f"[TTS] siwis.py (Piper) lancé sur http://0.0.0.0:{port} ...")
     print(f"[TTS] MODELE: {MODEL_PATH}")
     print(f"[TTS] ESPEAK_DATA_PATH: {ESPEAK_DATA}")
-    server = HTTPServer(("0.0.0.0", 5002), TTSHandler)
+    server = HTTPServer(("0.0.0.0", port), TTSHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
