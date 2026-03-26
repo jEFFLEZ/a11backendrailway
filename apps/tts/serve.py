@@ -1,44 +1,5 @@
 import os
-import uuid
-import subprocess
-import json
-import urllib.parse
-
-# Placeholder values for required variables
-OUT_DIR = "out"
-ESPEAK_DATA = "./espeak-ng-data"  # Windows/local compatible
-# Use 'piper.exe' for Windows local dev (no './')
-if os.name == "nt":
-    PIPER_EXE = os.path.abspath("piper.exe")
-else:
-    PIPER_EXE = "./piper"
-
-def ensure_model():
-    # Use the actual model filename present in apps/tts/
-    return "fr_FR-siwis-medium.onnx"
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-# --- Railway-compatible HTTP server ---
-
-
-
-
-# --- CHECK .onnx.json CONFIG ---
-MODEL_PATH_ENV = os.environ.get("MODEL_PATH")
-try:
-    MODEL_PATH = ensure_model()
-    CONFIG_PATH = MODEL_PATH + ".json"
-except Exception:
-    CONFIG_PATH = MODEL_PATH_ENV + ".json" if MODEL_PATH_ENV else "(unknown)"
-    print(f"[TTS] ❌ Fichier de configuration Piper manquant : {CONFIG_PATH}\nTélécharge le .onnx.json correspondant sur R2 !")
-    raise SystemExit(1)
-
-# --- CLEAN TEXT ---
-def clean_text(text):
-    import re
-    text = re.sub(r'<\|.*?\|>', '', text)
-    text = re.sub(r'[\*_~`|#>\[\]{}]', '', text)
-    text = re.sub(r'\s+', ' ', text)
+raise SystemExit("[TTS] Deprecated: use siwis.py as the main server entrypoint.")
     return text.strip()
 
 # --- SYNTH ---

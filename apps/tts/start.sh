@@ -11,7 +11,7 @@ if [ ! -f "/usr/local/bin/piper" ]; then
 	rm piper_linux_x86_64.tar.gz
 fi
 
-python serve.py
+python siwis.py
 	python3 /app/apps/tts/serve.py &
 	PIPER_PID=$!
 	echo "[A11] Piper PID: ${PIPER_PID}"
