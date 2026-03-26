@@ -21,6 +21,8 @@ if os.name == "nt":
 else:
     PIPER_EXE = os.path.join(ROOT_DIR, "piper")
 MODEL_PATH = os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
+print("[TTS] MODEL_PATH:", MODEL_PATH)
+print("[TTS] EXISTS:", os.path.exists(MODEL_PATH))
 ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
 OUT_DIR = os.path.join(ROOT_DIR, "out")
 
