@@ -18,14 +18,13 @@ from pathlib import Path
 ROOT_DIR = os.path.dirname(__file__)
 
 
-# ENV override (Railway)
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
     os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
 )
 PIPER_EXE = os.environ.get(
     "PIPER_PATH",
-    os.path.join(ROOT_DIR, "piper.exe") if os.name == "nt" else "/usr/local/bin/piper"
+    "/usr/local/bin/piper" if os.name != "nt" else os.path.join(ROOT_DIR, "piper.exe")
 )
 print("[TTS] MODEL_PATH:", MODEL_PATH)
 print("[TTS] MODEL EXISTS:", os.path.exists(MODEL_PATH))
