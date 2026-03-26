@@ -14,6 +14,6 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 
 EXPOSE 5000
 
-RUN chmod +x apps/tts/start.sh
+RUN chmod +x start.sh
 
-CMD ["bash", "apps/tts/start.sh"]
+CMD ["bash", "start.sh"]
