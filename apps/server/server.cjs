@@ -1,18 +1,4 @@
-// --- Endpoint API TTS universel ---
-const { callTTS } = require('./tts-call.js');
-app.post('/api/tts', async (req, res) => {
-  try {
-    const text = req.body?.text || '';
-    if (!text) {
-      return res.status(400).json({ error: 'Texte manquant' });
-    }
-    const audio = await callTTS(text);
-    res.setHeader('Content-Type', 'audio/wav');
-    res.send(audio);
-  } catch (e) {
-    res.status(500).json({ error: 'TTS error', details: String(e) });
-  }
-});
+// --- Endpoint API TTS universel --- (déplacé après la création de app)
 // --- .env first ---
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -290,6 +276,22 @@ const upload = multer({
 const { WebSocketServer } = require('ws');
 
 const app = express();
+
+// --- Endpoint API TTS universel --- (corrigé)
+const { callTTS } = require('./tts-call.js');
+app.post('/api/tts', async (req, res) => {
+  try {
+    const text = req.body?.text || '';
+    if (!text) {
+      return res.status(400).json({ error: 'Texte manquant' });
+    }
+    const audio = await callTTS(text);
+    res.setHeader('Content-Type', 'audio/wav');
+    res.send(audio);
+  } catch (e) {
+    res.status(500).json({ error: 'TTS error', details: String(e) });
+  }
+});
 const router = Router();
 
 // Racine de travail (doit pointer sur D:\A12 chez toi en .env)
