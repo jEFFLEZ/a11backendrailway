@@ -12,6 +12,12 @@ function envBool(name, fallback = false) {
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }
 
+function shouldPreferHttpTts() {
+  const explicit = String(process.env.ENABLE_PIPER_HTTP || '').trim();
+  if (explicit) return envBool('ENABLE_PIPER_HTTP', false);
+  return Boolean(String(process.env.TTS_BASE_URL || process.env.TTS_HOST || '').trim());
+}
+
 function isCommandAvailable(command) {
   const key = String(command || '').trim();
   if (!key) return false;
@@ -229,10 +235,11 @@ function parseJsonMaybe(value) {
   }
 }
 
-function toPublicAudioUrl(value) {
-  const audioUrl = String(value || '').trim();
-  if (!audioUrl) return null;
-  return audioUrl.startsWith('/tts/') ? audioUrl : '/tts/' + path.basename(audioUrl);
+function normalizeRemoteAssetUrl(baseUrl, value) {
+  const assetUrl = String(value || '').trim();
+  if (!assetUrl) return null;
+  if (/^https?:\/\//i.test(assetUrl)) return assetUrl;
+  return new URL(assetUrl.replace(/^\.\//, ''), `${String(baseUrl).replace(/\/$/, '')}/`).toString();
 }
 
 async function requestRemoteTts(payload) {
@@ -247,7 +254,7 @@ async function requestRemoteTts(payload) {
   const parsed = parseJsonMaybe(textBody);
 
   if (typeof parsed === 'string' && parsed.endsWith('.wav')) {
-    return { audio_url: toPublicAudioUrl(parsed), via: 'http-string' };
+    return { audio_url: normalizeRemoteAssetUrl(ttsBaseUrl, parsed), via: 'http-string' };
   }
 
   const audioUrl = parsed?.audio_url || parsed?.audioUrl || parsed?.url || parsed?.path || parsed?.file || parsed?.wav || null;
@@ -256,7 +263,9 @@ async function requestRemoteTts(payload) {
   }
 
   return {
-    audio_url: toPublicAudioUrl(audioUrl),
+    audio_url: normalizeRemoteAssetUrl(ttsBaseUrl, audioUrl),
+    gif_url: normalizeRemoteAssetUrl(ttsBaseUrl, parsed?.gif_url || parsed?.gifUrl || null),
+    gif_duration_ms: parsed?.gif_duration_ms ?? parsed?.gifDurationMs ?? null,
     via: 'http',
   };
 }
@@ -449,7 +458,7 @@ function spawnPiperLocal(text, model) {
 // GET /api/tts/health -> probe local Piper service (try multiple endpoints)
 router.get('/tts/health', async (req, res) => {
   const { host, port, baseUrl } = getLocalTtsConfig();
-  const preferHttpTts = envBool('ENABLE_PIPER_HTTP', false);
+  const preferHttpTts = shouldPreferHttpTts();
   const rawRequestedVoice = req.query && typeof req.query === 'object'
     ? (req.query.voice ?? req.query.model ?? '')
     : '';
@@ -541,7 +550,7 @@ router.post('/tts/piper', async (req, res) => {
   try {
     const text = String(req.body?.text || '').trim();
     const voice = String(req.body?.voice || req.body?.model || '').trim();
-    const preferHttpTts = envBool('ENABLE_PIPER_HTTP', false);
+    const preferHttpTts = shouldPreferHttpTts();
 
     if (!text) {
       return res.status(400).json({ error: 'missing_text' });

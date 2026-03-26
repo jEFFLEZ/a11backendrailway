@@ -284,13 +284,14 @@ const { WebSocketServer } = require('ws');
 
 // --- Endpoint API TTS universel --- (corrigé)
 const { callTTS } = require('./tts-call.js');
-app.post('/api/tts', async (req, res) => {
+app.post('/api/tts', express.json({ limit: '1mb' }), async (req, res) => {
   try {
-    const text = req.body?.text || '';
+    const text = String(req.body?.text || '').trim();
+    const voice = String(req.body?.voice || req.body?.model || '').trim();
     if (!text) {
       return res.status(400).json({ error: 'Texte manquant' });
     }
-    const result = await callTTS(text);
+    const result = await callTTS({ text, voice, model: voice || undefined });
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: 'TTS error', details: String(e) });
@@ -3083,10 +3084,14 @@ app.use(llmRouter);
 // Fallback: ensure server starts
 if (!LISTENING) {
   try {
-    app.listen(PORT, process.env.RAILWAY ? '0.0.0.0' : '127.0.0.1', () => {
+    const HOST = process.env.HOST || '0.0.0.0';
+    app.listen(PORT, HOST, () => {
       LISTENING = true;
       const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN || 'a11backendrailway.up.railway.app';
-      console.log(`[A11] Server listening on ${process.env.RAILWAY ? `https://${railwayDomain}` : `http://127.0.0.1:${PORT}`}`);
+      const publicUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+        ? `https://${railwayDomain}`
+        : `http://127.0.0.1:${PORT}`;
+      console.log(`[A11] Server listening on ${HOST}:${PORT} (public: ${publicUrl})`);
     });
   } catch (e) {
     console.error('[A11] Failed to start server:', e?.message);

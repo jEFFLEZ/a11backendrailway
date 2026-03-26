@@ -1,43 +1,49 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Ensure espeak-ng is installed (for Railway Ubuntu/Debian containers)
-if ! command -v espeak-ng >/dev/null 2>&1; then
-    echo "[TTS] Installing espeak-ng..."
-    apt-get update && apt-get install -y espeak-ng
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+export PORT="${PORT:-8080}"
+export MODEL_PATH="${MODEL_PATH:-$SCRIPT_DIR/fr_FR-siwis-medium.onnx}"
+
+if [ -x "$SCRIPT_DIR/piper/piper" ]; then
+  export PIPER_PATH="${PIPER_PATH:-$SCRIPT_DIR/piper/piper}"
+  export LD_LIBRARY_PATH="$SCRIPT_DIR/piper${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export PATH="$SCRIPT_DIR/piper:$PATH"
 fi
 
-# Download Piper if not present
-if [ ! -f "/usr/local/bin/piper" ]; then
-        echo "Downloading Piper..."
-        wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
-        tar -xvf piper_linux_x86_64.tar.gz
-        chmod +x piper
-        mv piper/piper /usr/local/bin/piper
+if [ -d "$SCRIPT_DIR/piper/espeak-ng-data" ]; then
+  export ESPEAK_DATA_PATH="${ESPEAK_DATA_PATH:-$SCRIPT_DIR/piper/espeak-ng-data}"
+else
+  export ESPEAK_DATA_PATH="${ESPEAK_DATA_PATH:-$SCRIPT_DIR/espeak-ng-data}"
 fi
 
-# Start the TTS Python server
-python3 ./apps/tts/siwis.py
-    rm piper_linux_x86_64.tar.gz
+if [ -z "${BASE_URL:-}" ] && [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+  export BASE_URL="https://${RAILWAY_PUBLIC_DOMAIN}"
 fi
 
-# Lancer le serveur TTS principal
+mkdir -p "$SCRIPT_DIR/out"
 
-
-
-# Télécharger le modèle et son .json si absents dans apps/tts/ (R2 public URL)
-MODEL_URL_BASE="https://files.funesterie.me"
-mkdir -p apps/tts
-
-if [ ! -f "apps/tts/fr_FR-siwis-medium.onnx" ]; then
-    wget -O apps/tts/fr_FR-siwis-medium.onnx "$MODEL_URL_BASE/fr_FR-siwis-medium.onnx"
+if [ ! -f "$MODEL_PATH" ]; then
+  echo "[TTS] Model not found: $MODEL_PATH" >&2
+  exit 1
 fi
 
-if [ ! -f "apps/tts/fr_FR-siwis-medium.onnx.json" ]; then
-    wget -O apps/tts/fr_FR-siwis-medium.onnx.json "$MODEL_URL_BASE/fr_FR-siwis-medium.onnx.json"
+if [ ! -x "${PIPER_PATH:-}" ]; then
+  if command -v piper >/dev/null 2>&1; then
+    export PIPER_PATH="$(command -v piper)"
+  else
+    echo "[TTS] Piper binary not found. Expected \$PIPER_PATH or $SCRIPT_DIR/piper/piper" >&2
+    exit 1
+  fi
 fi
 
-python siwis.py
+echo "[TTS] Starting siwis.py"
+echo "[TTS] PORT=$PORT"
+echo "[TTS] MODEL_PATH=$MODEL_PATH"
+echo "[TTS] PIPER_PATH=$PIPER_PATH"
+echo "[TTS] ESPEAK_DATA_PATH=$ESPEAK_DATA_PATH"
+echo "[TTS] BASE_URL=${BASE_URL:-auto}"
 
-# (optionnel) Lancer le backend Node après le TTS si besoin
-# node server.cjs
+exec python3 "$SCRIPT_DIR/siwis.py"

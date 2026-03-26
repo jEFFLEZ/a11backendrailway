@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import json
 import os
+import shutil
 import traceback
 import subprocess
 import uuid
@@ -17,26 +18,54 @@ from pathlib import Path
 
 ROOT_DIR = os.path.dirname(__file__)
 
+
+def _first_existing_path(candidates):
+    for candidate in candidates:
+        if not candidate:
+            continue
+        full = os.path.normpath(candidate)
+        if os.path.exists(full):
+            return full
+    return ""
+
+
+def _resolve_command(candidate: str) -> str:
+    raw = str(candidate or "").strip()
+    if not raw:
+        return ""
+    if os.path.isabs(raw) or os.sep in raw or (os.altsep and os.altsep in raw):
+        return os.path.normpath(raw)
+    return shutil.which(raw) or raw
+
 # --- Config Railway/Local ---
 PORT = int(os.environ.get("PORT", 8080))
-MODEL_PATH = os.environ.get(
-    "MODEL_PATH",
-    os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
-)
-PIPER_EXE = os.environ.get(
-    "PIPER_PATH",
-    "/usr/local/bin/piper" if os.name != "nt" else os.path.join(ROOT_DIR, "piper.exe")
-)
-BASE_URL = os.environ.get("BASE_URL", f"http://127.0.0.1:{PORT}")
-ESPEAK_DATA = os.path.join(ROOT_DIR, "espeak-ng-data")
+MODEL_PATH = os.environ.get("MODEL_PATH") or _first_existing_path([
+    os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx"),
+    os.path.join(ROOT_DIR, "model.onnx"),
+])
+PIPER_EXE = _resolve_command(os.environ.get("PIPER_PATH") or (
+    _first_existing_path([
+        os.path.join(ROOT_DIR, "piper", "piper"),
+        "/usr/local/bin/piper",
+    ]) if os.name != "nt" else os.path.join(ROOT_DIR, "piper.exe")
+))
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
+ESPEAK_DATA = os.environ.get("ESPEAK_DATA_PATH") or _first_existing_path([
+    os.path.join(ROOT_DIR, "piper", "espeak-ng-data"),
+    os.path.join(ROOT_DIR, "espeak-ng-data"),
+])
+PIPER_LIB_DIR = _first_existing_path([
+    os.path.join(ROOT_DIR, "piper"),
+    ROOT_DIR,
+])
 OUT_DIR = os.path.join(ROOT_DIR, "out")
 
 print(f"[TTS] PORT: {PORT}")
 print(f"[TTS] MODEL_PATH: {MODEL_PATH}")
 print(f"[TTS] MODEL EXISTS: {os.path.exists(MODEL_PATH)}")
 print(f"[TTS] PIPER_EXE: {PIPER_EXE}")
-print(f"[TTS] PIPER EXISTS: {os.path.exists(PIPER_EXE)}")
-print(f"[TTS] BASE_URL: {BASE_URL}")
+print(f"[TTS] PIPER EXISTS: {os.path.exists(PIPER_EXE) if PIPER_EXE else False}")
+print(f"[TTS] BASE_URL: {BASE_URL or 'auto'}")
 print(f"[TTS] ESPEAK_DATA: {ESPEAK_DATA}")
 
 # GIF template: try local tts folder, fallback to frontend assets
@@ -225,6 +254,24 @@ def clean_tts_text(text: str) -> str:
     return text.strip()
 
 
+def build_base_url(handler: BaseHTTPRequestHandler) -> str:
+    if BASE_URL:
+        return BASE_URL
+
+    forwarded_proto = handler.headers.get("X-Forwarded-Proto", "").strip()
+    forwarded_host = handler.headers.get("X-Forwarded-Host", "").strip()
+    host = forwarded_host or handler.headers.get("Host", "").strip()
+    public_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+
+    if public_domain:
+        return f"https://{public_domain}"
+    if host:
+        proto = forwarded_proto or ("https" if ".railway.app" in host or ".up.railway.app" in host else "http")
+        return f"{proto}://{host}"
+
+    return f"http://127.0.0.1:{PORT}"
+
+
 def synthesize(text: str) -> str:
     text = text.strip()
     if not text:
@@ -234,7 +281,12 @@ def synthesize(text: str) -> str:
     fname = f"{uuid.uuid4().hex}.wav"
     out_path = os.path.join(OUT_DIR, fname)
     env = os.environ.copy()
-    env["ESPEAK_DATA_PATH"] = ESPEAK_DATA
+    if ESPEAK_DATA and os.path.exists(ESPEAK_DATA):
+        env["ESPEAK_DATA_PATH"] = ESPEAK_DATA
+    if PIPER_LIB_DIR and os.path.isdir(PIPER_LIB_DIR):
+        existing_ld = env.get("LD_LIBRARY_PATH", "").strip()
+        env["LD_LIBRARY_PATH"] = PIPER_LIB_DIR if not existing_ld else f"{PIPER_LIB_DIR}:{existing_ld}"
+        env["PATH"] = PIPER_LIB_DIR + os.pathsep + env.get("PATH", "")
     cmd = [
         PIPER_EXE,
         "-m", MODEL_PATH,
@@ -247,7 +299,9 @@ def synthesize(text: str) -> str:
             cmd,
             input=text.encode("utf-8"),
             capture_output=True,
-            env=env
+            env=env,
+            cwd=ROOT_DIR,
+            timeout=120,
         )
 
         print("=== PIPER DEBUG ===")
@@ -257,7 +311,10 @@ def synthesize(text: str) -> str:
         print("===================")
 
         if result.returncode != 0:
-            raise RuntimeError("Piper failed")
+            stderr = result.stderr.decode(errors="ignore").strip()
+            stdout = result.stdout.decode(errors="ignore").strip()
+            details = stderr or stdout or "unknown error"
+            raise RuntimeError(f"Piper failed (exit {result.returncode}): {details[:500]}")
 
     except Exception as e:
         print("🔥 CRASH TTS:", e)
@@ -299,12 +356,11 @@ except Exception:
     import urllib.error
     _HAS_REQUESTS = False
 
-def notify_a11_avatar(gif_path: str, endpoint: str = "http://127.0.0.1:3000/api/avatar/update"):
-    # Utilise l'URL interne Railway du backend par défaut
-    # (remplace localhost par le nom du service Railway)
-    # Exemple : http://a11backendrailway.railway.internal:3000/api/avatar/update
-    if endpoint == "http://127.0.0.1:3000/api/avatar/update":
-        endpoint = "http://a11backendrailway.railway.internal:3000/api/avatar/update"
+def notify_a11_avatar(gif_path: str, endpoint: str = ""):
+    endpoint = (endpoint or os.environ.get("A11_AVATAR_UPDATE_URL", "")).strip()
+    if not endpoint:
+        print("[TTS][AVATAR] skipping notify: A11_AVATAR_UPDATE_URL not set")
+        return
     try:
         payload = json.dumps({"gif_path": gif_path}).encode("utf-8")
         if _HAS_REQUESTS:
@@ -352,7 +408,7 @@ class TTSHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         # TODO: Refactor cette méthode pour réduire la complexité
         # Simple health endpoint for probes
-        if parsed.path == "/health":
+        if parsed.path in ("/health", "/api/tts/health"):
             print("[TTS] /health called")
             try:
                 info = {"ok": True, "service": "siwis-tts", "model": os.path.basename(MODEL_PATH)}
@@ -367,14 +423,15 @@ class TTSHandler(BaseHTTPRequestHandler):
             text = query.get("text", [""])[0]
             try:
                 _, fname, gif_path, gif_ms = synthesize(text)
-                audio_url = f"{BASE_URL}/out/{fname}"
+                public_base_url = build_base_url(self)
+                audio_url = f"{public_base_url}/out/{fname}"
                 resp = {
                     "status": "ok",
                     "text": text,
                     "audio_url": audio_url,
                 }
                 if gif_path:
-                    resp["gif_url"] = f"{BASE_URL}/out/{os.path.basename(gif_path)}"
+                    resp["gif_url"] = f"{public_base_url}/out/{os.path.basename(gif_path)}"
                     resp["gif_duration_ms"] = gif_ms
                 self._send_json(resp, 200)
             except Exception as e:
@@ -435,14 +492,15 @@ class TTSHandler(BaseHTTPRequestHandler):
             print("[TTS] Erreur parse JSON:", e)
         try:
             _, fname, gif_path, gif_ms = synthesize(text)
-            audio_url = f"{BASE_URL}/out/{fname}"
+            public_base_url = build_base_url(self)
+            audio_url = f"{public_base_url}/out/{fname}"
             resp = {
                 "status": "ok",
                 "text": text,
                 "audio_url": audio_url,
             }
             if gif_path:
-                resp["gif_url"] = f"{BASE_URL}/out/{os.path.basename(gif_path)}"
+                resp["gif_url"] = f"{public_base_url}/out/{os.path.basename(gif_path)}"
                 resp["gif_duration_ms"] = gif_ms
             self._send_json(resp, 200)
         except Exception as e:
