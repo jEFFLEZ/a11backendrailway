@@ -97,6 +97,17 @@ export function logout() {
   clearAuthToken();
 }
 
+function buildAuthHeaders(contentType?: string) {
+  const headers: Record<string, string> = {};
+  if (contentType) headers['Content-Type'] = contentType;
+
+  const token = getAuthToken();
+  if (token) headers['X-NEZ-TOKEN'] = token;
+  else if (NEZ_TOKEN) headers['X-NEZ-TOKEN'] = NEZ_TOKEN;
+
+  return headers;
+}
+
 function dispatchBrowserEvent(event: Event) {
   globalThis.dispatchEvent(event);
 }
@@ -278,13 +289,14 @@ async function apiPost(body: unknown) {
 export async function chatCompletion(
   messages: Msg[],
   provider: Provider = 'local',
-  systemPromptOrOptions?: string | { turbo?: boolean; systemPrompt?: string; a11Dev?: boolean; model?: string }
+  systemPromptOrOptions?: string | { turbo?: boolean; systemPrompt?: string; a11Dev?: boolean; model?: string; conversationId?: string }
 ) {
   // Support both old signature (systemPrompt string) and new options object
   let systemPrompt: string | undefined;
   let turboFlag = false;
   let a11DevFlag = false;
   let modelOverride: string | undefined;
+  let conversationId: string | undefined;
   if (typeof systemPromptOrOptions === 'string') {
     systemPrompt = systemPromptOrOptions;
   } else if (typeof systemPromptOrOptions === 'object' && systemPromptOrOptions !== null) {
@@ -292,6 +304,9 @@ export async function chatCompletion(
     turboFlag = !!systemPromptOrOptions.turbo;
     a11DevFlag = !!systemPromptOrOptions.a11Dev;
     modelOverride = systemPromptOrOptions.model;
+    conversationId = typeof systemPromptOrOptions.conversationId === 'string'
+      ? systemPromptOrOptions.conversationId.trim()
+      : undefined;
   }
 
   // Ajout du systemPrompt si fourni
@@ -313,7 +328,8 @@ export async function chatCompletion(
     stream: false,
     temperature: turboFlag ? 0.3 : 0.7,
     top_p: 0.9,
-    a11Dev: a11DevFlag // ← AJOUT ICI
+    a11Dev: a11DevFlag,
+    conversationId,
   };
 
   // Always post to router (apiPost ignores the path and uses router endpoint)
@@ -397,6 +413,39 @@ export type A11ChatMessage = {
   content: string;
 };
 
+export type A11HistoryItem = {
+  id: string;
+  name: string;
+  updated?: string;
+  messageCount?: number;
+};
+
+export type A11ConversationResource = {
+  id?: number;
+  userId?: string;
+  conversationId?: string | null;
+  resourceKind?: string;
+  origin?: string;
+  filename: string;
+  storageKey?: string;
+  url?: string;
+  contentType?: string;
+  sizeBytes?: number;
+  metadata?: any;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type A11ConversationActivityEntry = {
+  id: string;
+  type: string;
+  tone?: string;
+  ts?: string;
+  title: string;
+  summary: string;
+  detail?: string;
+};
+
 export type A11AgentResponse =
   | {
       type: "text";
@@ -436,17 +485,269 @@ export async function callA11Agent(messages: A11ChatMessage[], devMode?: boolean
 export async function fetchA11HistoryList() {
   // GET /api/a11/history renvoie la liste des conversations (id, name, updated...)
   const url = API_BASE ? `${API_BASE}/api/a11/history` : '/api/a11/history';
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: buildAuthHeaders(),
+  });
   if (!res.ok) throw new Error('Erreur chargement historique A-11');
-  return res.json();
+  return res.json() as Promise<A11HistoryItem[]>;
 }
 
 export async function fetchA11Conversation(convId: string) {
   // GET /api/a11/history/:id renvoie les messages d'une conversation
   const url = API_BASE ? `${API_BASE}/api/a11/history/${encodeURIComponent(convId)}` : `/api/a11/history/${encodeURIComponent(convId)}`;
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: buildAuthHeaders(),
+  });
   if (!res.ok) throw new Error('Erreur chargement conversation A-11');
   return res.json();
+}
+
+export async function fetchA11ConversationResources(convId: string, options?: { kind?: string; limit?: number }) {
+  const params = new URLSearchParams();
+  if (options?.kind) params.set('kind', options.kind);
+  if (options?.limit) params.set('limit', String(options.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const url = API_BASE
+    ? `${API_BASE}/api/a11/history/${encodeURIComponent(convId)}/resources${suffix}`
+    : `/api/a11/history/${encodeURIComponent(convId)}/resources${suffix}`;
+  const res = await fetch(url, {
+    headers: buildAuthHeaders(),
+  });
+  if (!res.ok) throw new Error('Erreur chargement ressources A-11');
+  return res.json();
+}
+
+export async function fetchA11ConversationActivity(convId: string, options?: { limit?: number }) {
+  const params = new URLSearchParams();
+  if (options?.limit) params.set('limit', String(options.limit));
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  const url = API_BASE
+    ? `${API_BASE}/api/a11/history/${encodeURIComponent(convId)}/activity${suffix}`
+    : `/api/a11/history/${encodeURIComponent(convId)}/activity${suffix}`;
+  const res = await fetch(url, {
+    headers: buildAuthHeaders(),
+  });
+  if (!res.ok) throw new Error('Erreur chargement activite A-11');
+  return res.json() as Promise<{
+    ok: boolean;
+    conversationId?: string | null;
+    count?: number;
+    entries?: A11ConversationActivityEntry[];
+  }>;
+}
+
+function encodeTextAsDataUrl(text: string, contentType = 'text/plain;charset=utf-8') {
+  const bytes = new TextEncoder().encode(String(text || ''));
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  const base64 = btoa(binary);
+  return `data:${contentType};base64,${base64}`;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('file_read_failed'));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function uploadConversationFile(file: File, options?: { conversationId?: string; emailTo?: string }) {
+  const contentBase64 = await readFileAsDataUrl(file);
+  const res = await fetch(getApiUrl('/api/files/upload'), {
+    method: 'POST',
+    headers: buildAuthHeaders('application/json'),
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type || 'application/octet-stream',
+      contentBase64,
+      conversationId: options?.conversationId,
+      emailTo: options?.emailTo,
+    }),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse error
+  }
+
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.message || data?.error || `Upload failed (${res.status})`);
+  }
+
+  return data as {
+    ok: boolean;
+    conversationId?: string;
+    file?: A11ConversationResource;
+    conversationResource?: A11ConversationResource | null;
+    record?: any;
+    mail?: any;
+  };
+}
+
+export async function createTextArtifact(options: {
+  filename: string;
+  text: string;
+  contentType?: string;
+  kind?: string;
+  conversationId?: string;
+  description?: string;
+  emailTo?: string;
+  emailSubject?: string;
+  emailMessage?: string;
+  attachToEmail?: boolean;
+}) {
+  const contentType = String(options.contentType || 'text/plain;charset=utf-8').trim() || 'text/plain;charset=utf-8';
+  const contentBase64 = encodeTextAsDataUrl(options.text, contentType);
+  const res = await fetch(getApiUrl('/api/artifacts/create'), {
+    method: 'POST',
+    headers: buildAuthHeaders('application/json'),
+    body: JSON.stringify({
+      filename: options.filename,
+      contentBase64,
+      contentType,
+      kind: options.kind,
+      conversationId: options.conversationId,
+      description: options.description,
+      emailTo: options.emailTo,
+      emailSubject: options.emailSubject,
+      emailMessage: options.emailMessage,
+      attachToEmail: !!options.attachToEmail,
+    }),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse error
+  }
+
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.message || data?.error || `Artifact creation failed (${res.status})`);
+  }
+
+  return data as {
+    ok: boolean;
+    artifact?: {
+      kind?: string;
+      conversationId?: string;
+      description?: string | null;
+      filename?: string;
+      storageKey?: string;
+      url?: string;
+      contentType?: string;
+      sizeBytes?: number;
+    };
+    record?: any;
+    mail?: any;
+    conversationResource?: A11ConversationResource | null;
+  };
+}
+
+export async function emailConversationResource(resourceId: number, options: { to: string; subject?: string; message?: string; attachToEmail?: boolean }) {
+  const res = await fetch(getApiUrl('/api/resources/email'), {
+    method: 'POST',
+    headers: buildAuthHeaders('application/json'),
+    body: JSON.stringify({
+      resourceId,
+      to: options.to,
+      subject: options.subject,
+      message: options.message,
+      attachToEmail: !!options.attachToEmail,
+    }),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse error
+  }
+
+  if (!res.ok || !data?.ok) {
+    throw new Error(data?.message || data?.error || `Resource email failed (${res.status})`);
+  }
+
+  return data as {
+    ok: boolean;
+    resourceId: number;
+    resource?: A11ConversationResource;
+    mail?: {
+      ok?: boolean;
+      id?: string | null;
+      to?: string;
+      subject?: string;
+      attachmentIncluded?: boolean;
+      attachmentFallbackReason?: string | null;
+    };
+  };
+}
+
+function parseDownloadFilename(contentDisposition: string, fallback: string) {
+  const encodedMatch = /filename\*=UTF-8''([^;]+)/i.exec(contentDisposition || '');
+  if (encodedMatch?.[1]) {
+    try {
+      return decodeURIComponent(encodedMatch[1]);
+    } catch {
+      // ignore malformed encoding
+    }
+  }
+
+  const quotedMatch = /filename="([^"]+)"/i.exec(contentDisposition || '');
+  if (quotedMatch?.[1]) return quotedMatch[1];
+
+  const plainMatch = /filename=([^;]+)/i.exec(contentDisposition || '');
+  if (plainMatch?.[1]) return plainMatch[1].trim();
+
+  return fallback;
+}
+
+export async function downloadConversationResource(resource: A11ConversationResource) {
+  const resourceId = Number(resource?.id || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error('invalid_resource_id');
+  }
+
+  const res = await fetch(getApiUrl(`/api/resources/${resourceId}/download`), {
+    method: 'GET',
+    headers: buildAuthHeaders(),
+  });
+
+  if (!res.ok) {
+    let data: any = {};
+    try {
+      data = await res.json();
+    } catch {
+      // ignore parse errors
+    }
+    throw new Error(data?.message || data?.error || `Resource download failed (${res.status})`);
+  }
+
+  const blob = await res.blob();
+  const fallbackName = String(resource.filename || `resource-${resourceId}.bin`);
+  const filename = parseDownloadFilename(res.headers.get('content-disposition') || '', fallbackName);
+  const blobUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = blobUrl;
+  anchor.download = filename;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  globalThis.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+
+  return {
+    ok: true,
+    filename,
+    sizeBytes: blob.size,
+  };
 }
 
 type MemoryCounts = {

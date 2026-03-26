@@ -240,12 +240,13 @@ async function setupA11Supervisor() {
         cwd: path.dirname(ttsScript),
         env: {
           TTS_PORT: ttsPort,
+          PORT: ttsPort,
           PIPER_DIR: path.resolve(__dirname, '../../piper')
         },
         autoRestart: true
       });
     } else {
-      console.warn('[Supervisor] ✗ TTS script NOT FOUND (searched: serve.py, server.py, piper/serve.py)');
+      console.warn('[Supervisor] ✗ TTS script NOT FOUND (searched: siwis.py, serve.py, server.py, piper/serve.py)');
       console.warn('[Supervisor]   Set MANAGE_TTS=false to disable or add TTS script to expected locations');
     }
   } else {
@@ -261,8 +262,10 @@ function findTTSScript() {
   const BASE = path.resolve(__dirname, '../..');
   const WORKSPACE_ROOT = path.resolve(BASE, '..', '..');
   const candidates = [
+    path.join(WORKSPACE_ROOT, 'apps', 'tts', 'siwis.py'),
     path.join(WORKSPACE_ROOT, 'apps', 'tts', 'serve.py'),
     path.join(WORKSPACE_ROOT, 'apps', 'tts', 'server.py'),
+    path.join(BASE, 'tts', 'siwis.py'),
     path.join(BASE, 'tts', 'serve.py'),
     path.join(BASE, 'tts', 'server.py'),
     path.join(BASE, 'piper', 'serve.py'),

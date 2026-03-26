@@ -1,6 +1,31 @@
 import React, { useEffect, useState, useRef, useMemo } from "react";
-import { fetchA11HistoryList, fetchA11Conversation, login, logout, getAuthToken, forgotPassword, resetPassword, purgeMemoryNow } from "./lib/api";
+import {
+  createTextArtifact,
+  downloadConversationResource,
+  fetchA11HistoryList,
+  fetchA11Conversation,
+  fetchA11ConversationActivity,
+  fetchA11ConversationResources,
+  emailConversationResource,
+  login,
+  logout,
+  getAuthToken,
+  forgotPassword,
+  resetPassword,
+  purgeMemoryNow,
+  uploadConversationFile,
+  type A11ConversationActivityEntry,
+  type A11ConversationResource,
+  type A11HistoryItem,
+} from "./lib/api";
 import { A11HistoryPanel } from "./components/A11HistoryPanel";
+import { HistoryPanel } from "./components/HistoryPanel";
+import { ConversationActivityPanel } from "./components/ConversationActivityPanel";
+import { ConversationResourcesPanel } from "./components/ConversationResourcesPanel";
+import { CreateArtifactModal } from "./components/CreateArtifactModal";
+import { EmailResourceModal } from "./components/EmailResourceModal";
+import { ConfirmModal } from "./components/ConfirmModal";
+import { RenameConversationModal } from "./components/RenameConversationModal";
 import ReactMarkdown from "react-markdown";
 import "./index.css";
 import {
@@ -39,10 +64,215 @@ interface LlmStats {
   gpu?: boolean;
 }
 
+type A11HistoryMessage = {
+  id?: string;
+  role: Role;
+  content: string;
+  ts?: string;
+  imageUrl?: string | null;
+};
+
+type ArtifactFormat = "markdown" | "text" | "json";
+
+type AssistantExportSuggestion = {
+  kind: string;
+  label: string;
+  hint: string;
+  fileStem: string;
+  accent: string;
+};
+
 const DEFAULT_SYSTEM_NINDO =
   "Tu es A-11, assistant local. Réponds de façon concise, claire et directe. N'invente pas de contexte. Ne fais aucune action et ne proposes aucune action non demandée explicitement. Si la question est triviale, réponds en une phrase maximum.";
+
+function buildConversationArtifactContent(
+  conversationMessages: ChatMessage[],
+  options: { conversationId?: string | null; format: ArtifactFormat }
+) {
+  const exportedAt = new Date().toISOString();
+  const conversationId = String(options.conversationId || "default").trim() || "default";
+  const visibleMessages = conversationMessages.filter((message) => message.role !== "system");
+  const messagesToExport = visibleMessages.length ? visibleMessages : conversationMessages;
+  const normalizedMessages = messagesToExport.map((message, index) => ({
+    index: index + 1,
+    role: message.role,
+    content: String(message.content || ""),
+    imageUrl: message.imageUrl || null,
+  }));
+
+  if (options.format === "json") {
+    return {
+      kind: "conversation_json",
+      contentType: "application/json;charset=utf-8",
+      text: JSON.stringify(
+        {
+          conversationId,
+          exportedAt,
+          messageCount: normalizedMessages.length,
+          messages: normalizedMessages,
+        },
+        null,
+        2
+      ),
+    };
+  }
+
+  if (options.format === "markdown") {
+    const lines = [
+      "# Export A11",
+      "",
+      `- Conversation: ${conversationId}`,
+      `- Exported at: ${exportedAt}`,
+      `- Messages: ${normalizedMessages.length}`,
+      "",
+    ];
+
+    for (const message of normalizedMessages) {
+      lines.push(`## ${message.role.toUpperCase()} ${message.index}`);
+      lines.push("");
+      lines.push(message.content || "_Message vide_");
+      if (message.imageUrl) {
+        lines.push("");
+        lines.push(`Image: ${message.imageUrl}`);
+      }
+      lines.push("");
+    }
+
+    return {
+      kind: "conversation_markdown",
+      contentType: "text/markdown;charset=utf-8",
+      text: lines.join("\n"),
+    };
+  }
+
+  const lines = [
+    "A11 Conversation Export",
+    `Conversation: ${conversationId}`,
+    `Exported at: ${exportedAt}`,
+    `Messages: ${normalizedMessages.length}`,
+    "",
+  ];
+
+  for (const message of normalizedMessages) {
+    lines.push(`[${message.role.toUpperCase()} #${message.index}]`);
+    lines.push(message.content || "(message vide)");
+    if (message.imageUrl) lines.push(`Image: ${message.imageUrl}`);
+    lines.push("");
+  }
+
+  return {
+    kind: "conversation_text",
+    contentType: "text/plain;charset=utf-8",
+    text: lines.join("\n"),
+  };
+}
+
+function slugifyArtifactSegment(value: string | null | undefined, fallback: string) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || fallback;
+}
+
+function detectAssistantExportSuggestion(content: string): AssistantExportSuggestion | null {
+  const text = String(content || "").trim();
+  if (!text) return null;
+
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const bulletCount = lines.filter((line) => /^([-*]|\d+\.)\s+/.test(line)).length;
+  const headingCount = lines.filter((line) => /^#{1,3}\s+/.test(line)).length;
+  const tableLike = lines.filter((line) => /\|/.test(line)).length >= 3;
+  const jsonLike = text.startsWith("{") || text.startsWith("[") || text.includes("```json");
+  const codeLike = text.includes("```");
+
+  if (jsonLike) {
+    return {
+      kind: "structured_json",
+      label: "JSON",
+      hint: "Resultat structure detecte, pratique a exporter ou reutiliser.",
+      fileStem: "json",
+      accent: "#38bdf8",
+    };
+  }
+
+  if (tableLike) {
+    return {
+      kind: "tabular_result",
+      label: "Tableau",
+      hint: "Donnees tabulaires detectees, utiles a conserver comme document.",
+      fileStem: "tableau",
+      accent: "#22c55e",
+    };
+  }
+
+  if (codeLike) {
+    return {
+      kind: "code_snippet",
+      label: "Code",
+      hint: "Bloc de code detecte, utile a sauvegarder comme artefact.",
+      fileStem: "code",
+      accent: "#a78bfa",
+    };
+  }
+
+  if (bulletCount >= 4) {
+    return {
+      kind: "structured_list",
+      label: "Liste",
+      hint: "Liste ou plan detecte, pret a etre exporte.",
+      fileStem: "liste",
+      accent: "#f59e0b",
+    };
+  }
+
+  if (headingCount >= 2 || text.length >= 900) {
+    return {
+      kind: "structured_document",
+      label: "Document",
+      hint: "Contenu long ou structure, pertinent pour un export.",
+      fileStem: "document",
+      accent: "#f97316",
+    };
+  }
+
+  return null;
+}
+
+function buildAssistantMessageArtifact(message: ChatMessage, options: { conversationId?: string | null; index: number }) {
+  const exportedAt = new Date().toISOString();
+  const conversationId = String(options.conversationId || "default").trim() || "default";
+  const suggestion = detectAssistantExportSuggestion(message.content);
+  const lines = [
+    `# ${suggestion ? `Resultat A11 - ${suggestion.label}` : "Reponse A11"}`,
+    "",
+    `- Conversation: ${conversationId}`,
+    `- Exported at: ${exportedAt}`,
+    `- Message index: ${options.index + 1}`,
+    "",
+    message.content || "_Reponse vide_",
+  ];
+
+  if (message.imageUrl) {
+    lines.push("");
+    lines.push(`Image: ${message.imageUrl}`);
+  }
+
+  const dateLabel = exportedAt.slice(0, 10);
+  const filename = `a11-${slugifyArtifactSegment(conversationId, "conversation")}-${slugifyArtifactSegment(suggestion?.fileStem, "reply")}-${dateLabel}-${options.index + 1}.md`;
+  return {
+    filename,
+    kind: suggestion?.kind || "assistant_reply",
+    contentType: "text/markdown;charset=utf-8",
+    description: suggestion
+      ? `${suggestion.label} exporte depuis ${conversationId}`
+      : `Reponse assistant exportee depuis ${conversationId}`,
+    text: lines.join("\n"),
+  };
+}
 // ✅ LOGIN PANEL
-function LoginPanel({ onLoginSuccess }: readonly { onLoginSuccess: () => void }) {
+function LoginPanel({ onLoginSuccess }: { onLoginSuccess: () => void }) {
   const [username, setUsername] = useState("Djeff");
   const [password, setPassword] = useState("1991");
   const [forgotEmail, setForgotEmail] = useState("");
@@ -341,9 +571,30 @@ export function App() {
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null);
 
   // Historique A-11 (backend)
-  const [a11History, setA11History] = useState<any[]>([]);
+  const [a11History, setA11History] = useState<A11HistoryItem[]>([]);
   const [a11ConvId, setA11ConvId] = useState<string | null>(null);
-  const [a11ConvMsgs, setA11ConvMsgs] = useState<any[]>([]);
+  const [a11ConvMsgs, setA11ConvMsgs] = useState<A11HistoryMessage[]>([]);
+  const [conversationActivity, setConversationActivity] = useState<A11ConversationActivityEntry[]>([]);
+  const [loadingActivity, setLoadingActivity] = useState(false);
+  const [activityError, setActivityError] = useState("");
+  const [conversationResources, setConversationResources] = useState<A11ConversationResource[]>([]);
+  const [loadingResources, setLoadingResources] = useState(false);
+  const [resourceError, setResourceError] = useState("");
+  const [uploadFeedback, setUploadFeedback] = useState("");
+  const [createArtifactOpen, setCreateArtifactOpen] = useState(false);
+  const [creatingArtifact, setCreatingArtifact] = useState(false);
+  const [creatingMessageArtifactRequest, setCreatingMessageArtifactRequest] = useState<{
+    id: string;
+    mode: "save" | "mail" | "download";
+  } | null>(null);
+  const [createArtifactError, setCreateArtifactError] = useState("");
+  const [downloadingResourceId, setDownloadingResourceId] = useState<number | null>(null);
+  const [emailingResourceId, setEmailingResourceId] = useState<number | null>(null);
+  const [emailDialogResource, setEmailDialogResource] = useState<A11ConversationResource | null>(null);
+  const [emailDialogError, setEmailDialogError] = useState("");
+  const [renameDialog, setRenameDialog] = useState<{ id: string; currentName: string } | null>(null);
+  const [deleteDialogChatId, setDeleteDialogChatId] = useState<string | null>(null);
+  const [purgeConfirmOpen, setPurgeConfirmOpen] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [activeView, setActiveView] = useState<'chat' | 'admin'>('chat');
   const [purgingMemory, setPurgingMemory] = useState(false);
@@ -453,14 +704,286 @@ export function App() {
     );
   }
 
+  function mapBackendConversationMessages(rawMessages: any[]): ChatMessage[] {
+    return (Array.isArray(rawMessages) ? rawMessages : []).map((message: any, index: number) => ({
+      id: String(message?.id || `backend-msg-${Date.now()}-${index}`),
+      role: message?.role === "user" || message?.role === "assistant" || message?.role === "system"
+        ? message.role
+        : "assistant",
+      content: String(message?.content || ""),
+      imageUrl: typeof message?.imageUrl === "string" ? message.imageUrl : null,
+    }));
+  }
+
+  const currentConversationId = a11ConvId || selectedChatId;
+
+  async function refreshConversationActivity(conversationId?: string | null) {
+    const targetConversationId = String(conversationId || "").trim();
+    if (!targetConversationId) {
+      setConversationActivity([]);
+      setActivityError("");
+      return;
+    }
+
+    setLoadingActivity(true);
+    setActivityError("");
+    try {
+      const payload = await fetchA11ConversationActivity(targetConversationId, { limit: 12 });
+      setConversationActivity(Array.isArray(payload?.entries) ? payload.entries : []);
+    } catch (error_) {
+      console.warn("[A11] failed to load conversation activity", error_);
+      setConversationActivity([]);
+      setActivityError((error_ as Error).message || "Chargement de l'activite impossible");
+    } finally {
+      setLoadingActivity(false);
+    }
+  }
+
+  async function refreshConversationResources(conversationId?: string | null) {
+    const targetConversationId = String(conversationId || "").trim();
+    if (!targetConversationId) {
+      setConversationResources([]);
+      setResourceError("");
+      return;
+    }
+
+    setLoadingResources(true);
+    setResourceError("");
+    try {
+      const payload = await fetchA11ConversationResources(targetConversationId, { limit: 24 });
+      setConversationResources(Array.isArray(payload?.resources) ? payload.resources : []);
+    } catch (error_) {
+      console.warn("[A11] failed to load conversation resources", error_);
+      setConversationResources([]);
+      setResourceError((error_ as Error).message || "Chargement des ressources impossible");
+    } finally {
+      setLoadingResources(false);
+    }
+  }
+
+  async function handleEmailResource(resource: A11ConversationResource) {
+    if (typeof resource.id !== "number") return;
+    setEmailDialogError("");
+    setEmailDialogResource(resource);
+  }
+
+  async function handleDownloadResource(resource: A11ConversationResource) {
+    if (typeof resource.id !== "number") return;
+    setDownloadingResourceId(resource.id);
+    setUploadFeedback("Preparation du telechargement...");
+    try {
+      const result = await downloadConversationResource(resource);
+      setUploadFeedback(`Telechargement lance: ${result.filename}`);
+      await refreshConversationActivity(resource.conversationId || currentConversationId);
+    } catch (error_) {
+      console.warn("[A11] failed to download resource", error_);
+      const errorMessage = (error_ as Error).message || String(error_);
+      setUploadFeedback(`Echec telechargement: ${errorMessage}`);
+    } finally {
+      setDownloadingResourceId(null);
+    }
+  }
+
+  function closeEmailDialog() {
+    if (emailingResourceId) return;
+    setEmailDialogError("");
+    setEmailDialogResource(null);
+  }
+
+  function openCreateArtifactDialog() {
+    setCreateArtifactError("");
+    setCreateArtifactOpen(true);
+  }
+
+  function closeCreateArtifactDialog() {
+    if (creatingArtifact) return;
+    setCreateArtifactError("");
+    setCreateArtifactOpen(false);
+  }
+
+  async function submitCreateArtifact(payload: {
+    format: ArtifactFormat;
+    filename: string;
+    description?: string;
+    openEmailAfterCreate: boolean;
+    downloadAfterCreate: boolean;
+  }) {
+    const conversationId = currentConversationId || selectedChatId || undefined;
+    if (!conversationId) return;
+
+    const exportPayload = buildConversationArtifactContent(messages, {
+      conversationId,
+      format: payload.format,
+    });
+
+    setCreatingArtifact(true);
+    setCreateArtifactError("");
+    setUploadFeedback("Creation de l'artefact en cours...");
+    try {
+      const result = await createTextArtifact({
+        filename: payload.filename,
+        text: exportPayload.text,
+        contentType: exportPayload.contentType,
+        kind: exportPayload.kind,
+        conversationId,
+        description: payload.description,
+      });
+      setCreateArtifactOpen(false);
+      await refreshConversationResources(conversationId);
+      await refreshConversationActivity(conversationId);
+      if (payload.downloadAfterCreate && result.conversationResource?.id) {
+        await downloadConversationResource(result.conversationResource);
+      }
+      if (payload.openEmailAfterCreate && result.conversationResource?.id) {
+        setEmailDialogError("");
+        setEmailDialogResource(result.conversationResource);
+      }
+      if (payload.openEmailAfterCreate && payload.downloadAfterCreate) {
+        setUploadFeedback(`Artefact ${result.artifact?.filename || payload.filename} cree, telecharge et pret a etre envoye.`);
+      } else if (payload.openEmailAfterCreate) {
+        setUploadFeedback(`Artefact ${result.artifact?.filename || payload.filename} cree et pret pour l'envoi mail.`);
+      } else if (payload.downloadAfterCreate) {
+        setUploadFeedback(`Artefact ${result.artifact?.filename || payload.filename} cree et telecharge.`);
+      } else {
+        setUploadFeedback(`Artefact ${result.artifact?.filename || payload.filename} cree et stocke.`);
+      }
+    } catch (error_) {
+      console.warn("[A11] artifact creation failed", error_);
+      const errorMessage = (error_ as Error).message || String(error_);
+      setCreateArtifactError(errorMessage);
+      setUploadFeedback(`Echec creation artefact: ${errorMessage}`);
+    } finally {
+      setCreatingArtifact(false);
+    }
+  }
+
+  async function saveAssistantMessageArtifact(
+    message: ChatMessage,
+    messageIndex: number,
+    options?: { openEmailAfterCreate?: boolean; downloadAfterCreate?: boolean }
+  ) {
+    const conversationId = currentConversationId || selectedChatId || undefined;
+    if (!conversationId || message.role !== "assistant" || !String(message.content || "").trim()) return;
+
+    const artifactPayload = buildAssistantMessageArtifact(message, {
+      conversationId,
+      index: messageIndex,
+    });
+
+    const openEmailAfterCreate = !!options?.openEmailAfterCreate;
+    const downloadAfterCreate = !!options?.downloadAfterCreate;
+    setCreatingMessageArtifactRequest({
+      id: message.id,
+      mode: openEmailAfterCreate ? "mail" : (downloadAfterCreate ? "download" : "save"),
+    });
+    setUploadFeedback(
+      openEmailAfterCreate
+        ? "Sauvegarde de la reponse puis ouverture du mail..."
+        : (downloadAfterCreate
+          ? "Sauvegarde de la reponse puis telechargement..."
+          : "Sauvegarde de la reponse en artefact...")
+    );
+    try {
+      const result = await createTextArtifact({
+        filename: artifactPayload.filename,
+        text: artifactPayload.text,
+        contentType: artifactPayload.contentType,
+        kind: artifactPayload.kind,
+        conversationId,
+        description: artifactPayload.description,
+      });
+      await refreshConversationResources(conversationId);
+      await refreshConversationActivity(conversationId);
+      if (downloadAfterCreate && result.conversationResource?.id) {
+        await downloadConversationResource(result.conversationResource);
+      }
+      if (openEmailAfterCreate && result.conversationResource?.id) {
+        setEmailDialogError("");
+        setEmailDialogResource(result.conversationResource);
+        setUploadFeedback(`Reponse sauvegardee: ${result.artifact?.filename || artifactPayload.filename}. Envoi mail pret.`);
+      } else if (downloadAfterCreate) {
+        setUploadFeedback(`Reponse sauvegardee: ${result.artifact?.filename || artifactPayload.filename}. Telechargement lance.`);
+      } else {
+        setUploadFeedback(`Reponse sauvegardee: ${result.artifact?.filename || artifactPayload.filename}`);
+      }
+    } catch (error_) {
+      console.warn("[A11] assistant message artifact failed", error_);
+      const errorMessage = (error_ as Error).message || String(error_);
+      setUploadFeedback(`Echec sauvegarde reponse: ${errorMessage}`);
+    } finally {
+      setCreatingMessageArtifactRequest(null);
+    }
+  }
+
+  async function submitEmailResource(payload: { to: string; subject?: string; message?: string; attachToEmail: boolean }) {
+    const resource = emailDialogResource;
+    if (!resource || typeof resource.id !== "number") return;
+
+    setEmailingResourceId(resource.id);
+    setEmailDialogError("");
+    setUploadFeedback("Envoi mail en cours...");
+    try {
+      const result = await emailConversationResource(resource.id, {
+        to: payload.to.trim(),
+        subject: payload.subject,
+        message: payload.message,
+        attachToEmail: payload.attachToEmail,
+      });
+      const attachmentLabel = result.mail?.attachmentIncluded ? "avec piece jointe" : "avec lien";
+      setUploadFeedback(`Mail envoye vers ${payload.to.trim()} ${attachmentLabel}.`);
+      setEmailDialogResource(null);
+      await refreshConversationResources(resource.conversationId || currentConversationId);
+      await refreshConversationActivity(resource.conversationId || currentConversationId);
+    } catch (error_) {
+      console.warn("[A11] failed to email resource", error_);
+      const errorMessage = (error_ as Error).message || String(error_);
+      setEmailDialogError(errorMessage);
+      setUploadFeedback(`Echec envoi mail: ${errorMessage}`);
+    } finally {
+      setEmailingResourceId(null);
+    }
+  }
+
   function onImportClick() {
     fileInputRef.current?.click();
   }
 
-  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    handleImportFiles(e.target.files, (txt: string) => {
+  async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    handleImportFiles(files, (txt: string) => {
       setInput((prev) => (prev ? prev + "\n" + txt : txt));
     }).catch(console.error);
+
+    if (!files || files.length === 0) return;
+
+    const conversationId = a11ConvId || selectedChatId || undefined;
+    const uploaded: string[] = [];
+    const failed: string[] = [];
+    setUploadFeedback(`Import de ${files.length} fichier(s) en cours...`);
+    for (const file of Array.from(files)) {
+      try {
+        await uploadConversationFile(file, { conversationId });
+        uploaded.push(file.name);
+      } catch (error_) {
+        console.warn("[A11] file upload failed", file.name, error_);
+        failed.push(file.name);
+      }
+    }
+
+    if (conversationId) {
+      await refreshConversationActivity(conversationId);
+      await refreshConversationResources(conversationId);
+    }
+
+    if (uploaded.length && failed.length) {
+      setUploadFeedback(`Import partiel: ${uploaded.length} ok, ${failed.length} en echec.`);
+    } else if (uploaded.length) {
+      setUploadFeedback(`${uploaded.length} fichier(s) rattache(s) a la conversation.`);
+    } else if (failed.length) {
+      setUploadFeedback(`Echec import: ${failed.join(", ")}`);
+    }
+
+    e.target.value = "";
   }
 
   // New conversation handler
@@ -475,8 +998,14 @@ export function App() {
     };
     setChats((prev) => [newChat, ...prev]);
     setSelectedChatId(id);
+    setA11ConvId(null);
+    setA11ConvMsgs([]);
     setMessages(newChat.messages);
     setInput("");
+    setConversationActivity([]);
+    setConversationResources([]);
+    setActivityError("");
+    setUploadFeedback("");
   }
 
   // Speech recognition callback
@@ -522,7 +1051,8 @@ export function App() {
         {
           model,
           systemPrompt: systemPrompt,
-          a11Dev: devMode
+          a11Dev: devMode,
+          conversationId: selectedChatId || undefined,
         }
       );
 
@@ -536,6 +1066,7 @@ export function App() {
         updateChatMessages(selectedChatId, nm);
         return nm;
       });
+      await refreshConversationActivity(selectedChatId || a11ConvId);
 
       // Pipeline auto: LLM reply -> TTS playback
       speak(String(assistantText), { lang: "fr-FR" });
@@ -626,14 +1157,17 @@ export function App() {
   function renameChat(id: string) {
     const c = chats.find(x => x.id === id);
     if (!c) return;
-    const name = prompt('Nouveau nom de la conversation', c.name);
-    if (!name) return;
-    setChats(prev => prev.map(x => x.id === id ? { ...x, name } : x));
+    setRenameDialog({ id, currentName: c.name });
   }
 
   // Delete chat
   function deleteChat(id: string) {
-    if (!confirm('Supprimer cette conversation ?')) return;
+    setDeleteDialogChatId(id);
+  }
+
+  function confirmDeleteChat() {
+    const id = deleteDialogChatId;
+    if (!id) return;
     setChats(prev => {
       const next = prev.filter(x => x.id !== id);
       if (next.length === 0) {
@@ -650,6 +1184,7 @@ export function App() {
       }
       return next;
     });
+    setDeleteDialogChatId(null);
   }
 
   // NINDO layers (à adapter selon ton code)
@@ -746,6 +1281,19 @@ RÈGLES STRICTES :
     refreshA11History();
   }, []);
 
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (activeView !== 'chat') return;
+    refreshConversationActivity(currentConversationId);
+    refreshConversationResources(currentConversationId);
+  }, [isAuthenticated, activeView, currentConversationId]);
+
+  useEffect(() => {
+    if (!uploadFeedback) return;
+    const timeout = globalThis.setTimeout(() => setUploadFeedback(""), 5000);
+    return () => globalThis.clearTimeout(timeout);
+  }, [uploadFeedback]);
+
   // Handler pour rafraîchir la liste de l'historique
   async function refreshA11History() {
     setLoadingHistory(true);
@@ -764,10 +1312,34 @@ RÈGLES STRICTES :
   async function handleOpenA11Conversation(convId: string) {
     setA11ConvId(convId);
     setA11ConvMsgs([]);
+    setUploadFeedback("");
     setLoadingHistory(true);
     try {
       const conv = await fetchA11Conversation(convId);
-      setA11ConvMsgs(conv.messages || []);
+      const normalizedMessages = mapBackendConversationMessages(conv.messages || []);
+      setA11ConvMsgs(normalizedMessages);
+      setActiveView('chat');
+      setSelectedChatId(convId);
+      setMessages(normalizedMessages);
+      setChats((prev) => {
+        const existing = prev.find((chat) => chat.id === convId);
+        if (existing) {
+          return prev.map((chat) =>
+            chat.id === convId
+              ? { ...chat, name: existing.name || convId, messages: normalizedMessages, updated: Date.now() }
+              : chat
+          );
+        }
+        return [
+          {
+            id: convId,
+            name: convId === 'default' ? 'Session par defaut' : convId,
+            updated: Date.now(),
+            messages: normalizedMessages,
+          },
+          ...prev,
+        ];
+      });
     } catch (error_) {
       console.warn('[A11] failed to open conversation', error_);
       setA11ConvMsgs([]);
@@ -777,10 +1349,9 @@ RÈGLES STRICTES :
   }
 
   async function handlePurgeMemoryNow() {
-    const confirmed = globalThis.confirm('Déclencher un purge-now de la mémoire structurée ?');
-    if (!confirmed || purgingMemory) return;
-
+    if (purgingMemory) return;
     setPurgingMemory(true);
+    setPurgeConfirmOpen(false);
     setPurgeFeedback('Purge en cours...');
     try {
       const result = await purgeMemoryNow({ dryRun: memoryPurgeDryRun });
@@ -1081,7 +1652,7 @@ RÈGLES STRICTES :
                 </label>
                 <button
                   type="button"
-                  onClick={handlePurgeMemoryNow}
+                  onClick={() => setPurgeConfirmOpen(true)}
                   disabled={purgingMemory}
                   style={{
                     padding: '8px 12px',
@@ -1142,9 +1713,35 @@ RÈGLES STRICTES :
               </div>
             </div>
           ) : (
+          <>
+          <ConversationActivityPanel
+            conversationId={currentConversationId}
+            entries={conversationActivity}
+            loading={loadingActivity}
+            error={activityError || null}
+            onRefresh={() => refreshConversationActivity(currentConversationId)}
+          />
+          <ConversationResourcesPanel
+            conversationId={currentConversationId}
+            resources={conversationResources}
+            loading={loadingResources}
+            creatingArtifact={creatingArtifact}
+            error={resourceError || null}
+            uploadFeedback={uploadFeedback || null}
+            onCreateArtifact={openCreateArtifactDialog}
+            onRefresh={() => refreshConversationResources(currentConversationId)}
+            onDownloadResource={handleDownloadResource}
+            downloadingResourceId={downloadingResourceId}
+            onEmailResource={handleEmailResource}
+            emailingResourceId={emailingResourceId}
+          />
           <div className="scroll-frame">
             <div className="log">
-              {(a11ConvMsgs.length ? a11ConvMsgs : messages).map((m, idx) => {
+              {messages.map((m, idx) => {
+                const isSavingMessageArtifact = creatingMessageArtifactRequest?.id === m.id;
+                const isSavingMessageArtifactAndMail = isSavingMessageArtifact && creatingMessageArtifactRequest?.mode === "mail";
+                const isSavingMessageArtifactAndDownload = isSavingMessageArtifact && creatingMessageArtifactRequest?.mode === "download";
+                const exportSuggestion = m.role === "assistant" ? detectAssistantExportSuggestion(m.content) : null;
                 let messageClassName = "message ";
                 let roleLabel = "Système / Nindo";
                 if (m.role === "user") {
@@ -1174,6 +1771,56 @@ RÈGLES STRICTES :
                         />
                       </div>
                     )}
+                    {exportSuggestion ? (
+                      <div
+                        style={{
+                          marginTop: 10,
+                          padding: "8px 10px",
+                          borderRadius: 10,
+                          border: `1px solid ${exportSuggestion.accent}`,
+                          background: "#0b1220",
+                          color: "#e2e8f0",
+                        }}
+                      >
+                        <div style={{ fontSize: 11, fontWeight: 700, color: exportSuggestion.accent, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                          Pret a exporter · {exportSuggestion.label}
+                        </div>
+                        <div style={{ fontSize: 12, color: "#cbd5e1", marginTop: 4 }}>
+                          {exportSuggestion.hint}
+                        </div>
+                      </div>
+                    ) : null}
+                    {m.role === "assistant" && String(m.content || "").trim() ? (
+                      <div style={{ marginTop: 10, display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+                        <button
+                          type="button"
+                          className="btn ghost"
+                          onClick={() => saveAssistantMessageArtifact(m, idx, { downloadAfterCreate: true })}
+                          disabled={isSavingMessageArtifact || creatingArtifact}
+                          style={{ fontSize: 11, padding: "4px 8px" }}
+                        >
+                          {isSavingMessageArtifactAndDownload ? "Telechargement..." : "Sauver + Telecharger"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn ghost"
+                          onClick={() => saveAssistantMessageArtifact(m, idx, { openEmailAfterCreate: true })}
+                          disabled={isSavingMessageArtifact || creatingArtifact}
+                          style={{ fontSize: 11, padding: "4px 8px" }}
+                        >
+                          {isSavingMessageArtifactAndMail ? "Preparation mail..." : "Sauver + Mail"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn ghost"
+                          onClick={() => saveAssistantMessageArtifact(m, idx)}
+                          disabled={isSavingMessageArtifact || creatingArtifact}
+                          style={{ fontSize: 11, padding: "4px 8px" }}
+                        >
+                          {isSavingMessageArtifact && !isSavingMessageArtifactAndMail && !isSavingMessageArtifactAndDownload ? "Sauvegarde..." : "Sauver en artefact"}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 );
               })}
@@ -1225,10 +1872,12 @@ RÈGLES STRICTES :
             <input
               ref={fileInputRef}
               type="file"
+              multiple
               style={{ display: 'none' }}
               onChange={onFileChange}
             />
           </div>
+          </>
           )}
         </main>
       </div>
@@ -1236,6 +1885,55 @@ RÈGLES STRICTES :
         A-11 / Qflush UI · Cerbère 4545 · LLaMA local · Funesterie
       </footer>
       {showHistory && <HistoryPanel onClose={() => setShowHistory(false)} />}
+      <RenameConversationModal
+        open={!!renameDialog}
+        currentName={renameDialog?.currentName || ""}
+        onClose={() => setRenameDialog(null)}
+        onSubmit={(name) => {
+          const targetId = renameDialog?.id;
+          if (!targetId) return;
+          setChats((prev) => prev.map((chat) => chat.id === targetId ? { ...chat, name } : chat));
+          setRenameDialog(null);
+        }}
+      />
+      <ConfirmModal
+        open={!!deleteDialogChatId}
+        title="Supprimer la conversation"
+        message="Cette conversation locale sera retirée de la liste actuelle."
+        confirmLabel="Supprimer"
+        confirmTone="danger"
+        onClose={() => setDeleteDialogChatId(null)}
+        onConfirm={confirmDeleteChat}
+      />
+      <ConfirmModal
+        open={purgeConfirmOpen}
+        title="Confirmer la purge mémoire"
+        message={memoryPurgeDryRun
+          ? "Lancer une simulation de purge de la mémoire structurée ?"
+          : "Déclencher immédiatement la purge réelle de la mémoire structurée ?"}
+        confirmLabel={memoryPurgeDryRun ? "Lancer le dry run" : "Lancer la purge"}
+        confirmTone={memoryPurgeDryRun ? "primary" : "danger"}
+        loading={purgingMemory}
+        onClose={() => setPurgeConfirmOpen(false)}
+        onConfirm={handlePurgeMemoryNow}
+      />
+      <EmailResourceModal
+        resource={emailDialogResource}
+        open={!!emailDialogResource}
+        submitting={!!emailDialogResource && emailingResourceId === emailDialogResource.id}
+        error={emailDialogError || null}
+        onClose={closeEmailDialog}
+        onSubmit={submitEmailResource}
+      />
+      <CreateArtifactModal
+        open={createArtifactOpen}
+        submitting={creatingArtifact}
+        error={createArtifactError || null}
+        conversationId={currentConversationId}
+        messageCount={messages.filter((message) => message.role !== "system").length}
+        onClose={closeCreateArtifactDialog}
+        onSubmit={submitCreateArtifact}
+      />
       {audioBlockedUrl && (
         <div style={{
           position: 'fixed', bottom: 80, left: '50%', transform: 'translateX(-50%)',

@@ -10,6 +10,7 @@ const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 const fs = require('node:fs');
 const dotenv = require('dotenv');
+const { buildRuntimeConfig, getPublicRuntimeStatus } = require('./lib/runtime-config.cjs');
 
 // A11Host (VSIX + headless)
 const {
@@ -52,9 +53,11 @@ const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
 
+const runtimeConfig = buildRuntimeConfig(process.env);
+
 // Set remote qflush URL for production (allow env override)
-process.env.QFLUSH_URL = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL || 'https://qflush-production.up.railway.app';
-process.env.QFLUSH_REMOTE_URL = process.env.QFLUSH_REMOTE_URL || process.env.QFLUSH_URL;
+process.env.QFLUSH_URL = runtimeConfig.qflush.remoteUrl;
+process.env.QFLUSH_REMOTE_URL = runtimeConfig.qflush.remoteUrl;
 
 const qflushIntegration = require('./src/qflush-integration.cjs');
 const { setupA11Supervisor, runQflushFlow } = qflushIntegration;
@@ -110,9 +113,12 @@ const sharp = require('sharp');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
-const { Resend } = require('resend');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { nezAuth, getNezAccessLog, TOKENS, MODE, registerIssuedToken } = require('./src/middleware/nezAuth');
+const { createFileStorage } = require('./lib/file-storage.cjs');
+const { ingestUploadedFile } = require('./lib/file-ingestion.cjs');
+const { createArtifact, normalizeArtifactKind, buildArtifactOrigin } = require('./lib/artifact-manager.cjs');
+const { createEmailService } = require('./lib/email-service.cjs');
+const { analyzeUploadedResource, buildConversationResourceContext } = require('./lib/resource-reader.cjs');
 
 const BASE = path.resolve(__dirname);
 const LLAMA_DIR = path.join(BASE, 'llama.cpp');
@@ -213,6 +219,216 @@ function appendConversationLog(entry) {
   } catch (e) {
     console.warn('[A11][memory] append failed:', e?.message);
   }
+}
+
+function readConversationLogEntries({ userId, conversationId, limit = 20 } = {}) {
+  try {
+    ensureConvDir();
+    if (!fsMem.existsSync(A11_CONV_DIR)) return [];
+
+    const normalizedUserId = String(userId || '').trim();
+    const normalizedConversationId = normalizeConversationId(conversationId);
+    const normalizedLimit = Math.max(1, Math.min(100, Number(limit || 20)));
+    const files = fsMem
+      .readdirSync(A11_CONV_DIR, { withFileTypes: true })
+      .filter((dirent) => dirent.isFile() && dirent.name.endsWith('.jsonl'))
+      .map((dirent) => dirent.name)
+      .sort((a, b) => b.localeCompare(a));
+    const entries = [];
+
+    for (const filename of files) {
+      const fullPath = pathMem.join(A11_CONV_DIR, filename);
+      let raw;
+      try {
+        raw = fsMem.readFileSync(fullPath, 'utf8');
+      } catch (error_) {
+        console.warn('[A11][memory] read activity file failed:', fullPath, error_?.message);
+        continue;
+      }
+
+      const lines = raw.split('\n').map((line) => line.trim()).filter(Boolean).reverse();
+      for (const line of lines) {
+        let entry;
+        try {
+          entry = JSON.parse(line);
+        } catch (error_) {
+          console.warn('[A11][memory] activity JSON parse error in', fullPath, error_?.message);
+          continue;
+        }
+
+        const rawConversationId = String(entry?.conversationId || '').trim();
+        const entryUserId = String(entry?.userId || '').trim();
+        if (!rawConversationId) continue;
+        if (normalizeConversationId(rawConversationId) !== normalizedConversationId) continue;
+        if (normalizedUserId && (!entryUserId || entryUserId !== normalizedUserId)) continue;
+
+        entries.push(entry);
+        if (entries.length >= normalizedLimit) {
+          return entries;
+        }
+      }
+    }
+
+    return entries;
+  } catch (error_) {
+    console.warn('[A11][memory] read activity failed:', error_?.message);
+    return [];
+  }
+}
+
+function truncateConversationActivityText(value, maxLength = 180) {
+  const normalized = normalizeMemoryText(value);
+  if (!normalized) return '';
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function buildConversationActivityEntry(entry, index = 0) {
+  const type = String(entry?.type || 'event').trim() || 'event';
+  const ts = String(entry?.ts || new Date().toISOString()).trim() || new Date().toISOString();
+  const id = `${type}-${ts}-${index}`;
+
+  if (type === 'file_uploaded') {
+    const file = entry?.file || {};
+    const analysis = entry?.analysis || {};
+    return {
+      id,
+      type,
+      tone: 'file',
+      ts,
+      title: 'Fichier ajoute',
+      summary: truncateConversationActivityText(file.filename || 'Fichier rattache a la conversation', 140),
+      detail: truncateConversationActivityText(
+        analysis.preview
+          || analysis.note
+          || `${file.contentType || 'application/octet-stream'}${file.sizeBytes ? ` • ${file.sizeBytes} bytes` : ''}`,
+        180
+      ),
+    };
+  }
+
+  if (type === 'artifact_created') {
+    const artifact = entry?.artifact || {};
+    const mail = entry?.mail || null;
+    return {
+      id,
+      type,
+      tone: 'artifact',
+      ts,
+      title: 'Artefact cree',
+      summary: truncateConversationActivityText(
+        artifact.kind
+          ? `${artifact.filename || 'Artefact'} (${artifact.kind})`
+          : (artifact.filename || 'Artefact genere'),
+        140
+      ),
+      detail: truncateConversationActivityText(
+        artifact.description
+          || (mail?.to ? `Pret et envoye vers ${mail.to}` : 'Stocke pour reutilisation dans la conversation.'),
+        180
+      ),
+    };
+  }
+
+  if (type === 'resource_emailed') {
+    const resource = entry?.resource || {};
+    const mail = entry?.mail || {};
+    return {
+      id,
+      type,
+      tone: 'mail',
+      ts,
+      title: 'Ressource envoyee',
+      summary: truncateConversationActivityText(
+        `${resource.filename || 'Ressource'}${mail.to ? ` -> ${mail.to}` : ''}`,
+        140
+      ),
+      detail: truncateConversationActivityText(
+        mail.attachmentIncluded
+          ? 'Envoi avec piece jointe.'
+          : (mail.attachmentFallbackReason
+            ? `Lien envoye (${mail.attachmentFallbackReason}).`
+            : 'Envoi par lien public.'),
+        180
+      ),
+    };
+  }
+
+  if (type === 'resource_downloaded') {
+    const resource = entry?.resource || {};
+    return {
+      id,
+      type,
+      tone: 'file',
+      ts,
+      title: 'Ressource telechargee',
+      summary: truncateConversationActivityText(resource.filename || 'Document telecharge', 140),
+      detail: truncateConversationActivityText(
+        `${resource.contentType || 'application/octet-stream'}${resource.sizeBytes ? ` • ${resource.sizeBytes} bytes` : ''}`,
+        180
+      ),
+    };
+  }
+
+  if (type === 'chat_turn') {
+    const requestMessages = Array.isArray(entry?.request?.messages) ? entry.request.messages : [];
+    const latestUserMessage = requestMessages
+      .slice()
+      .reverse()
+      .find((message) => String(message?.role || '').trim() === 'user');
+    const assistantContent = extractAssistantText(entry?.response || {});
+    return {
+      id,
+      type,
+      tone: 'chat',
+      ts,
+      title: 'Echange avec A11',
+      summary: truncateConversationActivityText(
+        latestUserMessage?.content || entry?.request?.prompt || 'Question utilisateur',
+        140
+      ),
+      detail: truncateConversationActivityText(
+        assistantContent || entry?.request?.model || 'Reponse assistant enregistree.',
+        180
+      ),
+    };
+  }
+
+  if (type === 'agent_actions') {
+    const actionCount = Array.isArray(entry?.cerbere?.results)
+      ? entry.cerbere.results.length
+      : (Array.isArray(entry?.cerbere?.actions) ? entry.cerbere.actions.length : 0);
+    return {
+      id,
+      type,
+      tone: 'agent',
+      ts,
+      title: 'Action agent',
+      summary: truncateConversationActivityText(
+        entry?.envelope?.title
+          || entry?.envelope?.goal
+          || entry?.explanation
+          || 'Execution outillee via agent',
+        140
+      ),
+      detail: truncateConversationActivityText(
+        actionCount > 0
+          ? `${actionCount} action(s) executee(s).`
+          : (entry?.imagePath ? `Image produite: ${entry.imagePath}` : 'Execution agent tracee.'),
+        180
+      ),
+    };
+  }
+
+  return {
+    id,
+    type,
+    tone: 'neutral',
+    ts,
+    title: 'Activite',
+    summary: truncateConversationActivityText(entry?.summary || entry?.message || type, 140),
+    detail: '',
+  };
 }
 // --- Fin bloc mémoire persistante ---
 
@@ -503,6 +719,26 @@ if (db) {
           )
         `);
         await db.query('CREATE INDEX IF NOT EXISTS idx_user_files_user_created ON user_files (user_id, created_at DESC)');
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS conversation_resources (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            resource_kind TEXT NOT NULL DEFAULT 'file',
+            origin TEXT DEFAULT 'upload',
+            filename TEXT NOT NULL,
+            storage_key TEXT NOT NULL,
+            url TEXT,
+            content_type TEXT,
+            size_bytes INTEGER,
+            metadata_json JSONB,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (user_id, conversation_id, storage_key)
+          )
+        `);
+        await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_conversation_created ON conversation_resources (user_id, conversation_id, created_at DESC)');
+        await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_kind_updated ON conversation_resources (user_id, resource_kind, updated_at DESC)');
 
         const adminLookup = await db.query(
           'SELECT id FROM users WHERE LOWER(username)=LOWER($1) OR LOWER(email)=LOWER($2) LIMIT 1',
@@ -996,6 +1232,240 @@ async function saveUserFileMemory({ userId, filename, storageKey, url, contentTy
   );
 }
 
+function normalizeConversationResourceKind(resourceKind) {
+  const normalized = String(resourceKind || '').trim().toLowerCase();
+  if (normalized === 'artifact') return 'artifact';
+  return 'file';
+}
+
+function parseConversationResourceMetadata(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
+async function linkConversationResource({
+  userId,
+  conversationId,
+  resourceKind,
+  origin,
+  filename,
+  storageKey,
+  url,
+  contentType,
+  sizeBytes,
+  metadata,
+}) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedConversationId = normalizeConversationId(conversationId);
+  const normalizedFilename = normalizeMemoryText(filename).slice(0, 220);
+  const normalizedStorageKey = normalizeMemoryText(storageKey).slice(0, 500);
+  const normalizedUrl = normalizeMemoryText(url).slice(0, 1200);
+  if (!db || !normalizedUserId || !normalizedFilename || !normalizedStorageKey) return null;
+
+  const metadataJson = metadata == null ? null : JSON.stringify(metadata);
+  const result = await db.query(
+    `INSERT INTO conversation_resources (
+       user_id,
+       conversation_id,
+       resource_kind,
+       origin,
+       filename,
+       storage_key,
+       url,
+       content_type,
+       size_bytes,
+       metadata_json,
+       created_at,
+       updated_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
+     ON CONFLICT (user_id, conversation_id, storage_key)
+     DO UPDATE SET
+       resource_kind=EXCLUDED.resource_kind,
+       origin=EXCLUDED.origin,
+       filename=EXCLUDED.filename,
+       url=EXCLUDED.url,
+       content_type=EXCLUDED.content_type,
+       size_bytes=EXCLUDED.size_bytes,
+       metadata_json=EXCLUDED.metadata_json,
+       updated_at=NOW()
+     RETURNING id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at`,
+    [
+      normalizedUserId,
+      normalizedConversationId,
+      normalizeConversationResourceKind(resourceKind),
+      normalizeMemoryText(origin || 'upload').slice(0, 80) || 'upload',
+      normalizedFilename,
+      normalizedStorageKey,
+      normalizedUrl || null,
+      normalizeMemoryText(contentType || '').slice(0, 100) || null,
+      Number(sizeBytes || 0),
+      metadataJson,
+    ]
+  );
+
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  return {
+    id: Number(row.id || 0),
+    userId: String(row.user_id || ''),
+    conversationId: String(row.conversation_id || 'default'),
+    resourceKind: String(row.resource_kind || 'file'),
+    origin: String(row.origin || ''),
+    filename: String(row.filename || ''),
+    storageKey: String(row.storage_key || ''),
+    url: String(row.url || ''),
+    contentType: String(row.content_type || ''),
+    sizeBytes: Number(row.size_bytes || 0),
+    metadata: parseConversationResourceMetadata(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function listConversationResources(userId, { conversationId, resourceKind, limit = FILE_MEMORY_LIMIT } = {}) {
+  const normalizedUserId = String(userId || '').trim();
+  if (!db || !normalizedUserId) return [];
+
+  const normalizedConversationId = String(conversationId || '').trim()
+    ? normalizeConversationId(conversationId)
+    : '';
+  const normalizedResourceKind = String(resourceKind || '').trim()
+    ? normalizeConversationResourceKind(resourceKind)
+    : '';
+  const normalizedLimit = Math.max(1, Math.min(100, Number(limit || FILE_MEMORY_LIMIT)));
+  const params = [normalizedUserId];
+  const conditions = ['user_id=$1'];
+
+  if (normalizedConversationId) {
+    params.push(normalizedConversationId);
+    conditions.push(`conversation_id=$${params.length}`);
+  }
+
+  if (normalizedResourceKind) {
+    params.push(normalizedResourceKind);
+    conditions.push(`resource_kind=$${params.length}`);
+  }
+
+  params.push(normalizedLimit);
+  const result = await db.query(
+    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at
+     FROM conversation_resources
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY updated_at DESC, created_at DESC, id DESC
+     LIMIT $${params.length}`,
+    params
+  );
+
+  return result.rows.map((row) => ({
+    id: Number(row.id || 0),
+    userId: String(row.user_id || ''),
+    conversationId: String(row.conversation_id || 'default'),
+    resourceKind: String(row.resource_kind || 'file'),
+    origin: String(row.origin || ''),
+    filename: String(row.filename || ''),
+    storageKey: String(row.storage_key || ''),
+    url: String(row.url || ''),
+    contentType: String(row.content_type || ''),
+    sizeBytes: Number(row.size_bytes || 0),
+    metadata: parseConversationResourceMetadata(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+async function getConversationResourceById(userId, resourceId) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedResourceId = Number(resourceId || 0);
+  if (!db || !normalizedUserId || !Number.isFinite(normalizedResourceId) || normalizedResourceId <= 0) return null;
+
+  const result = await db.query(
+    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at
+     FROM conversation_resources
+     WHERE user_id=$1 AND id=$2
+     LIMIT 1`,
+    [normalizedUserId, normalizedResourceId]
+  );
+
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  return {
+    id: Number(row.id || 0),
+    userId: String(row.user_id || ''),
+    conversationId: String(row.conversation_id || 'default'),
+    resourceKind: String(row.resource_kind || 'file'),
+    origin: String(row.origin || ''),
+    filename: String(row.filename || ''),
+    storageKey: String(row.storage_key || ''),
+    url: String(row.url || ''),
+    contentType: String(row.content_type || ''),
+    sizeBytes: Number(row.size_bytes || 0),
+    metadata: parseConversationResourceMetadata(row.metadata_json),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function markConversationResourceEmailed(userId, resourceId, emailRecord) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedResourceId = Number(resourceId || 0);
+  if (!db || !normalizedUserId || !Number.isFinite(normalizedResourceId) || normalizedResourceId <= 0) return null;
+
+  const payload = {
+    lastEmailedAt: new Date().toISOString(),
+    lastEmail: {
+      to: String(emailRecord?.to || '').trim() || null,
+      subject: String(emailRecord?.subject || '').trim() || null,
+      attached: !!emailRecord?.attached,
+      mailId: String(emailRecord?.mailId || '').trim() || null,
+      ok: emailRecord?.ok !== false,
+    },
+  };
+
+  const result = await db.query(
+    `UPDATE conversation_resources
+     SET metadata_json = COALESCE(metadata_json, '{}'::jsonb) || $3::jsonb,
+         updated_at = NOW()
+     WHERE user_id=$1 AND id=$2
+     RETURNING id, metadata_json, updated_at`,
+    [normalizedUserId, normalizedResourceId, JSON.stringify(payload)]
+  );
+
+  const row = result.rows[0] || null;
+  if (!row) return null;
+  return {
+    id: Number(row.id || 0),
+    metadata: parseConversationResourceMetadata(row.metadata_json),
+    updatedAt: row.updated_at,
+  };
+}
+
+function buildMemorySystemMessage(logicalMemory, structuredMemoryContext, conversationResourceContext) {
+  const parts = [];
+  if (logicalMemory) {
+    parts.push(`Contexte utilisateur (memoire logique):\n${logicalMemory}`);
+  }
+  if (structuredMemoryContext) {
+    parts.push(structuredMemoryContext);
+  }
+  if (conversationResourceContext) {
+    parts.push(conversationResourceContext);
+  }
+
+  if (!parts.length) return null;
+  return {
+    role: 'system',
+    content: parts.join('\n\n'),
+  };
+}
+
 async function getUserFacts(userId, limit = FACT_MEMORY_LIMIT) {
   const normalizedUserId = String(userId || '').trim();
   if (!db || !normalizedUserId) return [];
@@ -1125,68 +1595,29 @@ function isR2Configured() {
 }
 
 let r2ClientSingleton = null;
+const fileStorage = createFileStorage({
+  endpoint: R2_ENDPOINT,
+  accessKeyId: R2_ACCESS_KEY,
+  secretAccessKey: R2_SECRET_KEY,
+  bucket: R2_BUCKET,
+  publicBaseUrl: R2_PUBLIC_BASE_URL,
+});
+
 function getR2Client() {
   if (r2ClientSingleton) return r2ClientSingleton;
-  if (!isR2Configured()) return null;
-
-  r2ClientSingleton = new S3Client({
-    region: 'auto',
-    endpoint: R2_ENDPOINT,
-    credentials: {
-      accessKeyId: R2_ACCESS_KEY,
-      secretAccessKey: R2_SECRET_KEY,
-    },
-  });
+  r2ClientSingleton = fileStorage.getClient();
   return r2ClientSingleton;
 }
 
-function sanitizeFileName(name) {
-  const base = String(name || '').trim() || 'file.bin';
-  const cleaned = base.replaceAll(/[^a-zA-Z0-9._-]/g, '_').replaceAll(/_+/g, '_');
-  return cleaned.slice(0, 180) || 'file.bin';
-}
-
-function normalizePublicAppUrl(rawUrl) {
-  let url = String(rawUrl || '').trim();
-  if (!url) url = 'https://a11.funesterie.pro';
-  // Prevent malformed values such as "/a11.funesterie.pro"
-  url = url.replace(/^\/+/, '');
-  if (!/^https?:\/\//i.test(url)) {
-    url = `https://${url}`;
-  }
-  return url.replace(/\/+$/, '');
-}
-
-function buildStorageKey(userId, filename) {
-  const normalizedUserId = String(userId || 'anonymous').replaceAll(/[^a-zA-Z0-9_-]/g, '_');
-  return `users/${normalizedUserId}/${Date.now()}-${sanitizeFileName(filename)}`;
-}
-
-function getFilePublicUrl(storageKey) {
-  if (R2_PUBLIC_BASE_URL) {
-    return `${R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${storageKey}`;
-  }
-  return `${R2_ENDPOINT.replace(/\/$/, '')}/${R2_BUCKET}/${storageKey}`;
-}
+const sanitizeFileName = fileStorage.sanitizeFileName;
+const normalizePublicAppUrl = fileStorage.normalizePublicAppUrl;
 
 async function uploadBufferToR2({ userId, filename, buffer, contentType }) {
-  const client = getR2Client();
-  if (!client) {
-    throw new Error('R2 is not configured');
-  }
+  return fileStorage.uploadBuffer({ userId, filename, buffer, contentType });
+}
 
-  const storageKey = buildStorageKey(userId, filename);
-  await client.send(new PutObjectCommand({
-    Bucket: R2_BUCKET,
-    Key: storageKey,
-    Body: buffer,
-    ContentType: contentType || 'application/octet-stream',
-  }));
-
-  return {
-    storageKey,
-    url: getFilePublicUrl(storageKey),
-  };
+async function downloadBufferFromR2(storageKey) {
+  return fileStorage.downloadBuffer(storageKey);
 }
 
 async function saveFileRecord({ userId, filename, storageKey, url, contentType, sizeBytes }) {
@@ -1206,8 +1637,12 @@ async function saveFileRecord({ userId, filename, storageKey, url, contentType, 
 // Email providers
 // Priority: Resend API, then SMTP/Gmail fallback
 // ============================================================
-const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
-const resendClient = resendApiKey ? new Resend(resendApiKey) : null;
+const emailService = createEmailService({
+  resendApiKey: process.env.RESEND_API_KEY,
+  fromEmail: process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>',
+  appUrl: normalizePublicAppUrl(process.env.APP_URL || process.env.FRONT_URL || 'https://a11.funesterie.pro'),
+});
+const resendClient = emailService.isConfigured();
 if (resendClient) {
   console.log('[MAIL] ✅ Resend provider activé');
 } else {
@@ -1215,27 +1650,7 @@ if (resendClient) {
 }
 
 async function sendFileEmail({ to, subject, message, fileUrl, attachment }) {
-  const normalizedTo = String(to || '').trim();
-  if (!normalizedTo) return { ok: false, reason: 'missing_to' };
-
-  const subjectLine = String(subject || 'A11 — Fichier généré').trim();
-  const textBody = String(message || 'Voici ton fichier généré.').trim();
-  const linkPart = fileUrl ? `\n\nLien: ${fileUrl}` : '';
-
-  if (!resendClient) {
-    return { ok: false, reason: 'mail_provider_not_configured' };
-  }
-  await resendClient.emails.send({
-    from: process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>',
-    to: normalizedTo,
-    subject: subjectLine,
-    text: `${textBody}${linkPart}`,
-    attachments: attachment ? [{
-      filename: attachment.filename,
-      content: attachment.buffer,
-    }] : undefined,
-  });
-  return { ok: true, provider: 'resend' };
+  return emailService.sendFileEmail({ to, subject, message, fileUrl, attachment });
 }
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
@@ -1452,7 +1867,7 @@ const forgotPasswordHandler = async (req, res) => {
   const { email } = req.body || {};
   const normalizedEmail = String(email || '').trim().toLowerCase();
   if (!normalizedEmail) return res.status(400).json({ error: 'Missing email' });
-  if (!resendClient && !emailTransporter) {
+  if (!emailService.isConfigured()) {
     console.warn('[AUTH] Forgot requested but email transport is not configured');
     return res.json({ ok: true, mailEnabled: false });
   }
@@ -1472,17 +1887,13 @@ const forgotPasswordHandler = async (req, res) => {
       [resetToken, expiresAt, user.id]
     );
 
-    const appUrl = normalizePublicAppUrl(process.env.APP_URL || process.env.FRONT_URL || 'https://a11.funesterie.pro');
+    const appUrl = emailService.getStatus().appUrl || normalizePublicAppUrl(process.env.APP_URL || process.env.FRONT_URL || 'https://a11.funesterie.pro');
     const link = `${appUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
-    const fromEmail = process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>';
-
-    if (!resendClient) throw new Error('Resend non configuré');
-    await resendClient.emails.send({
-      from: fromEmail,
+    const mailResult = await emailService.sendPasswordResetEmail({
       to: user.email,
-      subject: 'A11 — Réinitialisation mot de passe',
-      html: `<p>Clique ici pour réinitialiser ton mot de passe (valide 15 min):</p><p><a href="${link}">${link}</a></p>`
+      link,
     });
+    if (!mailResult?.ok) throw new Error(mailResult?.reason || 'mail_send_failed');
     console.log('[AUTH] ✅ Reset email envoyé à:', user.email);
     res.json({ ok: true, mailEnabled: true });
   } catch (e) {
@@ -1539,25 +1950,52 @@ app.post('/api/auth/reset-password', express.json(), resetPasswordHandler);
 app.get('/api/a11/history', verifyJWT, async (req, res) => {
   try {
     const userId = String(req.user?.id || '').trim();
-    const username = String(req.user?.username || '').trim();
     if (!db || !userId) return res.json([]);
 
     const summary = await db.query(
-      'SELECT COUNT(*)::int AS count, MAX(created_at) AS updated_at FROM messages WHERE user_id=$1',
+      `WITH message_conversations AS (
+         SELECT COALESCE(conversation_id, 'default') AS conversation_id,
+                COUNT(*)::int AS message_count,
+                MAX(created_at) AS updated_at
+         FROM messages
+         WHERE user_id=$1
+         GROUP BY COALESCE(conversation_id, 'default')
+       ),
+       resource_conversations AS (
+         SELECT conversation_id,
+                0::int AS message_count,
+                MAX(updated_at) AS updated_at
+         FROM conversation_resources
+         WHERE user_id=$1
+         GROUP BY conversation_id
+       ),
+       merged AS (
+         SELECT conversation_id,
+                SUM(message_count)::int AS message_count,
+                MAX(updated_at) AS updated_at
+         FROM (
+           SELECT * FROM message_conversations
+           UNION ALL
+           SELECT * FROM resource_conversations
+         ) grouped
+         GROUP BY conversation_id
+       )
+       SELECT conversation_id, message_count, updated_at
+       FROM merged
+       ORDER BY updated_at DESC, conversation_id ASC`,
       [userId]
     );
 
-    const row = summary.rows[0] || {};
-    const count = Number(row.count || 0);
-    if (!count) return res.json([]);
+    const conversations = summary.rows.map((row) => ({
+      id: String(row.conversation_id || 'default'),
+      name: String(row.conversation_id || 'default') === 'default'
+        ? 'Session par defaut'
+        : String(row.conversation_id || 'default'),
+      updated: row.updated_at || new Date().toISOString(),
+      messageCount: Number(row.message_count || 0),
+    }));
 
-    return res.json([
-      {
-        id: `user-${userId}`,
-        name: username ? `Historique de ${username}` : 'Historique du compte',
-        updated: row.updated_at || new Date().toISOString(),
-      }
-    ]);
+    return res.json(conversations);
   } catch (e) {
     console.error('[A11][History] List error:', e?.message);
     return res.status(500).json({ error: 'history_list_failed' });
@@ -1571,18 +2009,28 @@ app.get('/api/a11/history/:id', verifyJWT, async (req, res) => {
       return res.json({ id: req.params.id, messages: [] });
     }
 
-    const expectedId = `user-${userId}`;
-    if (req.params.id !== expectedId) {
-      return res.status(404).json({ error: 'history_not_found' });
+    const requestedId = String(req.params.id || '').trim();
+    const legacyHistoryId = `user-${userId}`;
+    const requestedConversationId = requestedId === legacyHistoryId
+      ? ''
+      : normalizeConversationId(requestedId);
+
+    let result;
+    if (requestedConversationId) {
+      result = await db.query(
+        'SELECT id, role, content, created_at FROM messages WHERE user_id=$1 AND COALESCE(conversation_id, $2)=$2 ORDER BY created_at ASC, id ASC LIMIT 200',
+        [userId, requestedConversationId]
+      );
+    } else {
+      result = await db.query(
+        'SELECT id, role, content, created_at FROM messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC LIMIT 200',
+        [userId]
+      );
     }
 
-    const result = await db.query(
-      'SELECT id, role, content, created_at FROM messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC LIMIT 200',
-      [userId]
-    );
-
     return res.json({
-      id: expectedId,
+      id: requestedConversationId || legacyHistoryId,
+      conversationId: requestedConversationId || null,
       messages: result.rows.map((row) => ({
         id: `msg-${row.id}`,
         role: String(row.role || 'assistant'),
@@ -1596,10 +2044,88 @@ app.get('/api/a11/history/:id', verifyJWT, async (req, res) => {
   }
 });
 
+app.get('/api/a11/history/:id/resources', verifyJWT, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const requestedId = String(req.params.id || '').trim();
+    const legacyHistoryId = `user-${userId}`;
+    const queryConversationId = String(req.query.conversationId || '').trim();
+    const requestedConversationId = requestedId && requestedId !== legacyHistoryId
+      ? normalizeConversationId(requestedId)
+      : (queryConversationId ? normalizeConversationId(queryConversationId) : '');
+    const requestedKind = String(req.query.kind || '').trim();
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+    const resources = await listConversationResources(userId, {
+      conversationId: requestedConversationId,
+      resourceKind: requestedKind,
+      limit,
+    });
+
+    return res.json({
+      ok: true,
+      id: requestedId || legacyHistoryId,
+      conversationId: requestedConversationId || null,
+      resources,
+      count: resources.length,
+    });
+  } catch (e) {
+    console.error('[A11][History] Resource list error:', e?.message);
+    return res.status(500).json({ ok: false, error: 'history_resource_list_failed' });
+  }
+});
+
+app.get('/api/a11/history/:id/activity', verifyJWT, async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+
+    const requestedId = String(req.params.id || '').trim();
+    const legacyHistoryId = `user-${userId}`;
+    const queryConversationId = String(req.query.conversationId || '').trim();
+    const requestedConversationId = requestedId && requestedId !== legacyHistoryId
+      ? normalizeConversationId(requestedId)
+      : (queryConversationId ? normalizeConversationId(queryConversationId) : '');
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 12)));
+
+    if (!requestedConversationId) {
+      return res.json({
+        ok: true,
+        id: requestedId || legacyHistoryId,
+        conversationId: null,
+        entries: [],
+        count: 0,
+      });
+    }
+
+    const rawEntries = readConversationLogEntries({
+      userId,
+      conversationId: requestedConversationId,
+      limit,
+    });
+    const entries = rawEntries.map((entry, index) => buildConversationActivityEntry(entry, index));
+
+    return res.json({
+      ok: true,
+      id: requestedId || legacyHistoryId,
+      conversationId: requestedConversationId,
+      entries,
+      count: entries.length,
+    });
+  } catch (e) {
+    console.error('[A11][History] Activity list error:', e?.message);
+    return res.status(500).json({ ok: false, error: 'history_activity_list_failed' });
+  }
+});
+
 // ✅ AUTH MIDDLEWARE - appliqué SEULEMENT sur /api/ai pour protéger chat
 // /api/auth/login reste public!
 app.use('/api/ai', verifyJWT);
 app.use('/api/files', verifyJWT);
+app.use('/api/artifacts', verifyJWT);
+app.use('/api/resources', verifyJWT);
 
 app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) => {
   try {
@@ -1614,52 +2140,33 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       filename,
       contentBase64,
       contentType,
+      conversationId,
+      convId,
+      sessionId,
       emailTo,
       emailSubject,
       emailMessage,
       attachToEmail,
     } = req.body || {};
-
-    const safeFilename = sanitizeFileName(filename || 'generated-file.bin');
-    const normalizedContentType = String(contentType || 'application/octet-stream').trim();
-    const rawBase64 = String(contentBase64 || '').trim();
-    const cleanBase64 = rawBase64.includes(',') ? rawBase64.split(',').pop() : rawBase64;
-    if (!cleanBase64) {
-      return res.status(400).json({ ok: false, error: 'missing_content_base64' });
-    }
-
-    const buffer = Buffer.from(cleanBase64, 'base64');
-    if (!buffer.length) {
-      return res.status(400).json({ ok: false, error: 'invalid_base64_content' });
-    }
-    if (buffer.length > FILE_UPLOAD_MAX_BYTES) {
-      return res.status(413).json({ ok: false, error: 'file_too_large', maxBytes: FILE_UPLOAD_MAX_BYTES });
-    }
-
-    const uploaded = await uploadBufferToR2({
+    const normalizedConversationId = normalizeConversationId(conversationId || convId || sessionId);
+    const ingestion = await ingestUploadedFile({
       userId,
-      filename: safeFilename,
-      buffer,
-      contentType: normalizedContentType,
-    });
-
-    const record = await saveFileRecord({
-      userId,
-      filename: safeFilename,
-      storageKey: uploaded.storageKey,
-      url: uploaded.url,
-      contentType: normalizedContentType,
-      sizeBytes: buffer.length,
-    });
-
-    await saveUserFileMemory({
-      userId,
-      filename: safeFilename,
-      storageKey: uploaded.storageKey,
-      url: uploaded.url,
-      contentType: normalizedContentType,
-      sizeBytes: buffer.length,
+      filename,
+      contentType,
+      contentBase64,
+      maxBytes: FILE_UPLOAD_MAX_BYTES,
       origin: 'upload',
+      conversationId: normalizedConversationId,
+      resourceKind: 'file',
+      resourceMetadata: {
+        source: 'api.files.upload',
+      },
+      linkConversationResource,
+      analyzeResourceContent: analyzeUploadedResource,
+      uploadBufferToR2,
+      saveFileRecord,
+      saveUserFileMemory,
+      sanitizeFileName,
     });
 
     let mail = null;
@@ -1668,26 +2175,231 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
         to: emailTo,
         subject: emailSubject || 'A11 — fichier généré',
         message: emailMessage || 'Ton fichier est prêt.',
-        fileUrl: uploaded.url,
-        attachment: attachToEmail ? { filename: safeFilename, buffer } : null,
+        fileUrl: ingestion.file.url,
+        attachment: attachToEmail ? { filename: ingestion.file.filename, buffer: ingestion.buffer } : null,
       });
     }
 
+    appendConversationLog({
+      type: 'file_uploaded',
+      userId,
+      conversationId: normalizedConversationId,
+      file: {
+        filename: ingestion.file.filename,
+        storageKey: ingestion.file.storageKey,
+        url: ingestion.file.url,
+        contentType: ingestion.file.contentType,
+        sizeBytes: ingestion.file.sizeBytes,
+      },
+      analysis: ingestion.analysis || ingestion.conversationResource?.metadata?.analysis || null,
+      mail,
+    });
+
     return res.json({
       ok: true,
-      file: {
-        filename: safeFilename,
-        storageKey: uploaded.storageKey,
-        url: uploaded.url,
-        contentType: normalizedContentType,
-        sizeBytes: buffer.length,
-      },
-      record,
+      conversationId: normalizedConversationId,
+      file: ingestion.file,
+      record: ingestion.record,
+      conversationResource: ingestion.conversationResource || null,
       mail,
     });
   } catch (e) {
+    if (e?.code === 'missing_content_base64' || e?.code === 'invalid_base64_content') {
+      return res.status(400).json({ ok: false, error: e.code });
+    }
+    if (e?.code === 'file_too_large') {
+      return res.status(413).json({ ok: false, error: e.code, maxBytes: e.maxBytes || FILE_UPLOAD_MAX_BYTES });
+    }
     console.error('[FILES] upload failed:', e?.message);
     return res.status(500).json({ ok: false, error: 'upload_failed', message: String(e?.message) });
+  }
+});
+
+app.get('/api/resources/my', async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const requestedConversationId = String(req.query.conversationId || '').trim();
+    const requestedKind = String(req.query.kind || '').trim();
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+    const resources = await listConversationResources(userId, {
+      conversationId: requestedConversationId,
+      resourceKind: requestedKind,
+      limit,
+    });
+
+    return res.json({
+      ok: true,
+      conversationId: requestedConversationId ? normalizeConversationId(requestedConversationId) : null,
+      resources,
+      count: resources.length,
+    });
+  } catch (e) {
+    console.error('[RESOURCES] list failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'resource_list_failed', message: String(e?.message) });
+  }
+});
+
+app.get('/api/resources/:id/download', async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const resourceId = Number(req.params?.id || 0);
+    if (!Number.isFinite(resourceId) || resourceId <= 0) {
+      return res.status(400).json({ ok: false, error: 'invalid_resource_id' });
+    }
+
+    const resource = await getConversationResourceById(userId, resourceId);
+    if (!resource) {
+      return res.status(404).json({ ok: false, error: 'resource_not_found' });
+    }
+    if (!resource.storageKey || !isR2Configured()) {
+      return res.status(409).json({ ok: false, error: 'resource_download_not_available' });
+    }
+
+    const downloaded = await downloadBufferFromR2(resource.storageKey);
+    const downloadName = sanitizeFileName(resource.filename || `resource-${resourceId}.bin`);
+    const encodedDownloadName = encodeURIComponent(downloadName);
+
+    res.setHeader('Content-Type', downloaded.contentType || resource.contentType || 'application/octet-stream');
+    if (downloaded.contentLength || resource.sizeBytes) {
+      res.setHeader('Content-Length', String(downloaded.contentLength || resource.sizeBytes || 0));
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"; filename*=UTF-8''${encodedDownloadName}`);
+    res.setHeader('Cache-Control', 'private, no-store');
+
+    appendConversationLog({
+      type: 'resource_downloaded',
+      userId,
+      conversationId: resource.conversationId || 'default',
+      resource: {
+        id: resource.id,
+        filename: resource.filename,
+        resourceKind: resource.resourceKind,
+        storageKey: resource.storageKey,
+        contentType: resource.contentType,
+        sizeBytes: resource.sizeBytes,
+      },
+    });
+
+    return res.status(200).send(downloaded.buffer);
+  } catch (e) {
+    console.error('[RESOURCES] download failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'resource_download_failed', message: String(e?.message) });
+  }
+});
+
+app.post('/api/resources/email', express.json({ limit: '1mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    if (!emailService.isConfigured()) {
+      return res.status(503).json({ ok: false, error: 'mail_provider_not_configured' });
+    }
+
+    const resourceId = Number(req.body?.resourceId || 0);
+    const to = String(req.body?.to || '').trim();
+    const attachToEmail = req.body?.attachToEmail === true || req.body?.attachToEmail === 'true';
+    const requestedSubject = String(req.body?.subject || '').trim();
+    const requestedMessage = String(req.body?.message || '').trim();
+
+    if (!Number.isFinite(resourceId) || resourceId <= 0) {
+      return res.status(400).json({ ok: false, error: 'invalid_resource_id' });
+    }
+    if (!to) {
+      return res.status(400).json({ ok: false, error: 'missing_to' });
+    }
+
+    const resource = await getConversationResourceById(userId, resourceId);
+    if (!resource) {
+      return res.status(404).json({ ok: false, error: 'resource_not_found' });
+    }
+
+    let attachment = null;
+    let attachmentIncluded = false;
+    let attachmentFallbackReason = null;
+    if (attachToEmail && resource.storageKey && isR2Configured()) {
+      try {
+        const downloaded = await downloadBufferFromR2(resource.storageKey);
+        attachment = {
+          filename: resource.filename,
+          buffer: downloaded.buffer,
+        };
+        attachmentIncluded = true;
+      } catch (error_) {
+        attachmentFallbackReason = String(error_?.message || 'attachment_download_failed');
+        console.warn('[RESOURCES] attachment download failed, sending link only:', attachmentFallbackReason);
+      }
+    } else if (attachToEmail) {
+      attachmentFallbackReason = 'attachment_not_available';
+    }
+
+    const subject = requestedSubject || `A11 — ${resource.resourceKind === 'artifact' ? 'artefact' : 'fichier'} ${resource.filename}`;
+    const messageLines = [];
+    if (requestedMessage) messageLines.push(requestedMessage);
+    else messageLines.push('A11 t’envoie une ressource depuis ta conversation.');
+    if (resource.conversationId) messageLines.push(`Conversation: ${resource.conversationId}`);
+    if (resource.metadata?.description) messageLines.push(`Description: ${String(resource.metadata.description)}`);
+    if (attachmentFallbackReason && !attachmentIncluded) {
+      messageLines.push('Note: la piece jointe n’a pas pu etre ajoutee, le lien reste disponible.');
+    }
+
+    const mail = await sendFileEmail({
+      to,
+      subject,
+      message: messageLines.join('\n\n'),
+      fileUrl: resource.url || null,
+      attachment,
+    });
+
+    await markConversationResourceEmailed(userId, resourceId, {
+      to,
+      subject,
+      attached: attachmentIncluded,
+      mailId: mail?.id || null,
+      ok: mail?.ok !== false,
+    });
+
+    appendConversationLog({
+      type: 'resource_emailed',
+      userId,
+      conversationId: resource.conversationId || 'default',
+      resource: {
+        id: resource.id,
+        filename: resource.filename,
+        resourceKind: resource.resourceKind,
+        storageKey: resource.storageKey,
+        url: resource.url,
+      },
+      mail: {
+        ...mail,
+        to,
+        subject,
+        attachmentIncluded,
+        attachmentFallbackReason,
+      },
+    });
+
+    return res.json({
+      ok: true,
+      resourceId,
+      resource,
+      mail: {
+        ...mail,
+        to,
+        subject,
+        attachmentIncluded,
+        attachmentFallbackReason,
+      },
+    });
+  } catch (e) {
+    console.error('[RESOURCES] email failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'resource_email_failed', message: String(e?.message) });
   }
 });
 
@@ -1938,6 +2650,133 @@ try {
 
 // Ajout des routes /healthz et /
 app.get('/healthz', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/api/status', (_req, res) => {
+  try {
+    return res.json(getPublicRuntimeStatus({
+      config: buildRuntimeConfig(process.env),
+      hasDb: Boolean(db),
+      isR2Configured: isR2Configured(),
+      hasResend: emailService.isConfigured(),
+      hasQflush: Boolean(QFLUSH_AVAILABLE),
+    }));
+  } catch (error_) {
+    return res.status(500).json({
+      ok: false,
+      service: 'a11-api',
+      error: String(error_?.message || error_),
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+app.post('/api/artifacts/create', express.json({ limit: '20mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+
+    if (!isR2Configured()) {
+      return res.status(503).json({ ok: false, error: 'r2_not_configured' });
+    }
+
+    const {
+      filename,
+      contentBase64,
+      contentType,
+      kind,
+      conversationId,
+      description,
+      emailTo,
+      emailSubject,
+      emailMessage,
+      attachToEmail,
+    } = req.body || {};
+
+    const result = await createArtifact({
+      userId,
+      filename,
+      contentBase64,
+      contentType,
+      kind,
+      conversationId,
+      description,
+      maxBytes: FILE_UPLOAD_MAX_BYTES,
+      emailTo,
+      emailSubject,
+      emailMessage,
+      attachToEmail,
+      sanitizeFileName,
+      ingestUploadedFile: (payload) => ingestUploadedFile({
+        ...payload,
+        linkConversationResource,
+        analyzeResourceContent: analyzeUploadedResource,
+        uploadBufferToR2,
+        saveFileRecord,
+        saveUserFileMemory,
+        sanitizeFileName,
+      }),
+      sendFileEmail,
+      appendConversationLog,
+      normalizeConversationId,
+    });
+
+    return res.json({
+      ok: true,
+      artifact: result.artifact,
+      record: result.record,
+      mail: result.mail,
+      conversationResource: result.conversationResource || null,
+    });
+  } catch (e) {
+    if (e?.code === 'missing_content_base64' || e?.code === 'invalid_base64_content') {
+      return res.status(400).json({ ok: false, error: e.code });
+    }
+    if (e?.code === 'file_too_large') {
+      return res.status(413).json({ ok: false, error: e.code, maxBytes: e.maxBytes || FILE_UPLOAD_MAX_BYTES });
+    }
+    console.error('[ARTIFACTS] create failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'artifact_create_failed', message: String(e?.message) });
+  }
+});
+
+app.get('/api/artifacts/my', async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const requestedKind = String(req.query.kind || '').trim();
+    const normalizedKind = requestedKind ? normalizeArtifactKind(requestedKind) : '';
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+    const originPrefix = normalizedKind ? buildArtifactOrigin(normalizedKind) : 'artifact:%';
+
+    const result = await db.query(
+      `SELECT filename, storage_key, url, content_type, size_bytes, origin, created_at, updated_at
+       FROM user_files
+       WHERE user_id=$1
+         AND origin LIKE $2
+       ORDER BY updated_at DESC, created_at DESC, id DESC
+       LIMIT $3`,
+      [userId, originPrefix, limit]
+    );
+
+    const artifacts = result.rows.map((row) => ({
+      kind: String(row.origin || '').startsWith('artifact:') ? String(row.origin).slice('artifact:'.length) : 'generated',
+      filename: row.filename,
+      storageKey: row.storage_key,
+      url: row.url,
+      contentType: row.content_type,
+      sizeBytes: Number(row.size_bytes || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      origin: row.origin,
+    }));
+
+    return res.json({ ok: true, artifacts, count: artifacts.length });
+  } catch (e) {
+    console.error('[ARTIFACTS] list failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'artifact_list_failed', message: String(e?.message) });
+  }
+});
 app.get('/', (_req, res) => res.status(200).json({ ok: true, service: 'a11-api' }));
 
 function getOpenAICompletionsUrl() {
@@ -2255,13 +3094,14 @@ function buildOpenAIProxyHeaders(reqHeaders, options = {}) {
   return headers;
 }
 
-function appendChatTurnLogSafe(body, responsePayload, defaultModel) {
+function appendChatTurnLogSafe(body, responsePayload, defaultModel, userId = null) {
   try {
     const reqBody = body || {};
     const convId = reqBody.conversationId || reqBody.convId || reqBody.sessionId || 'default';
     const messages = Array.isArray(reqBody.messages) ? reqBody.messages : [];
     appendConversationLog({
       type: 'chat_turn',
+      userId: String(userId || reqBody._user || '').trim() || null,
       conversationId: convId,
       request: {
         model: reqBody.model || defaultModel,
@@ -2286,6 +3126,8 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
       structuredFacts: [],
       structuredTasks: [],
       structuredFiles: [],
+      conversationResources: [],
+      conversationResourceContext: '',
       structuredMemoryContext: '',
     };
   }
@@ -2295,7 +3137,7 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
     await saveStructuredMemoryFromMessage(normalizedUserId, normalizedLatestMessage);
   }
 
-  const storedMessages = await getRecentChatMemory(normalizedUserId, CHAT_MEMORY_LIMIT, normalizedConversationId);
+  const storedMessages = await getRecentChatMemory(normalizedUserId, normalizedConversationId, CHAT_MEMORY_LIMIT);
   let logicalMemory = await getLogicalUserMemory(normalizedUserId);
   const messageCount = await countUserMessages(normalizedUserId);
 
@@ -2316,10 +3158,14 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
     });
   }
 
-  const [structuredFacts, structuredTasks, structuredFiles] = await Promise.all([
+  const [structuredFacts, structuredTasks, structuredFiles, conversationResources] = await Promise.all([
     getUserFacts(normalizedUserId, FACT_MEMORY_LIMIT),
     getUserTasks(normalizedUserId, TASK_MEMORY_LIMIT),
     getUserFilesMemory(normalizedUserId, FILE_MEMORY_LIMIT),
+    listConversationResources(normalizedUserId, {
+      conversationId: normalizedConversationId,
+      limit: 4,
+    }),
   ]);
 
   markFactsAsUsed(normalizedUserId, structuredFacts).catch((error_) => {
@@ -2332,6 +3178,8 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
     structuredFacts,
     structuredTasks,
     structuredFiles,
+    conversationResources,
+    conversationResourceContext: buildConversationResourceContext(conversationResources, { maxResources: 4 }),
     structuredMemoryContext: buildStructuredMemoryContext({
       facts: structuredFacts,
       tasks: structuredTasks,
@@ -2340,10 +3188,12 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
   };
 }
 
-function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, systemPrompt) {
+function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
   const messages = [];
   const normalizedSystemPrompt = String(systemPrompt || '').trim();
-  const systemMemoryParts = [];
+  const sanitizedBaseMessages = sanitizePromptMessages(baseMessages);
+  const explicitSystemMessages = sanitizedBaseMessages.filter((message) => message.role === 'system');
+  const nonSystemMessages = sanitizedBaseMessages.filter((message) => message.role !== 'system');
 
   if (normalizedSystemPrompt) {
     messages.push({
@@ -2352,24 +3202,28 @@ function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structured
     });
   }
 
-  if (logicalMemory) {
-    systemMemoryParts.push(`Contexte utilisateur (memoire logique):\n${logicalMemory}`);
-  }
-  if (structuredMemoryContext) {
-    systemMemoryParts.push(structuredMemoryContext);
+  messages.push(...explicitSystemMessages);
+
+  const memorySystemMessage = buildMemorySystemMessage(
+    logicalMemory,
+    structuredMemoryContext,
+    conversationResourceContext
+  );
+  if (memorySystemMessage) {
+    messages.push(memorySystemMessage);
   }
 
-  if (systemMemoryParts.length) {
-    messages.push({
-      role: 'system',
-      content: systemMemoryParts.join('\n\n')
-    });
-  }
+  return [...messages, ...nonSystemMessages];
+}
 
-  return [
-    ...messages,
-    ...(Array.isArray(storedMessages) ? storedMessages : [])
-  ];
+function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
+  return buildChatMessagesWithMemory(
+    Array.isArray(storedMessages) ? storedMessages : [],
+    logicalMemory,
+    structuredMemoryContext,
+    conversationResourceContext,
+    systemPrompt
+  );
 }
 
 async function proxyQflushChat(req, res) {
@@ -2395,6 +3249,8 @@ async function proxyQflushChat(req, res) {
       structuredFacts,
       structuredTasks,
       structuredFiles,
+      conversationResources,
+      conversationResourceContext,
       structuredMemoryContext,
     } = memoryContext;
 
@@ -2403,6 +3259,7 @@ async function proxyQflushChat(req, res) {
       storedMessages,
       logicalMemory,
       structuredMemoryContext,
+      conversationResourceContext,
       body.systemPrompt
     );
 
@@ -2452,12 +3309,13 @@ async function proxyQflushChat(req, res) {
         factsCount: structuredFacts.length,
         tasksCount: structuredTasks.length,
         filesCount: structuredFiles.length,
+        conversationResourcesCount: conversationResources.length,
         historyLimit: CHAT_MEMORY_LIMIT,
       },
       qflush: qflushResult,
     };
 
-    appendChatTurnLogSafe(body, data, 'qflush');
+    appendChatTurnLogSafe(body, data, 'qflush', userId);
     return res.status(200).json(data);
   } catch (err) {
     console.error('[A11] Error proxying chat via QFLUSH:', err && (err.message || err.toString()));
@@ -2465,9 +3323,9 @@ async function proxyQflushChat(req, res) {
   }
 }
 
-async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl) {
+async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, bodyOverride = null) {
   try {
-    const body = req.body || {};
+    const body = bodyOverride || req.body || {};
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const prompt = typeof body.prompt === 'string' && body.prompt.trim()
       ? body.prompt
@@ -2507,7 +3365,13 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl) {
       ],
     };
 
-    appendChatTurnLogSafe(body, data, 'local-gguf');
+    const userId = String(req.user?.id || body._user || '').trim();
+    const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
+    if (userId && content) {
+      await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
+    }
+
+    appendChatTurnLogSafe(body, data, 'local-gguf', userId);
     return res.status(200).json(data);
   } catch (err) {
     console.error('[A11] Error proxying local llama.cpp completion ->', localLlamaCompletionUrl, err && (err.message || err.toString()));
@@ -2521,17 +3385,19 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl) {
 async function proxyChatToOpenAI(req, res) {
   const provider = String(req.body?.provider || '').trim().toLowerCase();
   const latestUserMessage = getLatestUserMessage(req.body || {});
+  const userId = String(req.user?.id || req.body?._user || '').trim();
+  const conversationId = normalizeConversationId(req.body?.conversationId || req.body?.convId || req.body?.sessionId);
 
   if (isSiwisStatusQuestion(latestUserMessage)) {
     try {
       const snapshot = await getSiwisHealthSnapshot();
       const reply = formatSiwisStatusReply(snapshot);
       const data = toSimpleAssistantCompletion(reply, 'a11-runtime-tts-health');
-      appendChatTurnLogSafe(req.body, data, 'a11-runtime-tts-health');
+      appendChatTurnLogSafe(req.body, data, 'a11-runtime-tts-health', userId);
       return res.status(200).json(data);
     } catch {
       const fallback = toSimpleAssistantCompletion('Je ne peux pas verifier SIWIS pour le moment (health timeout).');
-      appendChatTurnLogSafe(req.body, fallback, 'a11-runtime-tts-health');
+      appendChatTurnLogSafe(req.body, fallback, 'a11-runtime-tts-health', userId);
       return res.status(200).json(fallback);
     }
   }
@@ -2540,11 +3406,31 @@ async function proxyChatToOpenAI(req, res) {
     return proxyQflushChat(req, res);
   }
 
+  let upstreamBody = req.body ? { ...req.body } : {};
+
+  if (userId) {
+    const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);
+    const requestMessages = Array.isArray(req.body?.messages)
+      ? req.body.messages
+      : (String(req.body?.prompt || '').trim() ? [{ role: 'user', content: String(req.body.prompt).trim() }] : []);
+    upstreamBody.messages = buildChatMessagesWithMemory(
+      requestMessages,
+      memoryContext.logicalMemory,
+      memoryContext.structuredMemoryContext,
+      memoryContext.conversationResourceContext,
+      req.body?.systemPrompt
+    );
+
+    if ((!upstreamBody.prompt || !String(upstreamBody.prompt).trim()) && upstreamBody.messages.length) {
+      upstreamBody.prompt = buildPromptFromMessages(upstreamBody.messages);
+    }
+  }
+
   const localLlamaCompletionUrl = provider === 'local' ? getLocalLlamaCompletionUrl() : null;
 
   if (localLlamaCompletionUrl) {
     console.log('[A11] USING LOCAL_LLM_URL ->', localLlamaCompletionUrl);
-    return proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl);
+    return proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, upstreamBody);
   }
 
   const upstreamUrl = getCompletionsUrlForRequest(req.body);
@@ -2562,13 +3448,17 @@ async function proxyChatToOpenAI(req, res) {
       method: 'post',
       url: upstreamUrl,
       headers: buildOpenAIProxyHeaders(req.headers, { provider }),
-      data: req.body && Object.keys(req.body).length ? req.body : undefined,
+      data: upstreamBody && Object.keys(upstreamBody).length ? upstreamBody : undefined,
       timeout: 60000,
     });
 
     const data = upstreamRes.data;
+    const content = extractAssistantText(data);
+    if (userId && content) {
+      await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
+    }
 
-    appendChatTurnLogSafe(req.body, data, 'gpt-4o-mini');
+    appendChatTurnLogSafe(req.body, data, 'gpt-4o-mini', userId);
 
     return res.status(upstreamRes.status).json(data);
   } catch (err) {
@@ -2874,6 +3764,7 @@ app.post('/api/agent', express.json(), async (req, res) => {
     try {
       appendConversationLog({
         type: 'agent_actions',
+        userId: String(req.user?.id || envelope?.userId || envelope?.user?.id || '').trim() || null,
         conversationId: envelope.conversationId || 'dev-agent',
         envelope,
         explanation,
