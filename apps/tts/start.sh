@@ -3,15 +3,14 @@ set -e
 
 # Download Piper if not present
 if [ ! -f "/usr/local/bin/piper" ]; then
-  echo "Downloading Piper..."
-  wget https://github.com/rhasspy/piper/releases/download/v1.2.0/piper_linux_x86_64.tar.gz
-  tar -xvf piper_linux_x86_64.tar.gz
-  chmod +x piper
-  mv piper /usr/local/bin/piper
-  rm piper_linux_x86_64.tar.gz
+	echo "Downloading Piper..."
+	wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+	tar -xvf piper_linux_x86_64.tar.gz
+	chmod +x piper
+	mv piper /usr/local/bin/piper
+	rm piper_linux_x86_64.tar.gz
 fi
 
-# Start your server
 python serve.py
 	python3 /app/apps/tts/serve.py &
 	PIPER_PID=$!
