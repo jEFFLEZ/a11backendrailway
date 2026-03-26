@@ -1,8 +1,8 @@
 param(
-  [string]$Root = 'D:\qflush',
-  [string]$OutText = 'D:\qflush-code-dump.txt',
-  [string]$OutRaw = 'D:\qflush-code-dump.raw',
-  [string]$OutPng = 'D:\qflush-code-dump.png',
+  [string]$Root = 'D:\funesterie\a11\a11qflushrailway',
+  [string]$OutText = 'D:\funesterie\a11\qflush-code-dump.txt',
+  [string]$OutRaw = 'D:\funesterie\a11\qflush-code-dump.raw',
+  [string]$OutPng = 'D:\funesterie\a11\qflush-code-dump.png',
   [int]$ImageWidth = 1024,
   [int]$MaxFileSizeMB = 0  # 0 = no size limit (was 5)
 )

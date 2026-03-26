@@ -21,7 +21,7 @@ npm install @funeste38/qflush
 ### Lancer tous les services avec supervision
 ```bash
 # Démarre le backend qui lance automatiquement les autres services
-cd D:\A11\apps\server
+cd D:\funesterie\a11\a11backendrailway\apps\server
 node server.cjs
 ```
 
@@ -231,7 +231,7 @@ A11 Backend (server.cjs)
 
 Les logs de chaque service sont dans:
 ```
-D:\A11\apps\logs\supervisor\
+D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\
 ├── cerbere.log
 ├── llama-server.log
 ├── tts-service.log
@@ -241,13 +241,13 @@ D:\A11\apps\logs\supervisor\
 ### Voir les logs en temps réel
 ```powershell
 # Cerbère
-Get-Content D:\A11\apps\logs\supervisor\cerbere.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\cerbere.log -Wait
 
 # LLaMA
-Get-Content D:\A11\apps\logs\supervisor\llama-server.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\llama-server.log -Wait
 
 # TTS
-Get-Content D:\A11\apps\logs\supervisor\tts-service.log -Wait
+Get-Content D:\funesterie\a11\a11backendrailway\apps\logs\supervisor\tts-service.log -Wait
 ```
 
 ## 🎯 Cas d'usage
@@ -306,14 +306,14 @@ MANAGE_TTS=true
 
 Vérifiez que le fichier existe:
 ```bash
-Test-Path D:\A11\apps\server\llm-router.mjs
+Test-Path D:\funesterie\a11\a11backendrailway\apps\server\llm-router.mjs
 ```
 
 ### TTS ne démarre pas
 
 Vérifiez que Python et le script existent:
 ```bash
-Test-Path D:\A11\tts\serve.py
+Test-Path D:\funesterie\a11\a11backendrailway\apps\tts\serve.py
 python --version
 ```
 
