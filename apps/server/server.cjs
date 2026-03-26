@@ -1,6 +1,8 @@
+// --- Endpoint API TTS universel --- (déplacé après la création de app)
+const app = express();
+
 // --- Endpoint de healthcheck Railway ---
 app.get('/health', (req, res) => res.json({ ok: true }));
-// --- Endpoint API TTS universel --- (déplacé après la création de app)
 // --- .env first ---
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
