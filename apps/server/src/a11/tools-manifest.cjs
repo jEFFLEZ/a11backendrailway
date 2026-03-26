@@ -2,16 +2,21 @@
 
 const path = require("node:path");
 
-const WORKSPACE_ROOTS = [
+const configuredWorkspaceRoot = String(process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || '').trim();
+const defaultWorkspaceRoot = configuredWorkspaceRoot
+  ? path.resolve(configuredWorkspaceRoot)
+  : path.resolve(process.cwd());
+
+const WORKSPACE_ROOTS = Array.from(new Set([
+  defaultWorkspaceRoot,
   "D:\\A11",
-  "D:\\A12"
-];
+  "D:\\A12",
+]));
 
 const DEFAULT_WORKSPACE_ROOT = WORKSPACE_ROOTS[0];
 
 const SAFE_DATA_ROOT = path.resolve(
-  WORKSPACE_ROOTS[1] || WORKSPACE_ROOTS[0],
-  "."
+  process.env.A11_SAFE_DATA_ROOT || path.join(DEFAULT_WORKSPACE_ROOT, "a11_runtime")
 );
 
 const TOOL_MANIFEST = {
@@ -129,6 +134,51 @@ const TOOL_MANIFEST = {
     description: "Ouvrir un fichier dans Visual Studio (si A11Host connecté).",
     dangerLevel: "medium",
     args: { path: "chemin absolu" }
+  },
+  vs_workspace_root: {
+    description: "Retourne le workspace root vu par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_compilation_errors: {
+    description: "Retourne les erreurs de compilation remontées par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_project_structure: {
+    description: "Retourne la structure projet/solution remontée par A11Host/Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_solution_info: {
+    description: "Retourne les informations de solution ouvertes dans Visual Studio.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_active_document: {
+    description: "Retourne le document actif dans Visual Studio si disponible.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_current_selection: {
+    description: "Retourne la sélection courante dans Visual Studio si disponible.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_goto_line: {
+    description: "Ouvrir un fichier et aller à une ligne précise dans Visual Studio si disponible.",
+    dangerLevel: "medium",
+    args: { path: "chemin absolu", line: "number (ligne 1-based)" }
+  },
+  vs_open_documents: {
+    description: "Liste les documents actuellement ouverts dans Visual Studio/A11Host.",
+    dangerLevel: "low",
+    args: {}
+  },
+  vs_execute_shell: {
+    description: "Exécute une commande shell via A11Host avec la même whitelist safe que l'outil shell local.",
+    dangerLevel: "high",
+    args: { command: "string (doit correspondre à une commande autorisée)" }
   },
   vs_build_solution: {
     description: "Lancer un build solution dans Visual Studio.",

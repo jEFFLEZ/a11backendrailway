@@ -5,10 +5,12 @@ const axios = require('axios');
 const PDFDocument = require('pdfkit');
 const fsSync = require('node:fs');
 const { exec } = require('node:child_process');
+const { isShellAllowed } = require('../../lib/safe-shell.cjs');
 
 // ⚠️ IMPORTANT : importer le manifest AVANT d'utiliser WORKSPACE_ROOTS
 const { TOOL_MANIFEST, WORKSPACE_ROOTS, SAFE_DATA_ROOT } = require('./tools-manifest.cjs');
 const { runQflushFlow } = require('../qflush-integration.cjs');
+const { callA11Host, getA11HostStatus } = require('../../a11host.cjs');
 
 function resolveSafePath(p, label) {
   const raw = String(p || "").trim();
@@ -26,14 +28,38 @@ function resolveSafePath(p, label) {
 // Base mémoire JSON pour A-11
 // ─────────────────────────────
 
-// Workspace de base pour la mémoire (priorité au deuxième, sinon au premier, sinon D:\A12)
+// Workspace de base pour la mémoire.
 const DEFAULT_WORKSPACE_ROOT =
-  (Array.isArray(WORKSPACE_ROOTS) && (WORKSPACE_ROOTS[1] || WORKSPACE_ROOTS[0])) ||
-  'D:\\A12';
+  (Array.isArray(WORKSPACE_ROOTS) && WORKSPACE_ROOTS[0]) ||
+  process.cwd();
 
 // ⚠️ Renommé → A11_MEMORY_ROOT pour éviter tout conflit avec d'autres modules
 const A11_MEMORY_ROOT = path.resolve(DEFAULT_WORKSPACE_ROOT, 'a11_memory');
 const A11_MEMO_DIR = path.join(A11_MEMORY_ROOT, 'memos');
+
+function slugifyAssetSegment(value, fallback = 'asset') {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || fallback;
+}
+
+function buildGeneratedAssetPath(filename, label = 'generated.outputPath') {
+  return resolveSafePath(path.join('generated', filename), label);
+}
+
+function parseImageSize(value, fallbackWidth = 1024, fallbackHeight = 1024) {
+  const raw = String(value || '').trim().toLowerCase();
+  const match = /^(\d{2,4})\s*[xX]\s*(\d{2,4})$/.exec(raw);
+  if (!match) {
+    return { width: fallbackWidth, height: fallbackHeight };
+  }
+  const width = Math.max(64, Math.min(2048, Number(match[1]) || fallbackWidth));
+  const height = Math.max(64, Math.min(2048, Number(match[2]) || fallbackHeight));
+  return { width, height };
+}
 
 function ensureMemoDir() {
   try {
@@ -273,20 +299,6 @@ function ensureToolAvailable(name) {
     throw new Error(`Unknown tool: ${name}`);
   }
   return spec;
-}
-
-const SHELL_WHITELIST = [
-  /^git status\b/i,
-  /^git diff\b/i,
-  /^npm test\b/i,
-  /^npm run build\b/i,
-  /^dotnet --info\b/i,
-  /^dotnet build\b/i
-];
-
-function isShellAllowed(cmd) {
-  if (!cmd || typeof cmd !== 'string') return false;
-  return SHELL_WHITELIST.some(re => re.test(cmd.trim()));
 }
 
 // QFLUSH
@@ -539,10 +551,9 @@ async function loadImageBuffer(ref) {
   }
 
   // Chemin local
-  let filePath = ref;
+  let filePath = String(ref).trim();
   if (!path.isAbsolute(filePath)) {
-    // tu peux adapter la racine, j’ai mis D:/A12 par défaut
-    filePath = path.resolve('D:/A12', filePath);
+    filePath = resolveSafePath(filePath, 'generate_pdf.image');
   }
 
   try {
@@ -557,9 +568,9 @@ async function loadImageBuffer(ref) {
 async function t_generate_pdf(args = {}) {
   let { outputPath, title, content, sections, author, date } = args;
 
-  if (!outputPath) {
-    outputPath = path.resolve("D:/A12", "expose_lyceen.pdf");
-  }
+  outputPath = outputPath
+    ? resolveSafePath(outputPath, 'generate_pdf.outputPath')
+    : buildGeneratedAssetPath(`expose_${Date.now()}.pdf`, 'generate_pdf.outputPath');
 
   // Securise la création du dossier avant d'écrire le PDF
   await fsp.mkdir(path.dirname(outputPath), { recursive: true });
@@ -641,20 +652,285 @@ async function t_generate_pdf(args = {}) {
   };
 }
 
-// PNG (stub)
+// PNG placeholder generator (safe fallback for dev actions)
 async function t_generate_png(args = {}) {
-  return { ok: true, stub: true, args };
+  const sharp = require('sharp');
+  const size = parseImageSize(args.imageSize, Number(args.width || 1024), Number(args.height || 1024));
+  const width = Math.max(64, Math.min(2048, Number(args.width || size.width || 1024)));
+  const height = Math.max(64, Math.min(2048, Number(args.height || size.height || 1024)));
+  const title = String(
+    args.text ||
+    args.prompt ||
+    args.imageDescription ||
+    args.imageType ||
+    'Illustration A11'
+  ).trim() || 'Illustration A11';
+  const subtitle = String(args.subtitle || 'Image de secours generee par A11').trim();
+  const baseName = `${slugifyAssetSegment(title, 'image')}-${Date.now()}.png`;
+  const outputPath = args.outputPath || args.path || args.imagePath
+    ? resolveSafePath(args.outputPath || args.path || args.imagePath, 'generate_png.outputPath')
+    : buildGeneratedAssetPath(baseName, 'generate_png.outputPath');
+
+  await fsp.mkdir(path.dirname(outputPath), { recursive: true });
+
+  const safeTitle = title
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+  const safeSubtitle = subtitle
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;');
+
+  const svg = `
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#0f172a"/>
+          <stop offset="100%" stop-color="#1d4ed8"/>
+        </linearGradient>
+      </defs>
+      <rect width="100%" height="100%" rx="28" fill="url(#bg)"/>
+      <circle cx="${Math.round(width * 0.78)}" cy="${Math.round(height * 0.22)}" r="${Math.round(Math.min(width, height) * 0.09)}" fill="#38bdf8" fill-opacity="0.22"/>
+      <circle cx="${Math.round(width * 0.18)}" cy="${Math.round(height * 0.76)}" r="${Math.round(Math.min(width, height) * 0.11)}" fill="#f59e0b" fill-opacity="0.18"/>
+      <text x="50%" y="42%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(28, Math.round(Math.min(width, height) * 0.08))}" font-weight="700" fill="#f8fafc">${safeTitle}</text>
+      <text x="50%" y="58%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(16, Math.round(Math.min(width, height) * 0.035))}" fill="#cbd5e1">${safeSubtitle}</text>
+      <text x="50%" y="84%" text-anchor="middle" font-family="Arial, sans-serif" font-size="${Math.max(12, Math.round(Math.min(width, height) * 0.024))}" fill="#93c5fd">A11 placeholder PNG</text>
+    </svg>
+  `;
+
+  await sharp(Buffer.from(svg)).png().toFile(outputPath);
+
+  return {
+    ok: true,
+    outputPath,
+    width,
+    height,
+    mode: 'placeholder',
+    prompt: title,
+  };
 }
 
-// VS / A11Host (stubs)
+// VS / A11Host
 async function t_vs_status() {
-  return { ok: true, available: false, methods: [] };
+  return await getA11HostStatus();
 }
+
+async function requireA11HostCapability(capabilityKey, unavailableError) {
+  const status = await getA11HostStatus();
+  if (!status.capabilities?.[capabilityKey]) {
+    return {
+      ok: false,
+      error: unavailableError,
+      mode: status.mode,
+      bridgeAvailable: status.bridgeAvailable,
+      capabilities: status.capabilities
+    };
+  }
+  return status;
+}
+
+function parseA11HostPayload(payload, fallbackKey) {
+  if (typeof payload !== 'string') {
+    return fallbackKey ? { [fallbackKey]: payload } : payload;
+  }
+
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return fallbackKey ? { [fallbackKey]: payload } : payload;
+  }
+}
+
+async function t_vs_workspace_root() {
+  const status = await requireA11HostCapability('workspaceRoot', 'vs_workspace_root unavailable');
+  if (!status.ok) return status;
+
+  const root = await callA11Host('GetWorkspaceRoot');
+  return {
+    ok: true,
+    root,
+    mode: status.mode
+  };
+}
+
+async function t_vs_compilation_errors() {
+  const status = await requireA11HostCapability('compilationErrors', 'vs_compilation_errors unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetCompilationErrors');
+  const parsed = parseA11HostPayload(payload, 'errors');
+  const errors = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.errors) ? parsed.errors : []);
+  return {
+    ok: true,
+    errors,
+    raw: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_project_structure() {
+  const status = await requireA11HostCapability('projectStructure', 'vs_project_structure unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetProjectStructure');
+  const parsed = parseA11HostPayload(payload, 'projectStructure');
+  return {
+    ok: true,
+    projectStructure: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_solution_info() {
+  const status = await requireA11HostCapability('solutionInfo', 'vs_solution_info unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetSolutionInfo');
+  const parsed = parseA11HostPayload(payload, 'solutionInfo');
+  return {
+    ok: true,
+    solutionInfo: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_active_document() {
+  const status = await requireA11HostCapability('activeDocument', 'vs_active_document unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetActiveDocument');
+  const parsed = parseA11HostPayload(payload, 'document');
+  return {
+    ok: true,
+    document: parsed,
+    mode: status.mode
+  };
+}
+
+async function t_vs_current_selection() {
+  const status = await requireA11HostCapability('currentSelection', 'vs_current_selection unavailable');
+  if (!status.ok) return status;
+
+  const payload = await callA11Host('GetCurrentSelection');
+  const parsed = parseA11HostPayload(payload, 'text');
+  const text = typeof parsed === 'string'
+    ? parsed
+    : (typeof parsed?.text === 'string' ? parsed.text : String(parsed?.text || ''));
+  return {
+    ok: true,
+    text,
+    raw: parsed,
+    mode: status.mode
+  };
+}
+
 async function t_vs_open_file(args = {}) {
-  return { ok: false, error: 'vs_open_file not wired yet' };
+  const filePath = String(args.path || '').trim();
+  if (!filePath) {
+    throw new Error('vs_open_file: missing "path"');
+  }
+
+  const status = await requireA11HostCapability('openFile', 'vs_open_file unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('OpenFile', filePath);
+  return {
+    ok: true,
+    success,
+    path: filePath,
+    mode: status.mode
+  };
 }
+
+async function t_vs_goto_line(args = {}) {
+  const filePath = String(args.path || '').trim();
+  const line = Number(args.line);
+  if (!filePath) {
+    throw new Error('vs_goto_line: missing "path"');
+  }
+  if (!Number.isInteger(line) || line < 1) {
+    throw new Error('vs_goto_line: invalid "line"');
+  }
+
+  const status = await requireA11HostCapability('gotoLine', 'vs_goto_line unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('GotoLine', filePath, line);
+  return {
+    ok: true,
+    success,
+    path: filePath,
+    line,
+    mode: status.mode
+  };
+}
+
+async function t_vs_open_documents() {
+  const status = await requireA11HostCapability('openDocuments', 'vs_open_documents unavailable');
+  if (!status.ok) return status;
+
+  const docs = await callA11Host('GetOpenDocuments');
+  let documents = docs;
+  if (typeof docs === 'string') {
+    try {
+      documents = JSON.parse(docs);
+    } catch {
+      documents = [docs];
+    }
+  }
+
+  return {
+    ok: true,
+    documents,
+    mode: status.mode
+  };
+}
+
+async function t_vs_execute_shell(args = {}) {
+  const command = String(args.command || '').trim();
+  if (!command) {
+    throw new Error('vs_execute_shell: missing "command"');
+  }
+  if (!isShellAllowed(command)) {
+    return {
+      ok: false,
+      error: `vs_execute_shell: command not allowed by whitelist: "${command}"`,
+      command
+    };
+  }
+
+  const status = await requireA11HostCapability('executeShell', 'vs_execute_shell unavailable');
+  if (!status.ok) return status;
+
+  try {
+    const output = await callA11Host('ExecuteShell', command);
+    return {
+      ok: true,
+      command,
+      output,
+      mode: status.mode
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      command,
+      mode: status.mode,
+      error: err?.message || String(err)
+    };
+  }
+}
+
 async function t_vs_build_solution() {
-  return { ok: false, error: 'vs_build_solution not wired yet' };
+  const status = await requireA11HostCapability('buildSolution', 'vs_build_solution unavailable');
+  if (!status.ok) return status;
+
+  const success = await callA11Host('BuildSolution');
+  return {
+    ok: true,
+    success,
+    mode: status.mode
+  };
 }
 
 async function t_a11_env_snapshot(_args = {}) {
@@ -946,9 +1222,18 @@ const TOOL_IMPL = {
   // LLM
   llm_analyze_text: t_llm_analyze_text,
 
-  // VS / A11Host (stubs)
+  // VS / A11Host
   vs_status: t_vs_status,
+  vs_workspace_root: t_vs_workspace_root,
+  vs_compilation_errors: t_vs_compilation_errors,
+  vs_project_structure: t_vs_project_structure,
+  vs_solution_info: t_vs_solution_info,
+  vs_active_document: t_vs_active_document,
+  vs_current_selection: t_vs_current_selection,
   vs_open_file: t_vs_open_file,
+  vs_goto_line: t_vs_goto_line,
+  vs_open_documents: t_vs_open_documents,
+  vs_execute_shell: t_vs_execute_shell,
   vs_build_solution: t_vs_build_solution,
 
   // PDF / PNG
@@ -1131,7 +1416,16 @@ module.exports = {
   t_generate_pdf,
   t_generate_png,
   t_vs_status,
+  t_vs_workspace_root,
+  t_vs_compilation_errors,
+  t_vs_project_structure,
+  t_vs_solution_info,
+  t_vs_active_document,
+  t_vs_current_selection,
   t_vs_open_file,
+  t_vs_goto_line,
+  t_vs_open_documents,
+  t_vs_execute_shell,
   t_vs_build_solution,
   t_a11_env_snapshot,
   t_a11_debug_echo,

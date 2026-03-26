@@ -20,6 +20,8 @@ import {
 } from "./lib/api";
 import { A11HistoryPanel } from "./components/A11HistoryPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
+import { A11OpsStatusPanel } from "./components/A11OpsStatusPanel";
+import { A11VsixDebugPanel } from "./components/A11VsixDebugPanel";
 import { ConversationActivityPanel } from "./components/ConversationActivityPanel";
 import { ConversationResourcesPanel } from "./components/ConversationResourcesPanel";
 import { CreateArtifactModal } from "./components/CreateArtifactModal";
@@ -34,6 +36,7 @@ import {
   stopMic,
   speak,
   cancelSpeech,
+  setTtsQueueEnabled,
   setSpeechMuted,
   isSpeechMuted,
   retryPlayUrl,
@@ -525,6 +528,7 @@ export function App() {
   ]);
   const [ttsFallback, setTtsFallback] = useState(false);
   const [audioBlockedUrl, setAudioBlockedUrl] = useState<string | null>(null);
+  const [audioPlaying, setAudioPlaying] = useState(false);
 
   // Audio-blocked banner: listen for autoplay block events
   useEffect(() => {
@@ -532,12 +536,18 @@ export function App() {
       const url = (e as CustomEvent).detail?.url;
       if (url) setAudioBlockedUrl(url);
     };
-    const onSpeechStart = () => setAudioBlockedUrl(null);
+    const onSpeechStart = () => {
+      setAudioBlockedUrl(null);
+      setAudioPlaying(true);
+    };
+    const onSpeechEnd = () => setAudioPlaying(false);
     globalThis.addEventListener('a11:audioBlocked', onBlocked);
     globalThis.addEventListener('a11:speechstart', onSpeechStart);
+    globalThis.addEventListener('a11:speechend', onSpeechEnd);
     return () => {
       globalThis.removeEventListener('a11:audioBlocked', onBlocked);
       globalThis.removeEventListener('a11:speechstart', onSpeechStart);
+      globalThis.removeEventListener('a11:speechend', onSpeechEnd);
     };
   }, []);
 
@@ -554,9 +564,7 @@ export function App() {
   const [sending, setSending] = useState(false);
   const stats: LlmStats | null = null;
   const [voiceListening, setVoiceListening] = useState(false);
-  const audioPlaying = false;
   const [devMode, setDevMode] = useState(false);
-  const speaking = false;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const toggleLockRef = useRef(false);
   const [model, setModel] = useState("gpt-4o-mini");
@@ -659,6 +667,20 @@ export function App() {
     setSelectedChatId(initial[0].id);
     setMessages(initial[0].messages);
   }, []);
+
+  useEffect(() => {
+    try {
+      if (localStorage.getItem('a11:tts-only') === '1') {
+        setTtsFallback(true);
+      }
+    } catch {
+      // ignore storage access errors
+    }
+  }, []);
+
+  useEffect(() => {
+    setTtsQueueEnabled(ttsFallback || voiceListening);
+  }, [ttsFallback, voiceListening]);
 
   useEffect(() => {
     try {
@@ -1068,8 +1090,9 @@ export function App() {
       });
       await refreshConversationActivity(selectedChatId || a11ConvId);
 
-      // Pipeline auto: LLM reply -> TTS playback
-      speak(String(assistantText), { lang: "fr-FR" });
+      if (ttsFallback || voiceListening) {
+        speak(String(assistantText), { lang: "fr-FR" });
+      }
     } catch (err: any) {
       const errMsg: ChatMessage = {
         id: `e-${Date.now()}`,
@@ -1207,7 +1230,7 @@ export function App() {
     }
     // Règle anti-blabla
     parts.push(
-      `# RÈGLES\n- Réponds uniquement à la demande de l'utilisateur.\n- N'invente jamais de contexte ou de scénario.\n- Ne propose aucune action non demandée explicitement.\n- Si la demande n'est pas claire, pose une seule question de clarification.\n- Si la question est triviale, réponds en une phrase maximum.`
+      `# RÈGLES\n- Réponds uniquement à la demande de l'utilisateur.\n- N'invente jamais de contexte ou de scénario.\n- Ne propose aucune action non demandée explicitement.\n- Ne réponds jamais par un JSON d'action, une enveloppe d'outil ou une pseudo commande.\n- Si la demande n'est pas claire, pose une seule question de clarification.\n- Si la question est triviale, réponds en une phrase maximum.`
     );
     return parts.join("\n\n---\n\n");
   }, [nindoLayers]);
@@ -1229,6 +1252,8 @@ export function App() {
       `# MODE DEV (A-11 DEVELOPER ENGINE)
 - Tu te comportes comme un ingénieur logiciel dans un vrai workspace local.
 - Tu peux proposer des actions JSON (mode "actions") pour Cerbère (write_file, generate_pdf, etc.).
+- Actions supportees: write_file, download_file, generate_pdf, generate_png.
+- N'invente jamais une action non supportee. Par exemple, n'utilise pas "generate_image": utilise "generate_png".
 - Tu évites les actions destructrices.
 - Tu ne t'inventes pas de problème : si tu n'as pas assez de contexte, tu demandes des fichiers / erreurs.
 
@@ -1711,6 +1736,9 @@ RÈGLES STRICTES :
                   </div>
                 )}
               </div>
+
+              <A11OpsStatusPanel />
+              <A11VsixDebugPanel />
             </div>
           ) : (
           <>

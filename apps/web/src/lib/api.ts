@@ -472,13 +472,28 @@ export async function callA11Agent(messages: A11ChatMessage[], devMode?: boolean
   const url = API_BASE ? `${API_BASE}/api/agent` : "/api/agent";
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(devMode ? { messages, devMode } : { messages }),
+    headers: buildAuthHeaders("application/json"),
+    body: JSON.stringify(devMode ? { messages, devMode, allowDevActions: true } : { messages }),
   });
   if (!res.ok) {
     throw new Error(`A11 /api/agent error: ${res.status}`);
   }
-  return res.json();
+  const data = await res.json();
+  if (data?.mode === "text") {
+    return {
+      type: "text",
+      content: String(data.text || data.explanation || ""),
+    };
+  }
+  return {
+    type: "tool-result",
+    tool: "actions",
+    input: data?.envelope || null,
+    result: data?.cerbere || null,
+    explanation: String(data?.explanation || ""),
+    imageUrl: data?.imagePath || null,
+    actionId: null,
+  };
 }
 
 // === A11 Conversation History (backend) ===
@@ -766,6 +781,136 @@ export type MemoryPurgeNowResponse = {
   removed: MemoryCounts;
   wouldRemove?: MemoryCounts | null;
 };
+
+export type A11HostStatusResponse = {
+  ok: boolean;
+  available?: boolean;
+  bridgeAvailable?: boolean;
+  headlessAvailable?: boolean;
+  mode?: string;
+  safeMode?: boolean;
+  workspaceRoot?: string | null;
+  buildCommandConfigured?: boolean;
+  methods?: string[];
+  bridgeMethods?: string[];
+  headlessMethods?: string[];
+  capabilities?: Record<string, boolean>;
+  shellPolicy?: {
+    whitelisted?: boolean;
+    defaultExamples?: string[];
+    extraPrefixes?: string[];
+  };
+  error?: string;
+};
+
+export type A11CapabilitiesResponse = {
+  ok: boolean;
+  a11host?: {
+    mode?: string;
+    bridgeConnected?: boolean;
+    safeMode?: boolean;
+    workspaceRoot?: string | null;
+    shellCwd?: string | null;
+    buildCommand?: string | null;
+    buildCommandConfigured?: boolean;
+    methods?: {
+      active?: string[];
+      bridge?: string[];
+      headless?: string[];
+    };
+    capabilities?: Record<string, boolean>;
+    shellPolicy?: {
+      whitelisted?: boolean;
+      defaultExamples?: string[];
+      extraPrefixes?: string[];
+    };
+  };
+  qflush?: {
+    available?: boolean;
+    error?: string | null;
+    processes?: Record<string, {
+      status?: string;
+      pid?: number | null;
+      restarts?: number;
+      uptime?: string | number | null;
+    }>;
+  };
+  error?: string;
+};
+
+export type QflushStatusResponse = {
+  available?: boolean;
+  initialized?: boolean;
+  remoteUrl?: string | null;
+  chatFlow?: string | null;
+  memorySummaryFlow?: string | null;
+  memorySummaryBuiltIn?: boolean;
+  message?: string;
+  error?: string;
+  processes?: Record<string, {
+    status?: string;
+    pid?: number | null;
+    restarts?: number;
+    uptime?: string | number | null;
+  }>;
+};
+
+export async function fetchA11HostStatus(): Promise<A11HostStatusResponse> {
+  const res = await fetch(getApiUrl('/api/a11host/status'), {
+    headers: buildAuthHeaders(),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse errors
+  }
+
+  if (!res.ok) {
+    throw new Error(data?.message || data?.error || `A11Host status failed (${res.status})`);
+  }
+
+  return data as A11HostStatusResponse;
+}
+
+export async function fetchA11Capabilities(): Promise<A11CapabilitiesResponse> {
+  const res = await fetch(getApiUrl('/api/a11/capabilities'), {
+    headers: buildAuthHeaders(),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse errors
+  }
+
+  if (!res.ok) {
+    throw new Error(data?.message || data?.error || `A11 capabilities failed (${res.status})`);
+  }
+
+  return data as A11CapabilitiesResponse;
+}
+
+export async function fetchQflushStatus(): Promise<QflushStatusResponse> {
+  const res = await fetch(getApiUrl('/api/qflush/status'), {
+    headers: buildAuthHeaders(),
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore parse errors
+  }
+
+  if (!res.ok) {
+    throw new Error(data?.message || data?.error || `Qflush status failed (${res.status})`);
+  }
+
+  return data as QflushStatusResponse;
+}
 
 export async function purgeMemoryNow(options?: { userId?: string; dryRun?: boolean }): Promise<MemoryPurgeNowResponse> {
   const dryRun = !!options?.dryRun;

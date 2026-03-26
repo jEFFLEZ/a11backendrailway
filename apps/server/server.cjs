@@ -15,7 +15,9 @@ const { buildRuntimeConfig, getPublicRuntimeStatus } = require('./lib/runtime-co
 // A11Host (VSIX + headless)
 const {
   registerA11HostRoutes,
-  setHeadlessConfig
+  setHeadlessConfig,
+  getA11HostStatus,
+  getA11HostCapabilities
 } = require('./a11host.cjs'); // adapte le chemin si besoin
 
 // Prevent DeprecationWarning for util._extend by replacing it early with Object.assign
@@ -667,6 +669,8 @@ if (db) {
             created_at TIMESTAMP DEFAULT NOW()
           )
         `);
+        await db.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS content_type TEXT');
+        await db.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS size_bytes INTEGER');
         await db.query('CREATE INDEX IF NOT EXISTS idx_files_user_created_at ON files (user_id, created_at DESC)');
         await db.query(`
           CREATE TABLE IF NOT EXISTS user_facts (
@@ -718,6 +722,8 @@ if (db) {
             UNIQUE (user_id, storage_key)
           )
         `);
+        await db.query('ALTER TABLE user_files ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT \'upload\'');
+        await db.query('ALTER TABLE user_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
         await db.query('CREATE INDEX IF NOT EXISTS idx_user_files_user_created ON user_files (user_id, created_at DESC)');
         await db.query(`
           CREATE TABLE IF NOT EXISTS conversation_resources (
@@ -737,6 +743,13 @@ if (db) {
             UNIQUE (user_id, conversation_id, storage_key)
           )
         `);
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS resource_kind TEXT NOT NULL DEFAULT \'file\'');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT \'upload\'');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS url TEXT');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS content_type TEXT');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS size_bytes INTEGER');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS metadata_json JSONB');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
         await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_conversation_created ON conversation_resources (user_id, conversation_id, created_at DESC)');
         await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_kind_updated ON conversation_resources (user_id, resource_kind, updated_at DESC)');
 
@@ -1666,7 +1679,10 @@ app.use('/tts', express.static(path.join(__dirname, '../../public/tts')));
 registerOpenAIRoutes(router);
 
 // Routes A11Host (VSIX + headless)
-registerA11HostRoutes(router);
+const a11HostRouter = Router();
+a11HostRouter.use((req, res, next) => verifyJWT(req, res, next));
+registerA11HostRoutes(a11HostRouter);
+router.use(a11HostRouter);
 
 // Monter le router principal sous /api
 app.use('/api', router);
@@ -1716,6 +1732,46 @@ function verifyJWT(req, res, next) {
     });
   }
 }
+
+app.get('/api/a11host/status', verifyJWT, async (_req, res) => {
+  try {
+    const status = await getA11HostStatus();
+    res.json(status);
+  } catch (err) {
+    console.warn('[A11Host] Protected status failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/a11/capabilities', verifyJWT, async (_req, res) => {
+  try {
+    const supervisor = globalThis.__A11_SUPERVISOR || globalThis.__A11_QFLUSH_SUPERVISOR || null;
+    const a11host = await getA11HostCapabilities();
+    const qflushStatus = qflushIntegration.getStatus(supervisor);
+    const processes = {};
+    for (const [name, proc] of Object.entries(qflushStatus.processes || {})) {
+      processes[name] = {
+        status: proc?.status || 'unknown',
+        pid: proc?.pid || null,
+        restarts: proc?.restarts || 0,
+        uptime: proc?.uptime ?? null
+      };
+    }
+
+    res.json({
+      ok: true,
+      a11host,
+      qflush: {
+        available: !!qflushStatus.available,
+        error: qflushStatus.error || null,
+        processes
+      }
+    });
+  } catch (err) {
+    console.warn('[A11] Capabilities route failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 function isAdminRequest(req) {
   const configuredAdminToken = String(process.env.NEZ_ADMIN_TOKEN || '').trim();
@@ -2123,6 +2179,7 @@ app.get('/api/a11/history/:id/activity', verifyJWT, async (req, res) => {
 // ✅ AUTH MIDDLEWARE - appliqué SEULEMENT sur /api/ai pour protéger chat
 // /api/auth/login reste public!
 app.use('/api/ai', verifyJWT);
+app.use('/api/agent', verifyJWT);
 app.use('/api/files', verifyJWT);
 app.use('/api/artifacts', verifyJWT);
 app.use('/api/resources', verifyJWT);
@@ -2875,6 +2932,206 @@ function normalizeAssistantOutput(value) {
   return text;
 }
 
+function normalizeDevActionName(name) {
+  const normalized = String(name || '').trim();
+  if (!normalized) return normalized;
+  if (normalized === 'generate_image') return 'generate_png';
+  if (normalized === 'websearch') return 'web_search';
+  return normalized;
+}
+
+function normalizeDevActionArgs(actionName, rawAction) {
+  const action = rawAction && typeof rawAction === 'object' ? rawAction : {};
+  const args = action.arguments && typeof action.arguments === 'object'
+    ? { ...action.arguments }
+    : action.input && typeof action.input === 'object'
+      ? { ...action.input }
+    : { ...action };
+
+  delete args.action;
+  delete args.name;
+  delete args.arguments;
+  delete args.input;
+
+  if (actionName === 'generate_pdf' && Array.isArray(args.sections)) {
+    args.sections = args.sections.map((section, index) => {
+      const images = Array.isArray(section?.images)
+        ? section.images.filter(Boolean)
+        : [section?.image].filter(Boolean);
+      return {
+        heading: String(section?.heading || section?.title || `Section ${index + 1}`).trim(),
+        text: String(section?.text || section?.content || '').trim(),
+        images,
+      };
+    });
+  }
+
+  if (actionName === 'generate_png') {
+    if (!args.outputPath) {
+      args.outputPath = args.imagePath || args.path || null;
+    }
+    if (!args.text) {
+      args.text = args.imageDescription || args.prompt || args.imageType || 'Illustration A11';
+    }
+    if (!args.width || !args.height) {
+      const sizeMatch = /^(\d{2,4})\s*[xX]\s*(\d{2,4})$/.exec(String(args.imageSize || '').trim());
+      if (sizeMatch) {
+        args.width = Number(args.width || sizeMatch[1]);
+        args.height = Number(args.height || sizeMatch[2]);
+      }
+    }
+  }
+
+  if (actionName === 'download_file' && !args.outputPath && args.path) {
+    args.outputPath = args.path;
+  }
+
+  return args;
+}
+
+function normalizeActionEnvelopeShape(candidate, defaults = {}) {
+  const payload = candidate && typeof candidate === 'object' ? { ...candidate } : null;
+  if (!payload) return null;
+
+  let actions = [];
+  if (Array.isArray(payload.actions)) {
+    actions = payload.actions;
+  } else if (payload.result && typeof payload.result === 'object') {
+    actions = [payload.result];
+  } else if (payload.action || payload.name) {
+    actions = [payload];
+  } else {
+    return null;
+  }
+
+  const normalizedActions = actions
+    .filter((action) => action && typeof action === 'object')
+    .map((action) => {
+      const actionName = normalizeDevActionName(action.action || action.name);
+      return {
+        action: actionName,
+        arguments: normalizeDevActionArgs(actionName, action),
+      };
+    })
+    .filter((action) => action.action);
+
+  if (!normalizedActions.length) return null;
+
+  return {
+    mode: 'actions',
+    goal: String(payload.goal || payload.title || defaults.goal || '').trim() || undefined,
+    conversationId: normalizeConversationId(payload.conversationId || defaults.conversationId),
+    userId: String(payload.userId || defaults.userId || '').trim() || undefined,
+    actions: normalizedActions,
+  };
+}
+
+function parseAssistantActionEnvelope(value, defaults = {}) {
+  const raw = String(value || '').trim();
+  if (!raw.startsWith('{') || !raw.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return normalizeActionEnvelopeShape(parsed, defaults);
+  } catch {
+    return null;
+  }
+}
+
+function applyAssistantTextToPayload(payload, content, extras = null) {
+  const normalizedContent = normalizeAssistantOutput(content);
+  if (!payload || typeof payload !== 'object') {
+    return toSimpleAssistantCompletion(normalizedContent);
+  }
+
+  if (Array.isArray(payload.choices) && payload.choices[0]) {
+    const choice = payload.choices[0];
+    if (choice.message && typeof choice.message === 'object') {
+      choice.message.content = normalizedContent;
+      choice.message.role = choice.message.role || 'assistant';
+    } else {
+      choice.message = { role: 'assistant', content: normalizedContent };
+    }
+  } else {
+    payload.choices = [{
+      index: 0,
+      message: { role: 'assistant', content: normalizedContent },
+      finish_reason: 'stop',
+    }];
+  }
+
+  if (extras && typeof extras === 'object') {
+    payload.a11Agent = {
+      ...(payload.a11Agent && typeof payload.a11Agent === 'object' ? payload.a11Agent : {}),
+      ...extras,
+    };
+  }
+
+  return payload;
+}
+
+async function resolveAssistantActionEnvelope({
+  content,
+  allowDevActions = false,
+  conversationId,
+  userId,
+}) {
+  const envelope = parseAssistantActionEnvelope(content, { conversationId, userId });
+  if (!envelope) {
+    return {
+      content: normalizeAssistantOutput(content),
+      envelope: null,
+      blocked: false,
+      executed: false,
+      cerbere: null,
+      extras: null,
+    };
+  }
+
+  if (!allowDevActions) {
+    return {
+      content: "Mode dev desactive: A11 a prepare une action outillee mais ne l'executera pas ici. Demande une reponse normale ou active le mode dev.",
+      envelope,
+      blocked: true,
+      executed: false,
+      cerbere: null,
+      extras: {
+        blocked: true,
+        actionCount: envelope.actions.length,
+      },
+    };
+  }
+
+  const cerbere = await runActionsEnvelope(envelope);
+  let explanation = summarizeCerbereResults(cerbere);
+  const publicImageUrl = extractImagePathFromCerbere(cerbere);
+  if (publicImageUrl) {
+    explanation += `\n\n![resultat](${publicImageUrl})`;
+  }
+
+  appendConversationLog({
+    type: 'agent_actions',
+    userId: String(userId || envelope.userId || '').trim() || null,
+    conversationId: envelope.conversationId || normalizeConversationId(conversationId),
+    envelope,
+    explanation,
+    imagePath: publicImageUrl,
+    cerbere,
+  });
+
+  return {
+    content: explanation,
+    envelope,
+    blocked: false,
+    executed: true,
+    cerbere,
+    extras: {
+      executed: true,
+      actionCount: Array.isArray(cerbere?.results) ? cerbere.results.length : 0,
+      imagePath: publicImageUrl || null,
+    },
+  };
+}
+
 function isSiwisStatusQuestion(value) {
   const text = String(value || '').trim().toLowerCase();
   if (!text) return false;
@@ -3282,7 +3539,14 @@ async function proxyQflushChat(req, res) {
       request: body
     });
 
-    const content = extractAssistantText(qflushResult);
+    const rawContent = extractAssistantText(qflushResult);
+    const resolvedAssistant = await resolveAssistantActionEnvelope({
+      content: rawContent,
+      allowDevActions: req.body?.a11Dev === true,
+      conversationId,
+      userId,
+    });
+    const content = resolvedAssistant.content;
     if (userId && content) {
       await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
     }
@@ -3314,6 +3578,9 @@ async function proxyQflushChat(req, res) {
       },
       qflush: qflushResult,
     };
+    if (resolvedAssistant.extras) {
+      data.a11Agent = resolvedAssistant.extras;
+    }
 
     appendChatTurnLogSafe(body, data, 'qflush', userId);
     return res.status(200).json(data);
@@ -3327,6 +3594,8 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
   try {
     const body = bodyOverride || req.body || {};
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    const userId = String(req.user?.id || body._user || '').trim();
+    const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
     const prompt = typeof body.prompt === 'string' && body.prompt.trim()
       ? body.prompt
       : buildPromptFromMessages(messages);
@@ -3347,7 +3616,14 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
       timeout: 60000,
     });
 
-    const content = extractLocalCompletionContent(upstreamRes.data);
+    const rawContent = extractLocalCompletionContent(upstreamRes.data);
+    const resolvedAssistant = await resolveAssistantActionEnvelope({
+      content: rawContent,
+      allowDevActions: body?.a11Dev === true,
+      conversationId,
+      userId,
+    });
+    const content = resolvedAssistant.content;
     const data = {
       id: `chatcmpl-local-${Date.now()}`,
       object: 'chat.completion',
@@ -3364,9 +3640,10 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
         },
       ],
     };
+    if (resolvedAssistant.extras) {
+      data.a11Agent = resolvedAssistant.extras;
+    }
 
-    const userId = String(req.user?.id || body._user || '').trim();
-    const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
     if (userId && content) {
       await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
     }
@@ -3453,7 +3730,15 @@ async function proxyChatToOpenAI(req, res) {
     });
 
     const data = upstreamRes.data;
-    const content = extractAssistantText(data);
+    const rawContent = extractAssistantText(data);
+    const resolvedAssistant = await resolveAssistantActionEnvelope({
+      content: rawContent,
+      allowDevActions: req.body?.a11Dev === true,
+      conversationId,
+      userId,
+    });
+    const content = resolvedAssistant.content;
+    applyAssistantTextToPayload(data, content, resolvedAssistant.extras);
     if (userId && content) {
       await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
     }
@@ -3660,7 +3945,7 @@ app.post('/ai', async (req, res) => {
 });
 
 const { A11_AGENT_SYSTEM_PROMPT, A11_AGENT_DEV_PROMPT } = require('./lib/a11Agent.js');
-const { runAction } = require('./src/a11/tools-dispatcher.cjs');
+const { runAction, runActionsEnvelope } = require('./src/a11/tools-dispatcher.cjs');
 
 async function callA11LLM(messages) {
   const backend = BACKENDS.llama_local;
@@ -3697,7 +3982,7 @@ function summarizeCerbereResults(cerbere) {
     }
     const parts = actions.map((a) => {
       const ok = a?.result?.ok ?? a?.ok;
-      const tool = a?.name || a?.tool || 'action';
+      const tool = a?.name || a?.tool || a?.action || 'action';
       const status = ok ? 'ok' : 'erreur';
       return `• ${tool} → ${status}`;
     });
@@ -3708,6 +3993,17 @@ function summarizeCerbereResults(cerbere) {
   }
 }
 
+function toPublicWorkspaceFileUrl(candidatePath) {
+  const raw = String(candidatePath || '').trim();
+  if (!raw) return null;
+  const absolutePath = path.isAbsolute(raw) ? raw : path.resolve(WORKSPACE_ROOT, raw);
+  const relativePath = path.relative(WORKSPACE_ROOT, absolutePath).replaceAll('\\', '/');
+  if (!relativePath || relativePath.startsWith('..')) {
+    return null;
+  }
+  return `/files/${relativePath}`;
+}
+
 function extractImagePathFromCerbere(cerbere) {
   let actions = [];
   if (Array.isArray(cerbere?.results)) {
@@ -3716,11 +4012,11 @@ function extractImagePathFromCerbere(cerbere) {
     actions = cerbere.actions;
   }
   for (const a of actions) {
-    const tool = a?.name || a?.tool;
+    const tool = a?.name || a?.tool || a?.action;
     const r = a?.result || {};
     const p = r.outputPath || r.path || r.savedAs || r.filePath;
-    if (tool === 'download_file' && typeof p === 'string' && p.length > 0) {
-      return p;
+    if ((tool === 'download_file' || tool === 'generate_png' || tool === 'generate_image') && typeof p === 'string' && p.length > 0) {
+      return toPublicWorkspaceFileUrl(p) || p;
     }
   }
   return null;
@@ -3728,7 +4024,39 @@ function extractImagePathFromCerbere(cerbere) {
 
 app.post('/api/agent', express.json(), async (req, res) => {
   try {
-    const { envelope } = req.body || {};
+    const body = req.body || {};
+    const allowDevActions = body.allowDevActions === true || body.devMode === true;
+    if (!allowDevActions) {
+      return res.status(403).json({
+        ok: false,
+        error: 'dev_mode_required'
+      });
+    }
+
+    const userId = String(req.user?.id || body.userId || '').trim();
+    const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
+
+    let envelope = normalizeActionEnvelopeShape(body.envelope, {
+      conversationId,
+      userId,
+    });
+
+    if (!envelope && Array.isArray(body.messages) && body.messages.length > 0) {
+      const llmOutput = await callA11LLM(body.messages);
+      envelope = parseAssistantActionEnvelope(llmOutput, {
+        conversationId,
+        userId,
+      });
+      if (!envelope) {
+        return res.json({
+          ok: true,
+          mode: 'text',
+          explanation: normalizeAssistantOutput(llmOutput),
+          text: normalizeAssistantOutput(llmOutput),
+        });
+      }
+    }
+
     if (!envelope) {
       return res.status(400).json({
         ok: false,
@@ -3736,52 +4064,20 @@ app.post('/api/agent', express.json(), async (req, res) => {
       });
     }
 
-    // 1) Exécution des actions par Cerbère
-    const cerbere = await runActionsEnvelope(envelope);
-
-    // 2) Résumé texte
-    let explanation = summarizeCerbereResults(cerbere);
-
-    // 3) Extraction éventuelle d’un chemin d’image
-    const relativeImagePath = extractImagePathFromCerbere(cerbere); // ex: "docs/camembert.jpg"
-    let publicImageUrl = null;
-
-    if (relativeImagePath) {
-      // chemin absolu sur disque pour info/log
-      const absPath = path.isAbsolute(relativeImagePath)
-        ? relativeImagePath
-        : path.join(WORKSPACE_ROOT, relativeImagePath);
-
-      // chemin relatif par rapport au workspace pour /files
-      const relFromRoot = path.relative(WORKSPACE_ROOT, absPath).replaceAll('\\', '/');
-      publicImageUrl = `/files/${relFromRoot}`;
-
-      // On enrichit le message avec le markdown de l’image
-      explanation += `\n\nVoici l'image téléchargée :\n\n![image](${publicImageUrl})`;
-    }
-
-    // --- MEMOIRE: log de l'action agent ---
-    try {
-      appendConversationLog({
-        type: 'agent_actions',
-        userId: String(req.user?.id || envelope?.userId || envelope?.user?.id || '').trim() || null,
-        conversationId: envelope.conversationId || 'dev-agent',
-        envelope,
-        explanation,
-        imagePath: publicImageUrl,
-        cerbere
-      });
-    } catch (e) {
-      console.warn('[A11][memory] log agent_actions failed:', e?.message);
-    }
-    // ---------------------------------------
+    const executed = await resolveAssistantActionEnvelope({
+      content: JSON.stringify(envelope),
+      allowDevActions: true,
+      conversationId,
+      userId,
+    });
 
     return res.json({
       ok: true,
       mode: 'dev',
-      explanation,
-      imagePath: publicImageUrl,
-      cerbere
+      explanation: executed.content,
+      imagePath: executed.extras?.imagePath || null,
+      cerbere: executed.cerbere,
+      envelope: executed.envelope,
     });
   } catch (e) {
     console.error('[A11][agent] error:', e);

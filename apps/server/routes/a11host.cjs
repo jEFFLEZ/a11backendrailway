@@ -8,6 +8,7 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const childProcess = require('node:child_process');
 const util = require('node:util');
+const { assertShellAllowed, getShellAllowlistSummary } = require('../lib/safe-shell.cjs');
 
 const execAsync = util.promisify(childProcess.exec);
 
@@ -117,6 +118,8 @@ const headlessHost = {
    * ExecuteShell : exécution d'une commande dans le workspace
    */
   async ExecuteShell(command) {
+    assertShellAllowed(command, 'ExecuteShell');
+
     const cwd =
       headlessConfig.shellCwd ||
       headlessConfig.workspaceRoot ||
@@ -155,6 +158,121 @@ const headlessHost = {
   // GetActiveDocument, etc.) ne sont pas implémentables proprement en
   // headless, donc on les laisse non définies ici.
 };
+
+function collectFunctionNames(target) {
+  if (!target || (typeof target !== 'object' && typeof target !== 'function')) {
+    return [];
+  }
+
+  const names = new Set();
+  let current = target;
+  while (current && current !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(current)) {
+      if (name === 'constructor') continue;
+      try {
+        if (typeof target[name] === 'function' || typeof current[name] === 'function') {
+          names.add(name);
+        }
+      } catch {
+        // Ignore getters/properties that throw.
+      }
+    }
+    current = Object.getPrototypeOf(current);
+  }
+
+  return Array.from(names).sort();
+}
+
+function getBridgeMethods() {
+  return collectFunctionNames(a11HostBridge);
+}
+
+function getHeadlessMethods() {
+  return collectFunctionNames(headlessHost);
+}
+
+function isA11HostMethodAvailable(methodName) {
+  return (
+    !!(a11HostBridge && typeof a11HostBridge[methodName] === 'function') ||
+    typeof headlessHost[methodName] === 'function'
+  );
+}
+
+function buildCapabilityFlags() {
+  return {
+    workspaceRoot: isA11HostMethodAvailable('GetWorkspaceRoot'),
+    compilationErrors: isA11HostMethodAvailable('GetCompilationErrors'),
+    projectStructure: isA11HostMethodAvailable('GetProjectStructure'),
+    solutionInfo: isA11HostMethodAvailable('GetSolutionInfo'),
+    activeDocument: isA11HostMethodAvailable('GetActiveDocument'),
+    currentSelection: isA11HostMethodAvailable('GetCurrentSelection'),
+    insertAtCursor: isA11HostMethodAvailable('InsertAtCursor'),
+    replaceSelection: isA11HostMethodAvailable('ReplaceSelection'),
+    openFile: isA11HostMethodAvailable('OpenFile'),
+    gotoLine: isA11HostMethodAvailable('GotoLine'),
+    openDocuments: isA11HostMethodAvailable('GetOpenDocuments'),
+    buildSolution: isA11HostMethodAvailable('BuildSolution'),
+    executeShell: isA11HostMethodAvailable('ExecuteShell'),
+    deleteFile: isA11HostMethodAvailable('DeleteFile'),
+    renameFile: isA11HostMethodAvailable('RenameFile')
+  };
+}
+
+async function getA11HostCapabilities() {
+  const bridgeMethods = getBridgeMethods();
+  const headlessMethods = getHeadlessMethods();
+  const activeMethods = Array.from(new Set([...bridgeMethods, ...headlessMethods])).sort();
+
+  let workspaceRoot = null;
+  try {
+    if (isA11HostMethodAvailable('GetWorkspaceRoot')) {
+      workspaceRoot = await callA11Host('GetWorkspaceRoot');
+    }
+  } catch (error) {
+    console.warn('[A11Host] Unable to resolve workspace root for status:', error.message);
+  }
+
+  return {
+    mode: a11HostBridge ? 'vsix' : 'headless',
+    bridgeConnected: !!a11HostBridge,
+    safeMode: SAFE_MODE,
+    workspaceRoot,
+    shellCwd:
+      headlessConfig.shellCwd ||
+      headlessConfig.workspaceRoot ||
+      process.cwd(),
+    buildCommand: headlessConfig.buildCommand || process.env.A11_BUILD_COMMAND || null,
+    buildCommandConfigured: !!(headlessConfig.buildCommand || process.env.A11_BUILD_COMMAND),
+    methods: {
+      active: activeMethods,
+      bridge: bridgeMethods,
+      headless: headlessMethods
+    },
+    capabilities: buildCapabilityFlags(),
+    shellPolicy: {
+      whitelisted: true,
+      ...getShellAllowlistSummary()
+    }
+  };
+}
+
+async function getA11HostStatus() {
+  const capabilities = await getA11HostCapabilities();
+  return {
+    ok: true,
+    available: capabilities.methods.active.length > 0,
+    bridgeAvailable: capabilities.bridgeConnected,
+    headlessAvailable: capabilities.methods.headless.length > 0,
+    mode: capabilities.mode,
+    safeMode: capabilities.safeMode,
+    workspaceRoot: capabilities.workspaceRoot,
+    buildCommandConfigured: capabilities.buildCommandConfigured,
+    methods: capabilities.methods.active,
+    bridgeMethods: capabilities.methods.bridge,
+    headlessMethods: capabilities.methods.headless,
+    capabilities: capabilities.capabilities
+  };
+}
 
 // =========================
 // CORE CALL DISPATCH
@@ -492,6 +610,16 @@ function registerA11HostRoutes(router) {
       if (!command) {
         return res.status(400).json({ ok: false, error: 'missing_command_parameter' });
       }
+      try {
+        assertShellAllowed(command, 'execute-shell');
+      } catch (err) {
+        return res.status(400).json({
+          ok: false,
+          error: 'command_not_allowed',
+          message: err.message,
+          shellPolicy: getShellAllowlistSummary()
+        });
+      }
       
       const output = await callA11Host('ExecuteShell', command);
       console.log(`[A11Host] ExecuteShell: ${command.substring(0, 50)}...`);
@@ -517,14 +645,26 @@ function registerA11HostRoutes(router) {
 
   // ========== UTILITY ENDPOINTS ==========
 
-  // GET /api/v1/vs/status - Check if A11Host bridge is available
-  router.get('/v1/vs/status', (req, res) => {
-    const available = !!a11HostBridge;
-    res.json({
-      ok: true,
-      available,
-      methods: available ? Object.keys(a11HostBridge).filter(k => typeof a11HostBridge[k] === 'function') : []
-    });
+  // GET /api/v1/vs/status - Check if A11Host bridge/headless mode is available
+  router.get('/v1/vs/status', async (req, res) => {
+    try {
+      const status = await getA11HostStatus();
+      res.json(status);
+    } catch (err) {
+      console.error('[A11Host] Status error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  // GET /api/v1/vs/capabilities - richer capability snapshot
+  router.get('/v1/vs/capabilities', async (req, res) => {
+    try {
+      const capabilities = await getA11HostCapabilities();
+      res.json({ ok: true, ...capabilities });
+    } catch (err) {
+      console.error('[A11Host] Capabilities error:', err.message);
+      res.status(500).json({ ok: false, error: err.message });
+    }
   });
 
   console.log('[Server] ✓ A11Host routes registered (with headless fallback)');
@@ -534,5 +674,8 @@ module.exports = {
   registerA11HostRoutes,
   setA11HostBridge,
   callA11Host,
-  setHeadlessConfig
+  setHeadlessConfig,
+  getA11HostStatus,
+  getA11HostCapabilities,
+  isA11HostMethodAvailable
 };

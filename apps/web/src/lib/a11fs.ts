@@ -26,11 +26,28 @@ export interface SolutionInfo { name: string; path: string; projectCount: number
 export interface ActiveDocument { path: string; name: string; line: number; column: number; selectedText: string }
 
 const API_BASE = (import.meta as any).env?.VITE_API_BASE || '/api';
+const NEZ_TOKEN = (import.meta as any).env?.VITE_A11_NEZ_TOKEN || '';
+
+function getVsAuthHeaders() {
+  const headers: Record<string, string> = {};
+  try {
+    const token = globalThis.localStorage?.getItem('a11-auth-token');
+    if (token) headers['X-NEZ-TOKEN'] = token;
+    else if (NEZ_TOKEN) headers['X-NEZ-TOKEN'] = NEZ_TOKEN;
+  } catch {
+    if (NEZ_TOKEN) headers['X-NEZ-TOKEN'] = NEZ_TOKEN;
+  }
+  return headers;
+}
 
 async function jsonFetch(url: string, init?: RequestInit) {
   const res = await fetch(url, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...getVsAuthHeaders(),
+      ...(init?.headers || {})
+    },
     credentials: 'include'
   });
   const ct = res.headers.get('content-type') || '';
