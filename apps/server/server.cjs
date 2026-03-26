@@ -317,11 +317,6 @@ setHeadlessConfig({
 });
 
 
-// --- Listen sur le port Railway ---
-const listenPort = process.env.PORT || 8080;
-app.listen(listenPort, () => {
-  console.log(`[A11] Server listening on port ${listenPort}`);
-});
 
 // Last generated GIF path (absolute on disk)
 let lastGifPath = null;
