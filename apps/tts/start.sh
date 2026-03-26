@@ -16,28 +16,15 @@ fi
 
 
 # Télécharger le modèle et son .json si absents dans apps/tts/ (R2 public URL)
-MODEL_URL_BASE="https://pub-9513dd3bb30a4b14bbfa8ca518c7caf.r2.dev"
+MODEL_URL_BASE="https://files.funesterie.me"
 mkdir -p apps/tts
 
 if [ ! -f "apps/tts/fr_FR-siwis-medium.onnx" ]; then
-    echo "[TTS] Téléchargement du modèle .onnx..."
     wget -O apps/tts/fr_FR-siwis-medium.onnx "$MODEL_URL_BASE/fr_FR-siwis-medium.onnx"
-    filetype=$(file apps/tts/fr_FR-siwis-medium.onnx)
-    echo "[TTS] Type du fichier modèle: $filetype"
-    if echo "$filetype" | grep -qi 'HTML'; then
-        echo "[TTS][ERREUR] Le modèle téléchargé est une page HTML (URL incorrecte ou accès refusé)" >&2
-        exit 1
-    fi
 fi
+
 if [ ! -f "apps/tts/fr_FR-siwis-medium.onnx.json" ]; then
-    echo "[TTS] Téléchargement du modèle .json..."
     wget -O apps/tts/fr_FR-siwis-medium.onnx.json "$MODEL_URL_BASE/fr_FR-siwis-medium.onnx.json"
-    filetype=$(file apps/tts/fr_FR-siwis-medium.onnx.json)
-    echo "[TTS] Type du fichier JSON: $filetype"
-    if echo "$filetype" | grep -qi 'HTML'; then
-        echo "[TTS][ERREUR] Le JSON téléchargé est une page HTML (URL incorrecte ou accès refusé)" >&2
-        exit 1
-    fi
 fi
 
 python3 siwis.py
