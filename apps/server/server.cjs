@@ -1,3 +1,18 @@
+// --- Endpoint API TTS universel ---
+const { callTTS } = require('./tts-call.js');
+app.post('/api/tts', async (req, res) => {
+  try {
+    const text = req.body?.text || '';
+    if (!text) {
+      return res.status(400).json({ error: 'Texte manquant' });
+    }
+    const audio = await callTTS(text);
+    res.setHeader('Content-Type', 'audio/wav');
+    res.send(audio);
+  } catch (e) {
+    res.status(500).json({ error: 'TTS error', details: String(e) });
+  }
+});
 // --- .env first ---
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
@@ -104,7 +119,6 @@ const sharp = require('sharp');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { Pool } = require('pg');
-const nodemailer = require('nodemailer');
 const { Resend } = require('resend');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const { nezAuth, getNezAccessLog, TOKENS, MODE, registerIssuedToken } = require('./src/middleware/nezAuth');
@@ -1180,35 +1194,10 @@ async function saveFileRecord({ userId, filename, storageKey, url, contentType, 
 // ============================================================
 const resendApiKey = String(process.env.RESEND_API_KEY || '').trim();
 const resendClient = resendApiKey ? new Resend(resendApiKey) : null;
-
-const hasSmtpConfig = !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
-const hasGmailConfig = !!(process.env.EMAIL_USER && process.env.EMAIL_PASS);
-
-let emailTransporter = null;
-if (hasSmtpConfig) {
-  emailTransporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT),
-    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true',
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-  });
-} else if (hasGmailConfig) {
-  emailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-  });
-}
-
 if (resendClient) {
   console.log('[MAIL] ✅ Resend provider activé');
-}
-
-if (!resendClient && !emailTransporter) {
-  console.warn('[MAIL] Aucun provider mail configuré (RESEND_API_KEY ou SMTP_* ou EMAIL_*)');
-} else if (emailTransporter) {
-  emailTransporter.verify()
-    .then(() => console.log('[MAIL] ✅ Transport SMTP prêt'))
-    .catch((e) => console.error('[MAIL] ❌ Transport SMTP invalide:', e.message));
+} else {
+  console.warn('[MAIL] Aucun provider mail configuré (RESEND_API_KEY manquant)');
 }
 
 async function sendFileEmail({ to, subject, message, fileUrl, attachment }) {
@@ -1219,35 +1208,20 @@ async function sendFileEmail({ to, subject, message, fileUrl, attachment }) {
   const textBody = String(message || 'Voici ton fichier généré.').trim();
   const linkPart = fileUrl ? `\n\nLien: ${fileUrl}` : '';
 
-  if (resendClient) {
-    await resendClient.emails.send({
-      from: process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>',
-      to: normalizedTo,
-      subject: subjectLine,
-      text: `${textBody}${linkPart}`,
-      attachments: attachment ? [{
-        filename: attachment.filename,
-        content: attachment.buffer,
-      }] : undefined,
-    });
-    return { ok: true, provider: 'resend' };
+  if (!resendClient) {
+    return { ok: false, reason: 'mail_provider_not_configured' };
   }
-
-  if (emailTransporter) {
-    await emailTransporter.sendMail({
-      from: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
-      to: normalizedTo,
-      subject: subjectLine,
-      text: `${textBody}${linkPart}`,
-      attachments: attachment ? [{
-        filename: attachment.filename,
-        content: attachment.buffer,
-      }] : undefined,
-    });
-    return { ok: true, provider: 'smtp' };
-  }
-
-  return { ok: false, reason: 'mail_provider_not_configured' };
+  await resendClient.emails.send({
+    from: process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>',
+    to: normalizedTo,
+    subject: subjectLine,
+    text: `${textBody}${linkPart}`,
+    attachments: attachment ? [{
+      filename: attachment.filename,
+      content: attachment.buffer,
+    }] : undefined,
+  });
+  return { ok: true, provider: 'resend' };
 }
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
@@ -1488,21 +1462,13 @@ const forgotPasswordHandler = async (req, res) => {
     const link = `${appUrl}/reset-password?token=${encodeURIComponent(resetToken)}`;
     const fromEmail = process.env.EMAIL_FROM || 'A11 <onboarding@resend.dev>';
 
-    if (resendClient) {
-      await resendClient.emails.send({
-        from: fromEmail,
-        to: user.email,
-        subject: 'A11 — Réinitialisation mot de passe',
-        html: `<p>Clique ici pour réinitialiser ton mot de passe (valide 15 min):</p><p><a href="${link}">${link}</a></p>`
-      });
-    } else {
-      await emailTransporter.sendMail({
-        from: process.env.EMAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER,
-        to: user.email,
-        subject: 'A11 — Réinitialisation mot de passe',
-        text: `Clique ici pour réinitialiser ton mot de passe (valide 15 min):\n\n${link}`
-      });
-    }
+    if (!resendClient) throw new Error('Resend non configuré');
+    await resendClient.emails.send({
+      from: fromEmail,
+      to: user.email,
+      subject: 'A11 — Réinitialisation mot de passe',
+      html: `<p>Clique ici pour réinitialiser ton mot de passe (valide 15 min):</p><p><a href="${link}">${link}</a></p>`
+    });
     console.log('[AUTH] ✅ Reset email envoyé à:', user.email);
     res.json({ ok: true, mailEnabled: true });
   } catch (e) {
