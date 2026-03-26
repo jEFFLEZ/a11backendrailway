@@ -3410,8 +3410,18 @@ function buildOpenAIProxyHeaders(reqHeaders, options = {}) {
   const provider = String(options.provider || '').trim().toLowerCase();
   const headers = reqHeaders ? { ...reqHeaders } : {};
   delete headers.host;
+  delete headers.authorization;
+  delete headers.Authorization;
+  delete headers['x-nez-token'];
+  delete headers['X-NEZ-TOKEN'];
+  delete headers.cookie;
+  delete headers.Cookie;
+  delete headers['content-length'];
+  delete headers['Content-Length'];
+  delete headers['transfer-encoding'];
+  delete headers['Transfer-Encoding'];
   headers['content-type'] = 'application/json';
-  if (provider !== 'local' && !headers.authorization && process.env.OPENAI_API_KEY) {
+  if (provider !== 'local' && process.env.OPENAI_API_KEY) {
     headers.authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
   }
   return headers;
