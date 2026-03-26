@@ -4,7 +4,6 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-
 # Installer dépendances système, copier les fichiers et télécharger Piper en une seule couche
 RUN apt-get update \
     && apt-get install -y wget unzip \
