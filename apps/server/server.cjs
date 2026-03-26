@@ -1861,15 +1861,33 @@ app.post('/api/auth/register', express.json(), async (req, res) => {
   if (!normalizedUsername || !normalizedEmail || !password) return res.status(400).json({ error: 'Missing fields' });
   try {
     const hash = await bcrypt.hash(password, 10);
-    await db.query(
-      'INSERT INTO users (username, email, password_hash) VALUES ($1,$2,$3)',
+    const { rows } = await db.query(
+      'INSERT INTO users (username, email, password_hash) VALUES ($1,$2,$3) RETURNING id, username, email',
       [normalizedUsername, normalizedEmail, hash]
     );
+    const user = rows[0];
+    const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
     console.log('[AUTH] ✅ Register:', normalizedUsername);
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      success: true,
+      token,
+      expiresIn: JWT_EXPIRY,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+      },
+    });
   } catch (e) {
     console.warn('[AUTH] Register failed:', e.message);
-    res.status(400).json({ error: 'User already exists' });
+    const message = String(e?.message || '');
+    const detail = String(e?.detail || '');
+    const combined = `${message} ${detail}`.toLowerCase();
+    let error = 'User already exists';
+    if (combined.includes('username')) error = 'username_taken';
+    else if (combined.includes('email')) error = 'email_taken';
+    res.status(400).json({ error });
   }
 });
 

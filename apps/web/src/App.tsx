@@ -10,6 +10,7 @@ import {
   login,
   logout,
   getAuthToken,
+  register,
   forgotPassword,
   resetPassword,
   purgeMemoryNow,
@@ -276,17 +277,31 @@ function buildAssistantMessageArtifact(message: ChatMessage, options: { conversa
 }
 // ✅ LOGIN PANEL
 function LoginPanel({ onLoginSuccess }: { onLoginSuccess: () => void }) {
+  const [mode, setMode] = useState<"login" | "register" | "forgot">("login");
   const [username, setUsername] = useState("Djeff");
+  const [registerEmail, setRegisterEmail] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [password, setPassword] = useState("1991");
   const [forgotEmail, setForgotEmail] = useState("");
   const [forgotSent, setForgotSent] = useState(false);
+  const [info, setInfo] = useState("");
   const [error, setError] = useState("");
   const [forgotError, setForgotError] = useState("");
   const [loading, setLoading] = useState(false);
   const [forgotLoading, setForgotLoading] = useState(false);
 
+  const switchMode = (nextMode: "login" | "register" | "forgot") => {
+    setMode(nextMode);
+    setError("");
+    setForgotError("");
+    setForgotSent(false);
+    setInfo("");
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError("");
+    setInfo("");
     setLoading(true);
     try {
       await login(username, password);
@@ -298,8 +313,38 @@ function LoginPanel({ onLoginSuccess }: { onLoginSuccess: () => void }) {
     }
   };
 
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError("");
+    setInfo("");
+    if (!username.trim() || !registerEmail.trim() || !password) {
+      setError("Pseudo, email et mot de passe requis");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Les mots de passe ne correspondent pas");
+      return;
+    }
+    setLoading(true);
+    try {
+      const result = await register(username.trim(), registerEmail.trim(), password);
+      if (result?.token) {
+        onLoginSuccess();
+        return;
+      }
+      setInfo("Compte cree. Connecte-toi avec ton nouveau mot de passe.");
+      setMode("login");
+    } catch (err) {
+      setError((err as Error).message || "Inscription echouee");
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleForgot = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError("");
+    setInfo("");
     setForgotError("");
     setForgotSent(false);
     if (!forgotEmail.trim()) {
@@ -320,68 +365,171 @@ function LoginPanel({ onLoginSuccess }: { onLoginSuccess: () => void }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100vh", gap: "20px" }}>
       <h1>🔐 A-11 Login</h1>
-      <form onSubmit={handleLogin} style={{ display: "flex", flexDirection: "column", gap: "15px", minWidth: "300px" }}>
-        <input
-          type="text"
-          placeholder="Username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          disabled={loading}
-          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
-        />
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          disabled={loading}
-          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
-        />
+      <div style={{ display: "flex", gap: "10px", marginBottom: "8px" }}>
         <button
-          type="submit"
-          disabled={loading}
+          type="button"
+          onClick={() => switchMode("login")}
           style={{
-            padding: "10px 20px",
-            borderRadius: "4px",
-            border: "none",
-            background: "#007bff",
+            padding: "10px 16px",
+            borderRadius: "999px",
+            border: "1px solid #334155",
+            background: mode === "login" ? "#7c3aed" : "#0f172a",
             color: "white",
             cursor: "pointer",
             fontWeight: "bold"
           }}
         >
-          {loading ? "Logging in..." : "Login"}
+          Login
         </button>
-        {error && <div style={{ color: "red", fontSize: "14px" }}>{error}</div>}
-      </form>
-      <form onSubmit={handleForgot} style={{ display: "flex", flexDirection: "column", gap: "10px", minWidth: "300px", marginTop: "10px" }}>
-        <div style={{ fontSize: "13px", color: "#94a3b8" }}>Mot de passe oublié ?</div>
-        <input
-          type="email"
-          placeholder="Ton email"
-          value={forgotEmail}
-          onChange={(e) => setForgotEmail(e.target.value)}
-          disabled={forgotLoading}
-          style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
-        />
         <button
-          type="submit"
-          disabled={forgotLoading}
+          type="button"
+          onClick={() => switchMode("register")}
           style={{
-            padding: "10px 20px",
-            borderRadius: "4px",
+            padding: "10px 16px",
+            borderRadius: "999px",
             border: "1px solid #334155",
-            background: "#0f172a",
-            color: "#e2e8f0",
+            background: mode === "register" ? "#7c3aed" : "#0f172a",
+            color: "white",
             cursor: "pointer",
             fontWeight: "bold"
           }}
         >
-          {forgotLoading ? "Envoi..." : "Envoyer le lien de reset"}
+          S'inscrire
         </button>
-        {forgotError && <div style={{ color: "red", fontSize: "13px" }}>{forgotError}</div>}
-        {forgotSent && <div style={{ color: "#22c55e", fontSize: "13px" }}>Si l'email existe, un lien a ete envoye.</div>}
-      </form>
+        <button
+          type="button"
+          onClick={() => switchMode("forgot")}
+          style={{
+            padding: "10px 16px",
+            borderRadius: "999px",
+            border: "1px solid #334155",
+            background: mode === "forgot" ? "#7c3aed" : "#0f172a",
+            color: "white",
+            cursor: "pointer",
+            fontWeight: "bold"
+          }}
+        >
+          Reset
+        </button>
+      </div>
+      {mode === "login" && (
+        <form onSubmit={handleLogin} style={{ display: "flex", flexDirection: "column", gap: "15px", minWidth: "300px" }}>
+          <input
+            type="text"
+            placeholder="Username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <button
+            type="submit"
+            disabled={loading}
+            style={{
+              padding: "10px 20px",
+              borderRadius: "4px",
+              border: "none",
+              background: "#007bff",
+              color: "white",
+              cursor: "pointer",
+              fontWeight: "bold"
+            }}
+          >
+            {loading ? "Logging in..." : "Login"}
+          </button>
+        </form>
+      )}
+      {mode === "register" && (
+        <form onSubmit={handleRegister} style={{ display: "flex", flexDirection: "column", gap: "15px", minWidth: "300px" }}>
+          <input
+            type="text"
+            placeholder="Pseudo"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <input
+            type="email"
+            placeholder="Email"
+            value={registerEmail}
+            onChange={(e) => setRegisterEmail(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <input
+            type="password"
+            placeholder="Mot de passe"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <input
+            type="password"
+            placeholder="Confirmer le mot de passe"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            disabled={loading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <button
+            type="submit"
+            disabled={loading}
+            style={{
+              padding: "10px 20px",
+              borderRadius: "4px",
+              border: "none",
+              background: "#7c3aed",
+              color: "white",
+              cursor: "pointer",
+              fontWeight: "bold"
+            }}
+          >
+            {loading ? "Creation..." : "S'inscrire"}
+          </button>
+        </form>
+      )}
+      {mode === "forgot" && (
+        <form onSubmit={handleForgot} style={{ display: "flex", flexDirection: "column", gap: "10px", minWidth: "300px", marginTop: "10px" }}>
+          <div style={{ fontSize: "13px", color: "#94a3b8" }}>Mot de passe oublié ?</div>
+          <input
+            type="email"
+            placeholder="Ton email"
+            value={forgotEmail}
+            onChange={(e) => setForgotEmail(e.target.value)}
+            disabled={forgotLoading}
+            style={{ padding: "10px", borderRadius: "4px", border: "1px solid #ccc" }}
+          />
+          <button
+            type="submit"
+            disabled={forgotLoading}
+            style={{
+              padding: "10px 20px",
+              borderRadius: "4px",
+              border: "1px solid #334155",
+              background: "#0f172a",
+              color: "#e2e8f0",
+              cursor: "pointer",
+              fontWeight: "bold"
+            }}
+          >
+            {forgotLoading ? "Envoi..." : "Envoyer le lien de reset"}
+          </button>
+          {forgotError && <div style={{ color: "red", fontSize: "13px" }}>{forgotError}</div>}
+          {forgotSent && <div style={{ color: "#22c55e", fontSize: "13px" }}>Si l'email existe, un lien a ete envoye.</div>}
+        </form>
+      )}
+      {error && <div style={{ color: "red", fontSize: "14px", maxWidth: "320px", textAlign: "center" }}>{error}</div>}
+      {info && <div style={{ color: "#22c55e", fontSize: "14px", maxWidth: "320px", textAlign: "center" }}>{info}</div>}
       <p style={{ fontSize: "12px", color: "#999" }}>Admin: Djeff / 1991</p>
     </div>
   );

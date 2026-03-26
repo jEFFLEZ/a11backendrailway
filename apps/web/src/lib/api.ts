@@ -51,6 +51,37 @@ export async function login(username: string, password: string) {
   throw new Error(data.error || 'Login failed');
 }
 
+export async function register(username: string, email: string, password: string) {
+  const res = await fetch(getApiUrl('/api/auth/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, email, password })
+  });
+
+  let data: any = {};
+  try {
+    data = await res.json();
+  } catch {
+    // ignore
+  }
+
+  if (!res.ok) {
+    if (data.error === 'username_taken') {
+      throw new Error("Ce nom d'utilisateur est deja pris");
+    }
+    if (data.error === 'email_taken') {
+      throw new Error("Cet email est deja utilise");
+    }
+    throw new Error(data.error || 'Register failed');
+  }
+
+  if (data.token) {
+    setAuthToken(data.token);
+  }
+
+  return data;
+}
+
 export async function forgotPassword(email: string) {
   const res = await fetch(getApiUrl('/api/auth/forgot-password'), {
     method: 'POST',
