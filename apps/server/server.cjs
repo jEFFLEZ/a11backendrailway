@@ -548,7 +548,7 @@ async function saveChatMemoryMessage(userId, role, content, conversationId) {
   );
 }
 
-async function getRecentChatMemory(userId, limit = CHAT_MEMORY_LIMIT, conversationId) {
+async function getRecentChatMemory(userId, conversationId, limit = CHAT_MEMORY_LIMIT) {
   const normalizedUserId = String(userId || '').trim();
   const normalizedConversationId = normalizeConversationId(conversationId);
   if (!db || !normalizedUserId) return [];
@@ -1962,9 +1962,9 @@ function sanitizePromptMessages(messages) {
     const content = typeof message?.content === 'string' ? message.content.trim() : '';
     if (!role || !content) continue;
 
-    const previous = sanitized[sanitized.length - 1];
+    const previous = sanitized.at(-1);
     // Drop accidental adjacent duplicates that can create echo effects.
-    if (previous && previous.role === role && previous.content === content) continue;
+    if (previous?.role === role && previous?.content === content) continue;
 
     sanitized.push({ role, content });
   }
@@ -1980,7 +1980,7 @@ function buildPromptFromMessages(messages) {
   const lines = sanitized.map((message) => `${message.role}: ${message.content}`);
 
   // Force one assistant turn completion and avoid continuing previous assistant text.
-  const lastRole = sanitized[sanitized.length - 1]?.role;
+  const lastRole = sanitized.at(-1)?.role;
   if (lastRole !== 'assistant') {
     lines.push('assistant:');
   }
