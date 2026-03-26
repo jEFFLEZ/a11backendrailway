@@ -1,13 +1,23 @@
 #!/bin/bash
 set -e
 
+# Ensure espeak-ng is installed (for Railway Ubuntu/Debian containers)
+if ! command -v espeak-ng >/dev/null 2>&1; then
+    echo "[TTS] Installing espeak-ng..."
+    apt-get update && apt-get install -y espeak-ng
+fi
+
 # Download Piper if not present
 if [ ! -f "/usr/local/bin/piper" ]; then
-    echo "Downloading Piper..."
-    wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
-    tar -xvf piper_linux_x86_64.tar.gz
-    chmod +x piper
-    mv piper/piper /usr/local/bin/piper
+        echo "Downloading Piper..."
+        wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
+        tar -xvf piper_linux_x86_64.tar.gz
+        chmod +x piper
+        mv piper/piper /usr/local/bin/piper
+fi
+
+# Start the TTS Python server
+python3 ./apps/tts/siwis.py
     rm piper_linux_x86_64.tar.gz
 fi
 

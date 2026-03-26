@@ -3,7 +3,7 @@ const express = require('express');
 const app = express();
 
 // --- Endpoint de healthcheck Railway ---
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 // ...existing code...
 // --- .env first ---
 const path = require('node:path');
@@ -1841,8 +1841,7 @@ app.get('/api/system-prompt', (_req, res) => {
   }
 });
 
-// Health check for Railway (expects /health)
-app.get('/health', (_req, res) => res.send('OK'));
+
 
 // Proxy /api/llm/stats to the configured LLM router (Cerbère) or DEFAULT_UPSTREAM
 let __stats_cache = null;

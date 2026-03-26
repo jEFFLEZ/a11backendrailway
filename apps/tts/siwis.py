@@ -353,6 +353,7 @@ class TTSHandler(BaseHTTPRequestHandler):
         # TODO: Refactor cette méthode pour réduire la complexité
         # Simple health endpoint for probes
         if parsed.path == "/health":
+            print("[TTS] /health called")
             try:
                 info = {"ok": True, "service": "siwis-tts", "model": os.path.basename(MODEL_PATH)}
                 self._send_json(info, 200)
