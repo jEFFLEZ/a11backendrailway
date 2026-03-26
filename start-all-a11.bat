@@ -7,7 +7,7 @@ echo [A11] Lancement du serveur TTS...
 set "TTS_MODEL_PATH=%~dp0apps\tts\fr_FR-siwis-medium.onnx"
 set "MODEL_URL=file:///%TTS_MODEL_PATH%"
 if exist "%TTS_MODEL_PATH%" (
-    start "TTS" cmd /k "cd /d %~dp0apps\tts && set MODEL_URL=%MODEL_URL% && set CONFIG_URL=%MODEL_URL%.json && python serve.py"
+    start "TTS" cmd /k "cd /d %~dp0apps\tts && set MODEL_URL=%MODEL_URL% && set CONFIG_URL=%MODEL_URL%.json && python siwis.py"
 ) else (
     echo [ERR] Modèle TTS introuvable : %TTS_MODEL_PATH%"
 )
