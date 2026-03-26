@@ -2920,6 +2920,14 @@ function getLocalLlamaCompletionUrl() {
   return `${base.replace(/\/$/, '')}/completion`;
 }
 
+function shouldFallbackToLocalOnOpenAIError(err) {
+  const status = Number(err?.response?.status || 0);
+  const code = String(err?.response?.data?.error?.code || '').trim().toLowerCase();
+  if (status === 429 && code === 'insufficient_quota') return true;
+  if (status === 401 && code === 'invalid_issuer') return true;
+  return false;
+}
+
 function normalizeChatRole(role) {
   const normalized = String(role || '').trim().toLowerCase();
   if (normalized === 'system' || normalized === 'assistant' || normalized === 'user') return normalized;
@@ -3833,6 +3841,21 @@ async function proxyChatToOpenAI(req, res) {
 
     return res.status(upstreamRes.status).json(data);
   } catch (err) {
+    const localFallbackUrl = getLocalLlamaCompletionUrl();
+    if (provider !== 'local' && localFallbackUrl && shouldFallbackToLocalOnOpenAIError(err)) {
+      console.warn('[A11] OpenAI unavailable, falling back to LOCAL_LLM_URL ->', localFallbackUrl);
+      return proxyLocalLlamaCompletion(
+        req,
+        res,
+        localFallbackUrl,
+        {
+          ...upstreamBody,
+          provider: 'local',
+          model: String(process.env.LOCAL_DEFAULT_MODEL || upstreamBody?.model || 'llama3.2:latest'),
+        }
+      );
+    }
+
     console.error('[A11] Error proxying chat ->', upstreamUrl, err && (err.message || err.toString()));
     if (err.response?.data) {
       return res.status(err.response.status || 502).json(err.response.data);
