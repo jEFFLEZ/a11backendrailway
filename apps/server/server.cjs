@@ -1,5 +1,5 @@
 // --- Endpoint API TTS universel --- (déplacé après la création de app)
-const app = express();
+// ...existing code...
 
 // --- Endpoint de healthcheck Railway ---
 app.get('/health', (req, res) => res.json({ ok: true }));
