@@ -7,7 +7,7 @@ if [ ! -f "/usr/local/bin/piper" ]; then
     wget https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz
     tar -xvf piper_linux_x86_64.tar.gz
     chmod +x piper
-    mv piper /usr/local/bin/piper
+    mv piper/piper /usr/local/bin/piper
     rm piper_linux_x86_64.tar.gz
 fi
 
