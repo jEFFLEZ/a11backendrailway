@@ -2858,6 +2858,55 @@ function getOpenAICompletionsUrl() {
   return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
 }
 
+function extractLowercaseOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    return parsed.origin.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function getRequestOrigin(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const host = forwardedHost || String(req.headers.host || '').trim();
+  const proto = forwardedProto || req.protocol || 'http';
+  if (!host) return '';
+  return `${proto}://${host}`.toLowerCase();
+}
+
+function isRecursiveOpenAIUpstream(req, upstreamUrl) {
+  const normalizedUpstream = String(upstreamUrl || '').trim();
+  if (!normalizedUpstream) return false;
+
+  const upstreamOrigin = extractLowercaseOrigin(normalizedUpstream);
+  if (!upstreamOrigin) return false;
+
+  const candidateOrigins = new Set();
+  const requestOrigin = getRequestOrigin(req);
+  if (requestOrigin) candidateOrigins.add(requestOrigin);
+
+  const publicApiUrl = String(process.env.PUBLIC_API_URL || process.env.API_URL || '').trim();
+  const publicApiOrigin = extractLowercaseOrigin(publicApiUrl);
+  if (publicApiOrigin) candidateOrigins.add(publicApiOrigin);
+
+  const railwayPublicDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
+  if (railwayPublicDomain) {
+    candidateOrigins.add(`https://${railwayPublicDomain}`.toLowerCase());
+    candidateOrigins.add(`http://${railwayPublicDomain}`.toLowerCase());
+  }
+
+  try {
+    const parsedUpstream = new URL(normalizedUpstream);
+    return candidateOrigins.has(upstreamOrigin) && parsedUpstream.pathname === '/v1/chat/completions';
+  } catch {
+    return false;
+  }
+}
+
 function getLocalCompletionsUrl() {
   const base = String(process.env.LLAMA_BASE || '').trim();
   if (!base) return null;
@@ -3733,6 +3782,16 @@ async function proxyChatToOpenAI(req, res) {
       ok: false,
       error: 'missing_local_upstream',
       message: 'provider=local requires LOCAL_LLM_URL or LLAMA_BASE, or enable QFLUSH chat with QFLUSH_CHAT_FLOW.'
+    });
+  }
+
+  if (provider !== 'local' && isRecursiveOpenAIUpstream(req, upstreamUrl)) {
+    console.error('[A11] Recursive OPENAI_BASE_URL detected:', upstreamUrl);
+    return res.status(503).json({
+      ok: false,
+      error: 'recursive_openai_base_url',
+      message: 'OPENAI_BASE_URL points to this same A11 API. Configure a real upstream LLM base URL such as https://api.openai.com/v1, or use LOCAL_LLM_URL/LLAMA_BASE/QFLUSH instead.',
+      upstreamUrl,
     });
   }
   console.log('[A11] USING', provider === 'local' ? 'LLAMA_BASE' : 'OPENAI', '->', upstreamUrl);
