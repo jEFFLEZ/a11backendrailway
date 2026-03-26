@@ -3009,6 +3009,33 @@ function normalizeAssistantOutput(value) {
     text = text.slice(0, cutAt).trim();
   }
 
+  const dedupedLines = [];
+  let previousLineKey = '';
+  for (const line of text.split(/\r?\n/)) {
+    const normalizedLine = line.trim();
+    const lineKey = normalizedLine.toLowerCase().replace(/\s+/g, ' ');
+    if (lineKey && lineKey === previousLineKey) continue;
+    dedupedLines.push(line);
+    previousLineKey = lineKey;
+  }
+  text = dedupedLines.join('\n').trim();
+
+  const blocks = text
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  if (blocks.length > 1) {
+    const dedupedBlocks = [];
+    let previousBlockKey = '';
+    for (const block of blocks) {
+      const blockKey = block.toLowerCase().replace(/\s+/g, ' ');
+      if (blockKey && blockKey === previousBlockKey) continue;
+      dedupedBlocks.push(block);
+      previousBlockKey = blockKey;
+    }
+    text = dedupedBlocks.join('\n\n').trim();
+  }
+
   return text;
 }
 
@@ -3106,8 +3133,31 @@ function normalizeActionEnvelopeShape(candidate, defaults = {}) {
   };
 }
 
-function parseAssistantActionEnvelope(value, defaults = {}) {
+function extractJsonObjectCandidate(value) {
   const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch?.[1]) {
+    const candidate = fencedMatch[1].trim();
+    if (candidate) return candidate;
+  }
+
+  if (raw.startsWith('{') && raw.endsWith('}')) {
+    return raw;
+  }
+
+  const firstBrace = raw.indexOf('{');
+  const lastBrace = raw.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return raw.slice(firstBrace, lastBrace + 1).trim();
+  }
+
+  return '';
+}
+
+function parseAssistantActionEnvelope(value, defaults = {}) {
+  const raw = extractJsonObjectCandidate(value);
   if (!raw.startsWith('{') || !raw.endsWith('}')) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -3154,6 +3204,7 @@ async function resolveAssistantActionEnvelope({
   allowDevActions = false,
   conversationId,
   userId,
+  requestOrigin = '',
 }) {
   const envelope = parseAssistantActionEnvelope(content, { conversationId, userId });
   if (!envelope) {
@@ -3183,7 +3234,7 @@ async function resolveAssistantActionEnvelope({
 
   const cerbere = await runActionsEnvelope(envelope);
   let explanation = summarizeCerbereResults(cerbere);
-  const publicImageUrl = extractImagePathFromCerbere(cerbere);
+  const publicImageUrl = extractImagePathFromCerbere(cerbere, requestOrigin);
   if (publicImageUrl) {
     explanation += `\n\n![resultat](${publicImageUrl})`;
   }
@@ -3635,6 +3686,7 @@ async function proxyQflushChat(req, res) {
       allowDevActions: req.body?.a11Dev === true,
       conversationId,
       userId,
+      requestOrigin: getRequestOrigin(req),
     });
     const content = resolvedAssistant.content;
     if (userId && content) {
@@ -3712,6 +3764,7 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
       allowDevActions: body?.a11Dev === true,
       conversationId,
       userId,
+      requestOrigin: getRequestOrigin(req),
     });
     const content = resolvedAssistant.content;
     const data = {
@@ -3836,6 +3889,7 @@ async function proxyChatToOpenAI(req, res) {
       allowDevActions: req.body?.a11Dev === true,
       conversationId,
       userId,
+      requestOrigin: getRequestOrigin(req),
     });
     const content = resolvedAssistant.content;
     applyAssistantTextToPayload(data, content, resolvedAssistant.extras);
@@ -4098,8 +4152,25 @@ function summarizeCerbereResults(cerbere) {
     const parts = actions.map((a) => {
       const ok = a?.result?.ok ?? a?.ok;
       const tool = a?.name || a?.tool || a?.action || 'action';
-      const status = ok ? 'ok' : 'erreur';
-      return `• ${tool} → ${status}`;
+      const result = a?.result || {};
+      const outputPath = String(result.outputPath || result.path || result.filePath || '').trim();
+      const label = outputPath ? path.basename(outputPath) : '';
+      if (!ok) {
+        return `• ${tool} → erreur${a?.error ? ` (${a.error})` : ''}`;
+      }
+      if (tool === 'generate_png') {
+        return `• Image générée${label ? ` (${label})` : ''}`;
+      }
+      if (tool === 'generate_pdf') {
+        return `• PDF généré${label ? ` (${label})` : ''}`;
+      }
+      if (tool === 'download_file') {
+        return `• Fichier téléchargé${label ? ` (${label})` : ''}`;
+      }
+      if (tool === 'write_file') {
+        return `• Fichier écrit${label ? ` (${label})` : ''}`;
+      }
+      return `• ${tool} → ok`;
     });
     if (!parts.length) return 'Actions exécutées par Cerbère.';
     return ['Actions exécutées par Cerbère :', ...parts].join('\n');
@@ -4108,7 +4179,25 @@ function summarizeCerbereResults(cerbere) {
   }
 }
 
-function toPublicWorkspaceFileUrl(candidatePath) {
+function getPublicFilesBaseUrl(requestOrigin = '') {
+  const explicitPublicApi = String(process.env.PUBLIC_API_URL || process.env.API_URL || '').trim();
+  if (explicitPublicApi) {
+    try {
+      return new URL(explicitPublicApi).origin;
+    } catch {
+      // ignore malformed config and keep falling back
+    }
+  }
+
+  const railwayPublicDomain = String(process.env.RAILWAY_PUBLIC_DOMAIN || '').trim();
+  if (railwayPublicDomain) {
+    return `https://${railwayPublicDomain}`;
+  }
+
+  return String(requestOrigin || '').trim();
+}
+
+function toPublicWorkspaceFileUrl(candidatePath, requestOrigin = '') {
   const raw = String(candidatePath || '').trim();
   if (!raw) return null;
   const absolutePath = path.isAbsolute(raw) ? raw : path.resolve(WORKSPACE_ROOT, raw);
@@ -4116,10 +4205,17 @@ function toPublicWorkspaceFileUrl(candidatePath) {
   if (!relativePath || relativePath.startsWith('..')) {
     return null;
   }
-  return `/files/${relativePath}`;
+  const encodedRelativePath = relativePath
+    .split('/')
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+  const publicPath = `/files/${encodedRelativePath}`;
+  const baseUrl = getPublicFilesBaseUrl(requestOrigin);
+  return baseUrl ? `${baseUrl}${publicPath}` : publicPath;
 }
 
-function extractImagePathFromCerbere(cerbere) {
+function extractImagePathFromCerbere(cerbere, requestOrigin = '') {
   let actions = [];
   if (Array.isArray(cerbere?.results)) {
     actions = cerbere.results;
@@ -4131,7 +4227,7 @@ function extractImagePathFromCerbere(cerbere) {
     const r = a?.result || {};
     const p = r.outputPath || r.path || r.savedAs || r.filePath;
     if ((tool === 'download_file' || tool === 'generate_png' || tool === 'generate_image') && typeof p === 'string' && p.length > 0) {
-      return toPublicWorkspaceFileUrl(p) || p;
+      return toPublicWorkspaceFileUrl(p, requestOrigin) || p;
     }
   }
   return null;
@@ -4184,6 +4280,7 @@ app.post('/api/agent', express.json(), async (req, res) => {
       allowDevActions: true,
       conversationId,
       userId,
+      requestOrigin: getRequestOrigin(req),
     });
 
     return res.json({
