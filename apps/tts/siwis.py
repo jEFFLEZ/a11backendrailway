@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import json
 import os
+import traceback
 import subprocess
 import uuid
 import wave
@@ -61,6 +62,7 @@ def get_wav_duration(path: str) -> float:
             return frames / float(rate)
     except Exception as e:
         print("[TTS] get_wav_duration error:", e)
+        traceback.print_exc()
         return 0.0
 
 
@@ -198,6 +200,7 @@ def generate_gif_for_wav(wav_path: str, gif_template: str = None) -> str:
         return out_gif
     except Exception as e:
         print("[TTS] Erreur génération GIF:", e)
+        traceback.print_exc()
         return ""
 
 
@@ -240,6 +243,7 @@ def synthesize(text: str) -> str:
             raise RuntimeError(f"Piper a retourné le code {result.returncode}")
     except Exception as e:
         print("[TTS] Erreur appel Piper:", e)
+        traceback.print_exc()
         raise
 
     # Après génération du WAV, on génère automatiquement le GIF synchronisé (si Pillow dispo)
@@ -263,6 +267,7 @@ def synthesize(text: str) -> str:
             print("[TTS] Erreur notify A-11:", e)
     except Exception as e:
         print("[TTS] Erreur lors de la génération automatique du GIF:", e)
+        traceback.print_exc()
 
     return out_path, fname, gif_path, gif_ms  # type: ignore
 
@@ -285,6 +290,7 @@ def notify_a11_avatar(gif_path: str, endpoint: str = "http://127.0.0.1:3000/api/
                 print(f"[TTS][AVATAR] notify A-11: {r.status_code} {r.text}")
             except Exception as e:
                 print("[TTS][AVATAR] requests.post failed:", e)
+                traceback.print_exc()
         else:
             req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method='POST')
             try:
@@ -293,8 +299,10 @@ def notify_a11_avatar(gif_path: str, endpoint: str = "http://127.0.0.1:3000/api/
                     print(f"[TTS][AVATAR] notify A-11 urllib: {resp.status} {body}")
             except urllib.error.URLError as e:
                 print("[TTS][AVATAR] urllib request failed:", e)
+                traceback.print_exc()
     except Exception as e:
         print("[TTS][AVATAR] notify error:", e)
+        traceback.print_exc()
 
 
 class TTSHandler(BaseHTTPRequestHandler):
@@ -327,6 +335,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                 self._send_json(info, 200)
             except Exception as e:
                 print('[TTS] health handler error:', e)
+                traceback.print_exc()
                 self._send_json({"ok": False, "error": str(e)}, 500)
             return
         if parsed.path == "/api/tts":
@@ -346,6 +355,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                 self._send_json(resp, 200)
             except Exception as e:
                 print("[TTS] Erreur:", e)
+                traceback.print_exc()
                 self._send_json({"status": "error", "error": str(e)}, 500)
             return
         if parsed.path.startswith("/out/"):
@@ -411,9 +421,10 @@ class TTSHandler(BaseHTTPRequestHandler):
                 resp["gif_url"] = f"http://127.0.0.1:5002/out/{os.path.basename(gif_path)}"
                 resp["gif_duration_ms"] = gif_ms
             self._send_json(resp, 200)
-        except Exception as e:
-            print("[TTS] Erreur:", e)
-            self._send_json({"status": "error", "error": str(e)}, 500)
+            except Exception as e:
+                print("[TTS] Erreur:", e)
+                traceback.print_exc()
+                self._send_json({"status": "error", "error": str(e)}, 500)
 
 
 if __name__ == "__main__":
