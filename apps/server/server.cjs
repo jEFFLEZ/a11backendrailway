@@ -1679,7 +1679,7 @@ registerOpenAIRoutes(router);
 
 // Routes A11Host (VSIX + headless)
 const a11HostRouter = Router();
-a11HostRouter.use((req, res, next) => verifyJWT(req, res, next));
+a11HostRouter.use('/v1/vs', (req, res, next) => verifyJWT(req, res, next));
 registerA11HostRoutes(a11HostRouter);
 router.use(a11HostRouter);
 
