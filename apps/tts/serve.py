@@ -1,43 +1,4 @@
-import os
 raise SystemExit("[TTS] Deprecated: use siwis.py as the main server entrypoint.")
-    return text.strip()
-
-# --- SYNTH ---
-def synthesize(text):
-    text = clean_text(text)
-    if not text:
-        text = "Bonjour"
-
-    fname = f"{uuid.uuid4().hex}.wav"
-    out_path = os.path.join(OUT_DIR, fname)
-
-    env = os.environ.copy()
-    env["ESPEAK_DATA_PATH"] = ESPEAK_DATA
-
-    cmd = [
-        PIPER_EXE,
-        "-m", MODEL_PATH,
-        "--output_file", out_path,
-    ]
-
-    print("[TTS] ▶", text)
-
-    # Always use shell=False, and PIPER_EXE is absolute on Windows
-    result = subprocess.run(
-        cmd,
-        input=text.encode("utf-8"),
-        capture_output=True,
-        env=env,
-        shell=False
-    )
-
-    print("[TTS] stdout:", result.stdout.decode(errors="ignore"))
-    print("[TTS] stderr:", result.stderr.decode(errors="ignore"))
-
-    if result.returncode != 0:
-        raise RuntimeError("Piper error")
-
-    return fname
 
 # --- SERVER ---
 class Handler(BaseHTTPRequestHandler):
