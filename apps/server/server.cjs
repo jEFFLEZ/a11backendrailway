@@ -4226,6 +4226,9 @@ function extractImagePathFromCerbere(cerbere, requestOrigin = '') {
     const tool = a?.name || a?.tool || a?.action;
     const r = a?.result || {};
     const p = r.outputPath || r.path || r.savedAs || r.filePath;
+    if (r?.ok === false) {
+      continue;
+    }
     if ((tool === 'download_file' || tool === 'generate_png' || tool === 'generate_image') && typeof p === 'string' && p.length > 0) {
       return toPublicWorkspaceFileUrl(p, requestOrigin) || p;
     }

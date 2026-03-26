@@ -50,6 +50,23 @@ function buildGeneratedAssetPath(filename, label = 'generated.outputPath') {
   return resolveSafePath(path.join('generated', filename), label);
 }
 
+function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path') {
+  const fallbackName = `download-${Date.now()}.png`;
+  let filename = fallbackName;
+  try {
+    const parsed = new URL(String(sourceUrl || ''));
+    const rawName = path.basename(parsed.pathname || '') || '';
+    const ext = path.extname(rawName).toLowerCase();
+    const baseName = path.basename(rawName, ext);
+    const safeBase = slugifyAssetSegment(baseName || 'download', 'download');
+    const safeExt = /\.(png|jpe?g|gif|webp)$/i.test(ext) ? ext : '.png';
+    filename = `${safeBase}-${Date.now()}${safeExt}`;
+  } catch {
+    filename = fallbackName;
+  }
+  return resolveSafePath(path.join('downloads', filename), label);
+}
+
 function parseImageSize(value, fallbackWidth = 1024, fallbackHeight = 1024) {
   const raw = String(value || '').trim().toLowerCase();
   const match = /^(\d{2,4})\s*[xX]\s*(\d{2,4})$/.exec(raw);
@@ -129,7 +146,6 @@ async function saveFacts(obj) {
 
 async function t_download_file(args = {}) {
   const { url } = args;
-  const filePath = resolveSafePath(args.path || args.outputPath, "download_file.path");
 
   if (!url || typeof url !== 'string') {
     throw new Error('download_file: missing "url"');
@@ -146,13 +162,17 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath || null,
+      outputPath: null,
       error: 'invalid_dummy_url',
       message:
         'download_file: refused dummy URL (example.com / dummy / about:blank / data:). ' +
         'Le LLM doit appeler web_search puis utiliser une URL réelle.'
     };
   }
+
+  const filePath = args.path || args.outputPath
+    ? resolveSafePath(args.path || args.outputPath, 'download_file.path')
+    : buildDownloadedAssetPath(url, 'download_file.path');
 
   // 🔒 N'accepte que des extensions d'image directes
   function looksLikeImageUrl(url) {
