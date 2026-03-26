@@ -20,7 +20,7 @@ ROOT_DIR = os.path.dirname(__file__)
 if os.name == "nt":
     PIPER_EXE = os.path.join(ROOT_DIR, "piper.exe")
 else:
-    PIPER_EXE = os.path.join(ROOT_DIR, "piper")
+    PIPER_EXE = "/usr/local/bin/piper"
 MODEL_PATH = os.path.join(ROOT_DIR, "fr_FR-siwis-medium.onnx")
 print("[TTS] MODEL_PATH:", MODEL_PATH)
 print("[TTS] EXISTS:", os.path.exists(MODEL_PATH))
