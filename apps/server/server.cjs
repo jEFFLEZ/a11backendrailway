@@ -5770,27 +5770,55 @@ function buildA11AgentInjectedContext(messages, toolResults = []) {
 }
 
 async function callA11LLM(messages, options = {}) {
-  const backend = BACKENDS.llama_local;
-  const upstreamUrl = `${backend.replace(/\/$/, '')}/v1/chat/completions`;
   const injectedContext = buildA11AgentInjectedContext(messages, options.toolResults);
+  const promptMessages = [
+    { role: 'system', content: A11_AGENT_SYSTEM_PROMPT },
+    { role: 'system', content: A11_AGENT_DEV_PROMPT },
+    { role: 'user', content: injectedContext }
+  ];
   const body = {
     model: 'llama3.2:latest',
-    messages: [
-      { role: 'system', content: A11_AGENT_SYSTEM_PROMPT },
-      { role: 'system', content: A11_AGENT_DEV_PROMPT },
-      { role: 'user', content: injectedContext }
-    ],
+    messages: promptMessages,
     stream: false
   };
-  const res = await fetch(upstreamUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) throw new Error(`A11 LLM error: ${res.status} – ${await res.text()}`);
-  const data = await res.json();
-  const content = data.choices?.[0]?.message?.content ?? data.choices?.[0]?.delta?.content ?? '';
-  return content.toString().trim();
+  const localChatUrl = getLocalCompletionsUrl();
+  if (localChatUrl) {
+    const res = await fetch(localChatUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error(`A11 LLM error: ${res.status} – ${await res.text()}`);
+    const data = await res.json();
+    const content =
+      data?.choices?.[0]?.message?.content ??
+      data?.choices?.[0]?.delta?.content ??
+      extractAssistantText(data) ??
+      '';
+    return String(content || '').trim();
+  }
+
+  const localCompletionUrl = getLocalLlamaCompletionUrl();
+  if (localCompletionUrl) {
+    const prompt = buildPromptFromMessages(promptMessages);
+    const upstreamRes = await axios({
+      method: 'post',
+      url: localCompletionUrl,
+      headers: { 'content-type': 'application/json' },
+      data: {
+        prompt,
+        n_predict: Number(process.env.A11_AGENT_MAX_TOKENS || 700),
+        stream: false
+      },
+      timeout: 60000,
+    });
+    return extractLocalCompletionContent(upstreamRes.data).trim();
+  }
+
+  return normalizeAssistantOutput(await callChatBackend(promptMessages, {
+    provider: getMemorySummaryProvider(),
+    model: process.env.A11_AGENT_MODEL || process.env.MEMORY_SUMMARY_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
+  }));
 }
 
 // --- Helpers Cerbère -> A-11 ---
