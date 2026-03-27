@@ -1892,6 +1892,99 @@ app.get('/api/a11/capabilities', verifyJWT, async (_req, res) => {
   }
 });
 
+app.get('/api/control/status', verifyJWT, async (req, res) => {
+  try {
+    const status = await buildControlCenterStatus(req);
+    res.json(status);
+  } catch (err) {
+    console.warn('[A11] Control status failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/control/:command', verifyJWT, requireRuntimeControlAccess, async (req, res) => {
+  try {
+    const command = String(req.params.command || '').trim().toLowerCase();
+    const target = String(req.body?.target || '').trim().toLowerCase();
+    const supervisor = getSupervisorInstance();
+    if (!supervisor) {
+      return res.status(503).json({
+        ok: false,
+        error: 'supervisor_unavailable',
+        message: 'Supervisor local indisponible.',
+      });
+    }
+
+    if (!['start', 'stop', 'restart'].includes(command)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'unsupported_command',
+        message: 'Commande non supportee.',
+      });
+    }
+
+    const availableTargets = Object.keys(qflushIntegration.getStatus(supervisor)?.processes || {});
+    if (!availableTargets.length) {
+      return res.status(503).json({
+        ok: false,
+        error: 'no_supervised_targets',
+        message: 'Aucun service supervise n est disponible sur ce backend.',
+      });
+    }
+
+    const targets = target === 'stack' ? availableTargets : [target];
+    const invalidTargets = targets.filter((candidate) => !availableTargets.includes(candidate));
+    if (invalidTargets.length) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_target',
+        message: `Cible invalide: ${invalidTargets.join(', ')}`,
+        availableTargets,
+      });
+    }
+
+    const results = [];
+    for (const currentTarget of targets) {
+      try {
+        let actionOk = false;
+        if (command === 'start') {
+          actionOk = await qflushIntegration.startProcess(supervisor, currentTarget);
+        } else if (command === 'stop') {
+          actionOk = await qflushIntegration.stopProcess(supervisor, currentTarget);
+        } else {
+          actionOk = await qflushIntegration.restartProcess(supervisor, currentTarget);
+        }
+
+        results.push({
+          target: currentTarget,
+          ok: !!actionOk,
+          message: actionOk ? `${command} demande` : `${command} refuse ou non disponible`,
+        });
+      } catch (error_) {
+        results.push({
+          target: currentTarget,
+          ok: false,
+          message: String(error_?.message || error_),
+        });
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const status = await buildControlCenterStatus(req);
+
+    res.json({
+      ok: results.every((entry) => entry.ok),
+      action: command,
+      target: target || 'stack',
+      results,
+      status,
+    });
+  } catch (err) {
+    console.warn('[A11] Control action failed:', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 function isAdminRequest(req) {
   const configuredAdminToken = String(process.env.NEZ_ADMIN_TOKEN || '').trim();
   const adminHeader = String(req.headers['x-nez-admin'] || '').trim();
@@ -1903,6 +1996,206 @@ function isAdminRequest(req) {
   const username = String(req.user?.username || '').trim().toLowerCase();
   const normalizedDefaultAdmin = DEFAULT_ADMIN_USERNAME.toLowerCase();
   return userId === 'admin' || username === 'admin' || username === normalizedDefaultAdmin;
+}
+
+function getSupervisorInstance() {
+  return globalThis.__A11_SUPERVISOR || globalThis.__A11_QFLUSH_SUPERVISOR || null;
+}
+
+function isLocalControlOrigin(req) {
+  const requestOrigin = String(getRequestOrigin(req) || '').toLowerCase();
+  const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').toLowerCase();
+  const candidates = [requestOrigin, requestHost].filter(Boolean);
+  return candidates.some((value) =>
+    value.includes('127.0.0.1') ||
+    value.includes('localhost') ||
+    value.includes('api.funesterie.me')
+  );
+}
+
+function requireRuntimeControlAccess(req, res, next) {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({
+      ok: false,
+      error: 'admin_required',
+      message: 'Controle runtime reserve au compte admin.',
+    });
+  }
+
+  if (!isLocalControlOrigin(req)) {
+    return res.status(403).json({
+      ok: false,
+      error: 'local_control_only',
+      message: 'Les actions start/stop/restart sont autorisees uniquement via le backend local ou tunnelé.',
+    });
+  }
+
+  return next();
+}
+
+async function getLlmStatsSnapshot() {
+  const port = Number(process.env.PORT || 3000);
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const response = await fetch(`${baseUrl}/api/llm/stats`, {
+    method: 'GET',
+    signal: AbortSignal.timeout(4000),
+  });
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    body = { raw: String(raw).slice(0, 400) };
+  }
+  return {
+    ok: response.ok,
+    status: response.status,
+    body,
+  };
+}
+
+function toControlServiceState(value, fallback = 'warning') {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'running' || normalized === 'ready' || normalized === 'online' || normalized === 'ok') {
+    return 'online';
+  }
+  if (normalized === 'registered' || normalized === 'starting' || normalized === 'booting') {
+    return 'starting';
+  }
+  if (normalized === 'stopped' || normalized === 'dead' || normalized === 'offline' || normalized === 'down') {
+    return 'offline';
+  }
+  return fallback;
+}
+
+function buildSupervisorServiceCard(target, processInfo, controlEnabled) {
+  const actions = controlEnabled ? ['start', 'restart', 'stop'] : [];
+  return {
+    id: target,
+    label: target === 'cerbere'
+      ? 'Cerbere / LLM Router'
+      : target === 'tts'
+        ? 'TTS / SIWIS'
+        : target === 'llama-server'
+          ? 'Llama Server'
+          : target,
+    state: toControlServiceState(processInfo?.status, 'warning'),
+    detail: `status ${processInfo?.status || 'unknown'} · pid ${processInfo?.pid || '—'} · restarts ${processInfo?.restarts || 0}`,
+    actions,
+    meta: {
+      pid: processInfo?.pid || null,
+      restarts: processInfo?.restarts || 0,
+      uptime: processInfo?.uptime ?? null,
+      autoRestart: processInfo?.autoRestart ?? null,
+    },
+  };
+}
+
+async function buildControlCenterStatus(req) {
+  const controlEnabled = isLocalControlOrigin(req) && isAdminRequest(req);
+  const supervisor = getSupervisorInstance();
+  const qflushStatus = qflushIntegration.getStatus(supervisor);
+  const runtime = getPublicRuntimeStatus({
+    config: buildRuntimeConfig(process.env),
+    hasDb: Boolean(db),
+    isR2Configured: isR2Configured(),
+    hasResend: emailService.isConfigured(),
+    hasQflush: Boolean(QFLUSH_AVAILABLE),
+  });
+
+  const [a11host, ttsSnapshot, llmSnapshot] = await Promise.all([
+    getA11HostStatus().catch((error_) => ({ ok: false, available: false, error: String(error_?.message || error_) })),
+    getSiwisHealthSnapshot().catch((error_) => ({ ok: false, status: 503, body: { error: String(error_?.message || error_) } })),
+    getLlmStatsSnapshot().catch((error_) => ({ ok: false, status: 503, body: { error: String(error_?.message || error_) } })),
+  ]);
+
+  const requestOrigin = getRequestOrigin(req);
+  const availableTargets = Object.keys(qflushStatus?.processes || {});
+  const services = [];
+
+  services.push({
+    id: 'backend',
+    label: 'Backend A11',
+    state: 'online',
+    detail: `API active · DB ${runtime?.integrations?.database ? 'ok' : 'off'} · R2 ${runtime?.integrations?.r2?.configured ? 'ok' : 'off'}`,
+    url: requestOrigin || runtime?.config?.publicApiUrl || null,
+    actions: [],
+    meta: runtime?.config || {},
+  });
+
+  services.push({
+    id: 'tts-http',
+    label: 'TTS / SIWIS',
+    state: ttsSnapshot?.ok && ttsSnapshot?.body?.ok ? 'online' : 'offline',
+    detail: ttsSnapshot?.ok && ttsSnapshot?.body?.ok
+      ? `mode ${ttsSnapshot.body.mode || 'http'}`
+      : `indisponible (${String(ttsSnapshot?.body?.error || ttsSnapshot?.status || 'unknown')})`,
+    url: runtime?.config?.tts?.publicBaseUrl || runtime?.config?.tts?.internalUrl || null,
+    actions: [],
+    meta: ttsSnapshot?.body || {},
+  });
+
+  services.push({
+    id: 'llm-router',
+    label: 'Cerbere / LLM',
+    state: llmSnapshot?.ok ? 'online' : 'offline',
+    detail: llmSnapshot?.ok
+      ? `mode ${llmSnapshot?.body?.mode || 'ok'}`
+      : `indisponible (${String(llmSnapshot?.body?.error || llmSnapshot?.status || 'unknown')})`,
+    url: String(process.env.LLM_ROUTER_URL || '').trim() || null,
+    actions: [],
+    meta: llmSnapshot?.body || {},
+  });
+
+  services.push({
+    id: 'qflush-runtime',
+    label: 'Qflush',
+    state: qflushStatus?.available ? 'online' : 'warning',
+    detail: qflushStatus?.available
+      ? `flow ${qflushStatus?.chatFlow || 'non configure'}`
+      : String(qflushStatus?.error || qflushStatus?.message || 'non initialise'),
+    url: qflushStatus?.remoteUrl || process.env.QFLUSH_URL || null,
+    actions: [],
+    meta: qflushStatus || {},
+  });
+
+  services.push({
+    id: 'a11host',
+    label: 'A11Host',
+    state: a11host?.available ? 'online' : 'warning',
+    detail: a11host?.available
+      ? `mode ${a11host?.mode || 'connected'}`
+      : String(a11host?.error || 'bridge indisponible'),
+    url: null,
+    actions: [],
+    meta: a11host || {},
+  });
+
+  for (const [target, processInfo] of Object.entries(qflushStatus?.processes || {})) {
+    services.push(buildSupervisorServiceCard(target, processInfo, controlEnabled));
+  }
+
+  return {
+    ok: true,
+    profile: {
+      key: isLocalControlOrigin(req) ? 'local' : 'online',
+      label: isLocalControlOrigin(req) ? 'Local tunnel' : 'Online',
+      requestOrigin,
+      frontendUrl: runtime?.config?.frontendUrl || 'https://a11.funesterie.pro',
+      publicApiUrl: runtime?.config?.publicApiUrl || requestOrigin || '',
+      controlEnabled,
+      controlReason: controlEnabled
+        ? 'Actions start/stop/restart autorisees sur ce backend.'
+        : 'Statuts consultables ici. Les actions runtime sont reservees au backend local/tunnelé.',
+      availableTargets,
+    },
+    runtime,
+    supervisor: {
+      available: !!qflushStatus?.available,
+      processes: qflushStatus?.processes || {},
+    },
+    services,
+  };
 }
 
 async function getStructuredMemoryCounts(userId) {
@@ -3028,7 +3321,12 @@ function isRecursiveOpenAIUpstream(req, upstreamUrl) {
 }
 
 function getLocalCompletionsUrl() {
-  const base = String(process.env.LLAMA_BASE || process.env.LLM_URL || '').trim();
+  const explicitBase = String(process.env.LLAMA_BASE || process.env.LLM_URL || '').trim();
+  const routerBase = String(process.env.LLM_ROUTER_URL || '').trim();
+  const inferredLocalBase = (String(process.env.BACKEND || '').trim().toLowerCase() === 'local' || String(process.env.NODE_ENV || '').trim().toLowerCase() !== 'production')
+    ? `http://127.0.0.1:${String(process.env.LLAMA_PORT || process.env.LOCAL_LLM_PORT || '8080').trim() || '8080'}`
+    : '';
+  const base = explicitBase || routerBase || inferredLocalBase;
   if (!base) return null;
   const normalized = base.replace(/\/$/, '');
   return normalized.endsWith('/v1') ? `${normalized}/chat/completions` : `${normalized}/v1/chat/completions`;
@@ -4092,8 +4390,8 @@ console.log(`[A11] PORT utilisé: ${ PORT } (source: ${ envSource }, env: ${ pro
 // Single DEFAULT_UPSTREAM: prefer LLAMA_BASE if set, otherwise use localhost (11434)
 if (globalThis.__A11_DEFAULT_UPSTREAM === undefined) {
   const host = '127.0.0.1';
-  // default to llama-server port 8000 when LLAMA_BASE is not set
-  const port = process.env.LLAMA_PORT || '8000';
+  // default to llama-server port 8080 when LLAMA_BASE is not set
+  const port = process.env.LLAMA_PORT || process.env.LOCAL_LLM_PORT || '8080';
   const configuredLlmBase = process.env.LLAMA_BASE?.trim();
   // If a local LLM router is configured, prefer it as the default upstream
   if (process.env.LLM_ROUTER_URL?.trim()) {

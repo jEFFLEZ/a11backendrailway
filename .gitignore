@@ -6,3 +6,8 @@ dist/
 .vs/
 .DS_Store
 Thumbs.db
+.a11-launcher/
+apps/logs/
+apps/server/tmp-restart-*.log
+a11_memory/conversations/
+a11_memory/memos/memo_env_snapshot_*.json

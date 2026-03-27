@@ -17,16 +17,20 @@ const DEV_MODE = String(process.env.DEV_MODE || '').toLowerCase() === 'true';
 
 // Backend configuration
 const QFLUSH_BASE = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL || null;
-const LLAMA_LOCAL_FALLBACK = process.env.NODE_ENV === 'production' ? null : "http://127.0.0.1:8000";
+const LOCAL_LLM_PORT = process.env.LLAMA_PORT || process.env.LOCAL_LLM_PORT || 8080;
+const LLAMA_LOCAL_FALLBACK = process.env.NODE_ENV === 'production'
+  ? null
+  : `http://127.0.0.1:${LOCAL_LLM_PORT}`;
 
 const BACKENDS = {
-  llama_local: process.env.LLAMA_BASE || QFLUSH_BASE || LLAMA_LOCAL_FALLBACK,
+  llama_local: process.env.LOCAL_LLM_URL || process.env.LLAMA_BASE || QFLUSH_BASE || LLAMA_LOCAL_FALLBACK,
   ollama: "http://127.0.0.1:11434",
-  openai: process.env.OPENAI_API_URL || null
+  openai: process.env.OPENAI_API_URL || process.env.OPENAI_BASE_URL || null
 };
 
 console.log(`[Cerbère] DEV ENGINE initialized (DEV_MODE=${DEV_MODE ? 'true' : 'false'})`);
 console.log('[Cerbère] Available backends:', BACKENDS);
+console.log('[Cerbère] Local LLM fallback:', LLAMA_LOCAL_FALLBACK || '(disabled)');
 
 // Backend selection based on model
 function selectBackend(model) {
