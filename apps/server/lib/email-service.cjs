@@ -1,5 +1,24 @@
 const { Resend } = require('resend');
 
+function normalizeRecipients(to) {
+  if (Array.isArray(to)) {
+    return Array.from(new Set(
+      to
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    ));
+  }
+
+  const raw = String(to || '').trim();
+  if (!raw) return [];
+  return Array.from(new Set(
+    raw
+      .split(/[;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  ));
+}
+
 function createEmailService(config = {}) {
   const resendApiKey = String(config.resendApiKey || '').trim();
   const fromEmail = String(config.fromEmail || 'A11 <onboarding@resend.dev>').trim();
@@ -20,8 +39,8 @@ function createEmailService(config = {}) {
   }
 
   async function sendEmail({ to, subject, text, html, attachments, tags }) {
-    const normalizedTo = String(to || '').trim();
-    if (!normalizedTo) {
+    const recipients = normalizeRecipients(to);
+    if (!recipients.length) {
       return { ok: false, reason: 'missing_to' };
     }
     if (!resendClient) {
@@ -30,7 +49,7 @@ function createEmailService(config = {}) {
 
     const response = await resendClient.emails.send({
       from: fromEmail,
-      to: normalizedTo,
+      to: recipients.length === 1 ? recipients[0] : recipients,
       subject: String(subject || 'A11').trim() || 'A11',
       text: typeof text === 'string' ? text : undefined,
       html: typeof html === 'string' ? html : undefined,
@@ -42,6 +61,7 @@ function createEmailService(config = {}) {
       ok: true,
       provider: 'resend',
       id: response?.data?.id || response?.id || null,
+      to: recipients,
     };
   }
 
@@ -77,6 +97,7 @@ function createEmailService(config = {}) {
     sendEmail,
     sendFileEmail,
     sendPasswordResetEmail,
+    normalizeRecipients,
   };
 }
 

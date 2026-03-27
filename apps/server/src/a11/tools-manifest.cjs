@@ -246,6 +246,161 @@ const TOOL_MANIFEST = {
     constraints: { roots: WORKSPACE_ROOTS },
     args: { url: "string", outputPath: "chemin absolu" }
   },
+  share_file: {
+    description: "Publie un fichier local dans l'espace A-11 et peut l'envoyer par email.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      path: "string (chemin absolu ou relatif vers un fichier local)",
+      filename: "string (optionnel, nom force pour le stockage)",
+      contentType: "string (optionnel)",
+      emailTo: "string|string[] (optionnel, un ou plusieurs destinataires email)",
+      emailSubject: "string (optionnel)",
+      emailMessage: "string (optionnel)",
+      attachToEmail: "bool (optionnel, joindre le fichier au mail)"
+    }
+  },
+  list_stored_files: {
+    description: "Liste les fichiers déjà stockés dans l'espace A-11 de l'utilisateur.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      limit: "number (optionnel, 1-100)"
+    }
+  },
+  list_resources: {
+    description: "Liste les ressources de conversation stockées par A-11 (fichiers ou artefacts).",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')",
+      limit: "number (optionnel, 1-100)"
+    }
+  },
+  get_latest_resource: {
+    description: "Retourne la ressource la plus recente d'une conversation ou d'un type donne.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')"
+    }
+  },
+  email_resource: {
+    description: "Envoie par email une ressource déjà stockée par A-11 à partir de son resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      resourceId: "number (id de la ressource)",
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  email_latest_resource: {
+    description: "Envoie par email la ressource la plus recente, sans avoir besoin de fournir un chemin ou resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel, ex: 'file' ou 'artifact')",
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  send_email: {
+    description: "Envoie un email texte, avec pieces jointes locales optionnelles.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel, corps texte)",
+      html: "string (optionnel, corps HTML)",
+      path: "string (optionnel, fichier local a joindre)",
+      paths: "string[] (optionnel, plusieurs fichiers a joindre)",
+      attachToEmail: "bool (optionnel, true par defaut si path/paths present)"
+    }
+  },
+  schedule_email: {
+    description: "Programme un email pour plus tard, avec pieces jointes locales optionnelles.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      to: "string|string[] (un ou plusieurs destinataires)",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel, delai avant envoi)",
+      delayMinutes: "number (optionnel)",
+      path: "string (optionnel)",
+      paths: "string[] (optionnel)"
+    }
+  },
+  schedule_resource_email: {
+    description: "Programme l'envoi d'une ressource stockee a une date/heure future.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      resourceId: "number",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel)",
+      delayMinutes: "number (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  schedule_latest_resource_email: {
+    description: "Programme l'envoi de la ressource la plus recente sans donner de resourceId.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      conversationId: "string (optionnel)",
+      kind: "string (optionnel)",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)",
+      sendAt: "string ISO date/heure future (optionnel)",
+      delaySeconds: "number (optionnel)",
+      delayMinutes: "number (optionnel)",
+      attachToEmail: "bool (optionnel)"
+    }
+  },
+  list_scheduled_emails: {
+    description: "Liste les emails planifies par A-11 pour l'utilisateur courant.",
+    dangerLevel: "low",
+    constraints: { requiresAuth: true },
+    args: {
+      status: "string (optionnel: scheduled, running, sent, failed, cancelled)",
+      limit: "number (optionnel)"
+    }
+  },
+  cancel_scheduled_email: {
+    description: "Annule un email planifie tant qu'il n'a pas encore ete execute.",
+    dangerLevel: "medium",
+    constraints: { requiresAuth: true },
+    args: {
+      jobId: "string (identifiant du job planifie)"
+    }
+  },
+  zip_and_email: {
+    description: "Cree une archive ZIP a partir de plusieurs chemins locaux puis l'envoie par email.",
+    dangerLevel: "medium",
+    constraints: { roots: WORKSPACE_ROOTS, requiresAuth: true },
+    args: {
+      inputPaths: "string[] (ou paths)",
+      outputPath: "string (optionnel)",
+      to: "string|string[]",
+      subject: "string (optionnel)",
+      message: "string (optionnel)"
+    }
+  },
   a11_env_snapshot: {
     dangerLevel: "low",
     description: "Retourne un snapshot JSON de l'environnement A-11 (tools, roots, qflush, cerbère, env safe)."

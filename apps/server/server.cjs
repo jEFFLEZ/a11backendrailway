@@ -1579,6 +1579,447 @@ async function markConversationResourceEmailed(userId, resourceId, emailRecord) 
   };
 }
 
+function normalizeEmailRecipients(value) {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(
+      value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    ));
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  return Array.from(new Set(
+    raw
+      .split(/[;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  ));
+}
+
+function normalizeInlineAttachments(rawAttachments) {
+  const attachments = [];
+  const source = Array.isArray(rawAttachments) ? rawAttachments : [];
+
+  for (const [index, item] of source.entries()) {
+    const filename = sanitizeFileName(item?.filename || `attachment-${index + 1}.bin`);
+    const contentBase64 = String(item?.contentBase64 || item?.base64 || '').trim();
+    if (!contentBase64) {
+      const error = new Error('missing_attachment_content');
+      error.code = 'missing_attachment_content';
+      error.index = index;
+      throw error;
+    }
+
+    let buffer;
+    try {
+      buffer = Buffer.from(contentBase64, 'base64');
+    } catch {
+      const error = new Error('invalid_attachment_base64');
+      error.code = 'invalid_attachment_base64';
+      error.index = index;
+      throw error;
+    }
+
+    if (!buffer || !buffer.length) {
+      const error = new Error('empty_attachment');
+      error.code = 'empty_attachment';
+      error.index = index;
+      throw error;
+    }
+
+    attachments.push({
+      filename,
+      contentBase64: buffer.toString('base64'),
+    });
+  }
+
+  return attachments;
+}
+
+function toEmailServiceAttachments(serializedAttachments) {
+  return (Array.isArray(serializedAttachments) ? serializedAttachments : []).map((item, index) => ({
+    filename: sanitizeFileName(item?.filename || `attachment-${index + 1}.bin`),
+    content: Buffer.from(String(item?.contentBase64 || ''), 'base64'),
+  }));
+}
+
+async function getLatestConversationResource(userId, { conversationId, resourceKind } = {}) {
+  const resources = await listConversationResources(userId, {
+    conversationId,
+    resourceKind,
+    limit: 1,
+  });
+  return resources[0] || null;
+}
+
+async function sendPlainEmailNow({
+  userId,
+  to,
+  subject,
+  text,
+  html,
+  attachments,
+  conversationId,
+  tags,
+  logType = 'mail_sent',
+}) {
+  const recipients = normalizeEmailRecipients(to);
+  if (!recipients.length) {
+    return { ok: false, error: 'missing_to' };
+  }
+
+  const mail = await emailService.sendEmail({
+    to: recipients,
+    subject,
+    text: String(text || '').trim() || (!String(html || '').trim() ? 'Email envoye depuis A11.' : undefined),
+    html: String(html || '').trim() || undefined,
+    attachments: toEmailServiceAttachments(attachments),
+    tags,
+  });
+
+  if (mail?.ok === false) {
+    return { ok: false, error: mail.reason || 'mail_send_failed', mail };
+  }
+
+  appendConversationLog({
+    type: logType,
+    userId: String(userId || '').trim() || null,
+    conversationId: normalizeConversationId(conversationId),
+    mail: {
+      ...mail,
+      to: recipients,
+      subject: String(subject || '').trim() || 'A11',
+      attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+    },
+  });
+
+  return {
+    ok: true,
+    conversationId: normalizeConversationId(conversationId),
+    mail: {
+      ...mail,
+      to: recipients,
+      subject: String(subject || '').trim() || 'A11',
+    },
+    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+  };
+}
+
+async function sendConversationResourceEmailNow({
+  userId,
+  resourceId,
+  resource = null,
+  to,
+  subject,
+  message,
+  attachToEmail,
+}) {
+  const recipients = normalizeEmailRecipients(to);
+  if (!recipients.length) {
+    return { ok: false, error: 'missing_to' };
+  }
+
+  const resolvedResource = resource || await getConversationResourceById(userId, resourceId);
+  if (!resolvedResource) {
+    return { ok: false, error: 'resource_not_found' };
+  }
+
+  let attachment = null;
+  let attachmentIncluded = false;
+  let attachmentFallbackReason = null;
+  if (attachToEmail && resolvedResource.storageKey && isR2Configured()) {
+    try {
+      const downloaded = await downloadBufferFromR2(resolvedResource.storageKey);
+      attachment = {
+        filename: resolvedResource.filename,
+        buffer: downloaded.buffer,
+      };
+      attachmentIncluded = true;
+    } catch (error_) {
+      attachmentFallbackReason = String(error_?.message || 'attachment_download_failed');
+      console.warn('[RESOURCES] attachment download failed, sending link only:', attachmentFallbackReason);
+    }
+  } else if (attachToEmail) {
+    attachmentFallbackReason = 'attachment_not_available';
+  }
+
+  const resolvedSubject = String(subject || '').trim()
+    || `A11 — ${resolvedResource.resourceKind === 'artifact' ? 'artefact' : 'fichier'} ${resolvedResource.filename}`;
+  const messageLines = [];
+  if (String(message || '').trim()) messageLines.push(String(message || '').trim());
+  else messageLines.push('A11 t’envoie une ressource depuis ta conversation.');
+  if (resolvedResource.conversationId) messageLines.push(`Conversation: ${resolvedResource.conversationId}`);
+  if (resolvedResource.metadata?.description) messageLines.push(`Description: ${String(resolvedResource.metadata.description)}`);
+  if (attachmentFallbackReason && !attachmentIncluded) {
+    messageLines.push('Note: la piece jointe n’a pas pu etre ajoutee, le lien reste disponible.');
+  }
+
+  const mail = await sendFileEmail({
+    to: recipients,
+    subject: resolvedSubject,
+    message: messageLines.join('\n\n'),
+    fileUrl: resolvedResource.url || null,
+    attachment,
+  });
+
+  await markConversationResourceEmailed(userId, resolvedResource.id, {
+    to: recipients,
+    subject: resolvedSubject,
+    attached: attachmentIncluded,
+    mailId: mail?.id || null,
+    ok: mail?.ok !== false,
+  });
+
+  appendConversationLog({
+    type: 'resource_emailed',
+    userId: String(userId || '').trim() || null,
+    conversationId: resolvedResource.conversationId || 'default',
+    resource: {
+      id: resolvedResource.id,
+      filename: resolvedResource.filename,
+      resourceKind: resolvedResource.resourceKind,
+      storageKey: resolvedResource.storageKey,
+      url: resolvedResource.url,
+    },
+    mail: {
+      ...mail,
+      to: recipients,
+      subject: resolvedSubject,
+      attachmentIncluded,
+      attachmentFallbackReason,
+    },
+  });
+
+  if (mail?.ok === false) {
+    return { ok: false, error: mail.reason || 'resource_email_failed', resource: resolvedResource, mail };
+  }
+
+  return {
+    ok: true,
+    resourceId: resolvedResource.id,
+    resource: resolvedResource,
+    mail: {
+      ...mail,
+      to: recipients,
+      subject: resolvedSubject,
+      attachmentIncluded,
+      attachmentFallbackReason,
+    },
+  };
+}
+
+async function sendLatestConversationResourceEmailNow({
+  userId,
+  conversationId,
+  resourceKind,
+  to,
+  subject,
+  message,
+  attachToEmail,
+}) {
+  const latestResource = await getLatestConversationResource(userId, { conversationId, resourceKind });
+  if (!latestResource) {
+    return { ok: false, error: 'latest_resource_not_found' };
+  }
+
+  const sent = await sendConversationResourceEmailNow({
+    userId,
+    resourceId: latestResource.id,
+    resource: latestResource,
+    to,
+    subject,
+    message,
+    attachToEmail,
+  });
+
+  return {
+    ...sent,
+    latest: true,
+  };
+}
+
+const SCHEDULED_MAIL_DIR = path.resolve(
+  process.env.A11_SCHEDULED_MAIL_DIR || path.join(__dirname, '.a11_state')
+);
+const SCHEDULED_MAIL_PATH = path.join(SCHEDULED_MAIL_DIR, 'scheduled-mails.json');
+const scheduledMailTimers = new Map();
+
+function ensureScheduledMailStore() {
+  fs.mkdirSync(SCHEDULED_MAIL_DIR, { recursive: true });
+  if (!fs.existsSync(SCHEDULED_MAIL_PATH)) {
+    fs.writeFileSync(SCHEDULED_MAIL_PATH, '[]', 'utf8');
+  }
+}
+
+function readScheduledMailJobs() {
+  ensureScheduledMailStore();
+  try {
+    const raw = fs.readFileSync(SCHEDULED_MAIL_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (error_) {
+    console.warn('[MAIL] scheduled store read failed:', error_?.message);
+    return [];
+  }
+}
+
+function writeScheduledMailJobs(jobs) {
+  ensureScheduledMailStore();
+  fs.writeFileSync(SCHEDULED_MAIL_PATH, JSON.stringify(Array.isArray(jobs) ? jobs : [], null, 2), 'utf8');
+}
+
+function normalizeScheduledMailKind(kind) {
+  const normalized = String(kind || 'email').trim().toLowerCase();
+  if (normalized === 'resource_email') return 'resource_email';
+  if (normalized === 'latest_resource_email') return 'latest_resource_email';
+  return 'email';
+}
+
+function computeScheduledSendAt({ sendAt, delaySeconds }) {
+  if (Number.isFinite(Number(delaySeconds)) && Number(delaySeconds) > 0) {
+    return new Date(Date.now() + Number(delaySeconds) * 1000).toISOString();
+  }
+
+  const parsed = new Date(String(sendAt || '').trim());
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('invalid_sendAt');
+  }
+  return parsed.toISOString();
+}
+
+function buildScheduledMailJobId() {
+  return `mail-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function summarizeScheduledMailJob(job) {
+  return {
+    id: String(job?.id || ''),
+    kind: String(job?.kind || 'email'),
+    status: String(job?.status || 'scheduled'),
+    sendAt: String(job?.sendAt || ''),
+    createdAt: String(job?.createdAt || ''),
+    executedAt: job?.executedAt || null,
+    cancelledAt: job?.cancelledAt || null,
+    conversationId: job?.conversationId || null,
+    to: Array.isArray(job?.to) ? job.to : normalizeEmailRecipients(job?.to),
+    subject: job?.subject || null,
+    attachmentCount: Array.isArray(job?.attachments) ? job.attachments.length : 0,
+    resourceId: Number(job?.resourceId || 0) || null,
+    resourceKind: job?.resourceKind || null,
+    error: job?.error || null,
+    result: job?.result || null,
+  };
+}
+
+async function executeScheduledMailJob(jobId) {
+  const jobs = readScheduledMailJobs();
+  const index = jobs.findIndex((job) => job?.id === jobId);
+  if (index < 0) return null;
+
+  const job = jobs[index];
+  if (job.status !== 'scheduled') return summarizeScheduledMailJob(job);
+
+  job.status = 'running';
+  job.startedAt = new Date().toISOString();
+  jobs[index] = job;
+  writeScheduledMailJobs(jobs);
+
+  try {
+    let result = null;
+    if (job.kind === 'email') {
+      result = await sendPlainEmailNow({
+        userId: job.userId,
+        to: job.to,
+        subject: job.subject,
+        text: job.message,
+        html: job.html,
+        attachments: job.attachments,
+        conversationId: job.conversationId,
+        tags: [{ name: 'type', value: 'scheduled_email' }],
+        logType: 'mail_sent',
+      });
+    } else if (job.kind === 'resource_email') {
+      result = await sendConversationResourceEmailNow({
+        userId: job.userId,
+        resourceId: job.resourceId,
+        to: job.to,
+        subject: job.subject,
+        message: job.message,
+        attachToEmail: job.attachToEmail,
+      });
+    } else if (job.kind === 'latest_resource_email') {
+      result = await sendLatestConversationResourceEmailNow({
+        userId: job.userId,
+        conversationId: job.conversationId,
+        resourceKind: job.resourceKind,
+        to: job.to,
+        subject: job.subject,
+        message: job.message,
+        attachToEmail: job.attachToEmail,
+      });
+    } else {
+      throw new Error(`unsupported_scheduled_mail_kind:${job.kind}`);
+    }
+
+    if (!result?.ok) {
+      throw new Error(result?.error || 'scheduled_mail_failed');
+    }
+
+    job.status = 'sent';
+    job.executedAt = new Date().toISOString();
+    job.result = result;
+    job.error = null;
+  } catch (error_) {
+    job.status = 'failed';
+    job.executedAt = new Date().toISOString();
+    job.error = String(error_?.message || error_);
+  }
+
+  jobs[index] = job;
+  writeScheduledMailJobs(jobs);
+  return summarizeScheduledMailJob(job);
+}
+
+function scheduleMailTimer(job) {
+  if (!job?.id) return;
+  const existing = scheduledMailTimers.get(job.id);
+  if (existing) clearTimeout(existing);
+  scheduledMailTimers.delete(job.id);
+
+  if (job.status !== 'scheduled') return;
+
+  const runAtMs = new Date(job.sendAt).getTime();
+  if (!Number.isFinite(runAtMs)) return;
+
+  const remaining = runAtMs - Date.now();
+  const maxDelay = 2147483647;
+  const delay = Math.max(0, Math.min(maxDelay, remaining));
+  const timer = setTimeout(async () => {
+    scheduledMailTimers.delete(job.id);
+    if (runAtMs - Date.now() > 1000) {
+      scheduleMailTimer(job);
+      return;
+    }
+    try {
+      await executeScheduledMailJob(job.id);
+    } catch (error_) {
+      console.warn('[MAIL] scheduled execution failed:', error_?.message);
+    }
+  }, delay);
+  scheduledMailTimers.set(job.id, timer);
+}
+
+function bootstrapScheduledMailJobs() {
+  const jobs = readScheduledMailJobs();
+  for (const job of jobs) {
+    if (job?.status === 'scheduled') {
+      scheduleMailTimer(job);
+    }
+  }
+}
+
 function buildMemorySystemMessage(logicalMemory, structuredMemoryContext, conversationResourceContext) {
   const parts = [];
   if (logicalMemory) {
@@ -1784,6 +2225,8 @@ if (resendClient) {
 async function sendFileEmail({ to, subject, message, fileUrl, attachment }) {
   return emailService.sendFileEmail({ to, subject, message, fileUrl, attachment });
 }
+
+bootstrapScheduledMailJobs();
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
 app.use(express.json({ limit: '10mb' }));
@@ -2613,6 +3056,7 @@ app.use('/api/agent', verifyJWT);
 app.use('/api/files', verifyJWT);
 app.use('/api/artifacts', verifyJWT);
 app.use('/api/resources', verifyJWT);
+app.use('/api/mail', verifyJWT);
 
 app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) => {
   try {
@@ -2780,6 +3224,31 @@ app.get('/api/resources/:id/download', async (req, res) => {
   }
 });
 
+app.get('/api/resources/latest', async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const latestResource = await getLatestConversationResource(userId, {
+      conversationId: req.query.conversationId,
+      resourceKind: req.query.kind,
+    });
+
+    if (!latestResource) {
+      return res.status(404).json({ ok: false, error: 'latest_resource_not_found' });
+    }
+
+    return res.json({
+      ok: true,
+      resource: latestResource,
+    });
+  } catch (e) {
+    console.error('[RESOURCES] latest failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'latest_resource_failed', message: String(e?.message) });
+  }
+});
+
 app.post('/api/resources/email', express.json({ limit: '1mb' }), async (req, res) => {
   try {
     const userId = String(req.user?.id || '').trim();
@@ -2789,104 +3258,248 @@ app.post('/api/resources/email', express.json({ limit: '1mb' }), async (req, res
       return res.status(503).json({ ok: false, error: 'mail_provider_not_configured' });
     }
 
-    const resourceId = Number(req.body?.resourceId || 0);
-    const to = String(req.body?.to || '').trim();
-    const attachToEmail = req.body?.attachToEmail === true || req.body?.attachToEmail === 'true';
-    const requestedSubject = String(req.body?.subject || '').trim();
-    const requestedMessage = String(req.body?.message || '').trim();
+    const result = await sendConversationResourceEmailNow({
+      userId,
+      resourceId: req.body?.resourceId,
+      to: req.body?.to || req.body?.emailTo || req.body?.recipients || '',
+      subject: req.body?.subject,
+      message: req.body?.message,
+      attachToEmail: req.body?.attachToEmail === true || req.body?.attachToEmail === 'true',
+    });
 
-    if (!Number.isFinite(resourceId) || resourceId <= 0) {
-      return res.status(400).json({ ok: false, error: 'invalid_resource_id' });
+    if (!result?.ok) {
+      if (result.error === 'resource_not_found') return res.status(404).json(result);
+      if (result.error === 'missing_to') return res.status(400).json(result);
+      if (result.error === 'mail_provider_not_configured') return res.status(503).json(result);
+      return res.status(502).json(result);
     }
-    if (!to) {
+
+    return res.json(result);
+  } catch (e) {
+    console.error('[RESOURCES] email failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'resource_email_failed', message: String(e?.message) });
+  }
+});
+
+app.post('/api/resources/latest/email', express.json({ limit: '1mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    if (!emailService.isConfigured()) {
+      return res.status(503).json({ ok: false, error: 'mail_provider_not_configured' });
+    }
+
+    const result = await sendLatestConversationResourceEmailNow({
+      userId,
+      conversationId: req.body?.conversationId || req.body?.convId || req.body?.sessionId || req.query?.conversationId,
+      resourceKind: req.body?.kind || req.body?.resourceKind || req.query?.kind,
+      to: req.body?.to || req.body?.emailTo || req.body?.recipients || '',
+      subject: req.body?.subject,
+      message: req.body?.message,
+      attachToEmail: req.body?.attachToEmail === true || req.body?.attachToEmail === 'true',
+    });
+
+    if (!result?.ok) {
+      if (result.error === 'latest_resource_not_found') return res.status(404).json(result);
+      if (result.error === 'missing_to') return res.status(400).json(result);
+      if (result.error === 'mail_provider_not_configured') return res.status(503).json(result);
+      return res.status(502).json(result);
+    }
+
+    return res.json(result);
+  } catch (e) {
+    console.error('[RESOURCES] latest email failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'latest_resource_email_failed', message: String(e?.message) });
+  }
+});
+
+app.post('/api/mail/send', express.json({ limit: '20mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!emailService.isConfigured()) {
+      return res.status(503).json({ ok: false, error: 'mail_provider_not_configured' });
+    }
+
+    const attachments = normalizeInlineAttachments(req.body?.attachments);
+    const result = await sendPlainEmailNow({
+      userId,
+      to: req.body?.to || req.body?.emailTo || req.body?.recipients || '',
+      subject: req.body?.subject || req.body?.emailSubject || 'A11',
+      text: String(req.body?.message || req.body?.text || req.body?.body || '').trim() || (!req.body?.html ? 'Email envoye depuis A11.' : undefined),
+      html: typeof req.body?.html === 'string' ? req.body.html : undefined,
+      attachments,
+      conversationId: req.body?.conversationId || req.body?.convId || req.body?.sessionId,
+      tags: [{ name: 'type', value: 'agent_mail' }],
+      logType: 'mail_sent',
+    });
+
+    if (!result?.ok) {
+      if (result.error === 'missing_to') return res.status(400).json(result);
+      if (result.error === 'mail_provider_not_configured') return res.status(503).json(result);
+      return res.status(502).json(result);
+    }
+
+    return res.json(result);
+  } catch (e) {
+    const code = e?.code || 'mail_send_failed';
+    const status = code === 'missing_attachment_content' || code === 'invalid_attachment_base64' || code === 'empty_attachment'
+      ? 400
+      : 500;
+    console.error('[MAIL] send failed:', e?.message);
+    return res.status(status).json({ ok: false, error: code, index: e?.index ?? null, message: String(e?.message) });
+  }
+});
+
+app.post('/api/mail/schedule', express.json({ limit: '20mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    if (!emailService.isConfigured()) {
+      return res.status(503).json({ ok: false, error: 'mail_provider_not_configured' });
+    }
+
+    const kind = normalizeScheduledMailKind(req.body?.kind);
+    const recipients = normalizeEmailRecipients(req.body?.to || req.body?.emailTo || req.body?.recipients || '');
+    if (!recipients.length) {
       return res.status(400).json({ ok: false, error: 'missing_to' });
     }
 
-    const resource = await getConversationResourceById(userId, resourceId);
-    if (!resource) {
-      return res.status(404).json({ ok: false, error: 'resource_not_found' });
-    }
+    const sendAt = computeScheduledSendAt({
+      sendAt: req.body?.sendAt,
+      delaySeconds: req.body?.delaySeconds ?? (Number.isFinite(Number(req.body?.delayMinutes)) ? Number(req.body.delayMinutes) * 60 : req.body?.delay),
+    });
 
-    let attachment = null;
-    let attachmentIncluded = false;
-    let attachmentFallbackReason = null;
-    if (attachToEmail && resource.storageKey && isR2Configured()) {
-      try {
-        const downloaded = await downloadBufferFromR2(resource.storageKey);
-        attachment = {
-          filename: resource.filename,
-          buffer: downloaded.buffer,
-        };
-        attachmentIncluded = true;
-      } catch (error_) {
-        attachmentFallbackReason = String(error_?.message || 'attachment_download_failed');
-        console.warn('[RESOURCES] attachment download failed, sending link only:', attachmentFallbackReason);
+    const job = {
+      id: buildScheduledMailJobId(),
+      kind,
+      status: 'scheduled',
+      userId,
+      createdAt: new Date().toISOString(),
+      sendAt,
+      conversationId: normalizeConversationId(req.body?.conversationId || req.body?.convId || req.body?.sessionId),
+      to: recipients,
+      subject: String(req.body?.subject || req.body?.emailSubject || 'A11').trim() || 'A11',
+      message: String(req.body?.message || req.body?.text || req.body?.body || '').trim(),
+      html: typeof req.body?.html === 'string' ? req.body.html : '',
+      attachToEmail: req.body?.attachToEmail === true || req.body?.attachToEmail === 'true',
+      attachments: [],
+      resourceId: null,
+      resourceKind: String(req.body?.kindFilter || req.body?.resourceKind || req.body?.resource_type || '').trim() || '',
+    };
+
+    if (kind === 'email') {
+      job.attachments = normalizeInlineAttachments(req.body?.attachments);
+    } else if (kind === 'resource_email') {
+      job.resourceId = Number(req.body?.resourceId || 0);
+      if (!Number.isFinite(job.resourceId) || job.resourceId <= 0) {
+        return res.status(400).json({ ok: false, error: 'invalid_resource_id' });
       }
-    } else if (attachToEmail) {
-      attachmentFallbackReason = 'attachment_not_available';
+      const resource = await getConversationResourceById(userId, job.resourceId);
+      if (!resource) {
+        return res.status(404).json({ ok: false, error: 'resource_not_found' });
+      }
+    } else if (kind === 'latest_resource_email') {
+      const latestResource = await getLatestConversationResource(userId, {
+        conversationId: job.conversationId,
+        resourceKind: job.resourceKind || undefined,
+      });
+      if (!latestResource) {
+        return res.status(404).json({ ok: false, error: 'latest_resource_not_found' });
+      }
     }
 
-    const subject = requestedSubject || `A11 — ${resource.resourceKind === 'artifact' ? 'artefact' : 'fichier'} ${resource.filename}`;
-    const messageLines = [];
-    if (requestedMessage) messageLines.push(requestedMessage);
-    else messageLines.push('A11 t’envoie une ressource depuis ta conversation.');
-    if (resource.conversationId) messageLines.push(`Conversation: ${resource.conversationId}`);
-    if (resource.metadata?.description) messageLines.push(`Description: ${String(resource.metadata.description)}`);
-    if (attachmentFallbackReason && !attachmentIncluded) {
-      messageLines.push('Note: la piece jointe n’a pas pu etre ajoutee, le lien reste disponible.');
-    }
-
-    const mail = await sendFileEmail({
-      to,
-      subject,
-      message: messageLines.join('\n\n'),
-      fileUrl: resource.url || null,
-      attachment,
-    });
-
-    await markConversationResourceEmailed(userId, resourceId, {
-      to,
-      subject,
-      attached: attachmentIncluded,
-      mailId: mail?.id || null,
-      ok: mail?.ok !== false,
-    });
+    const jobs = readScheduledMailJobs();
+    jobs.push(job);
+    writeScheduledMailJobs(jobs);
+    scheduleMailTimer(job);
 
     appendConversationLog({
-      type: 'resource_emailed',
+      type: 'mail_scheduled',
       userId,
-      conversationId: resource.conversationId || 'default',
-      resource: {
-        id: resource.id,
-        filename: resource.filename,
-        resourceKind: resource.resourceKind,
-        storageKey: resource.storageKey,
-        url: resource.url,
-      },
-      mail: {
-        ...mail,
-        to,
-        subject,
-        attachmentIncluded,
-        attachmentFallbackReason,
-      },
+      conversationId: job.conversationId,
+      mail: summarizeScheduledMailJob(job),
     });
 
     return res.json({
       ok: true,
-      resourceId,
-      resource,
-      mail: {
-        ...mail,
-        to,
-        subject,
-        attachmentIncluded,
-        attachmentFallbackReason,
-      },
+      job: summarizeScheduledMailJob(job),
     });
   } catch (e) {
-    console.error('[RESOURCES] email failed:', e?.message);
-    return res.status(500).json({ ok: false, error: 'resource_email_failed', message: String(e?.message) });
+    const code = e?.message === 'invalid_sendAt' ? 'invalid_sendAt' : (e?.code || 'mail_schedule_failed');
+    const status = code === 'invalid_sendAt' || code === 'missing_attachment_content' || code === 'invalid_attachment_base64' || code === 'empty_attachment'
+      ? 400
+      : 500;
+    console.error('[MAIL] schedule failed:', e?.message);
+    return res.status(status).json({ ok: false, error: code, index: e?.index ?? null, message: String(e?.message) });
+  }
+});
+
+app.get('/api/mail/scheduled', async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+
+    const requestedStatus = String(req.query.status || '').trim().toLowerCase();
+    const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+    const jobs = readScheduledMailJobs()
+      .filter((job) => String(job?.userId || '') === userId)
+      .filter((job) => !requestedStatus || String(job?.status || '').toLowerCase() === requestedStatus)
+      .sort((a, b) => new Date(a.sendAt).getTime() - new Date(b.sendAt).getTime())
+      .slice(0, limit)
+      .map((job) => summarizeScheduledMailJob(job));
+
+    return res.json({
+      ok: true,
+      count: jobs.length,
+      jobs,
+    });
+  } catch (e) {
+    console.error('[MAIL] scheduled list failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'scheduled_mail_list_failed', message: String(e?.message) });
+  }
+});
+
+app.post('/api/mail/scheduled/:id/cancel', express.json({ limit: '1mb' }), async (req, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim();
+    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+
+    const jobId = String(req.params?.id || '').trim();
+    const jobs = readScheduledMailJobs();
+    const index = jobs.findIndex((job) => job?.id === jobId && String(job?.userId || '') === userId);
+    if (index < 0) {
+      return res.status(404).json({ ok: false, error: 'scheduled_mail_not_found' });
+    }
+
+    if (jobs[index].status !== 'scheduled') {
+      return res.status(409).json({ ok: false, error: 'scheduled_mail_not_cancellable', job: summarizeScheduledMailJob(jobs[index]) });
+    }
+
+    jobs[index].status = 'cancelled';
+    jobs[index].cancelledAt = new Date().toISOString();
+    writeScheduledMailJobs(jobs);
+
+    const timer = scheduledMailTimers.get(jobId);
+    if (timer) clearTimeout(timer);
+    scheduledMailTimers.delete(jobId);
+
+    const job = summarizeScheduledMailJob(jobs[index]);
+    appendConversationLog({
+      type: 'mail_schedule_cancelled',
+      userId,
+      conversationId: jobs[index].conversationId || 'default',
+      mail: job,
+    });
+
+    return res.json({
+      ok: true,
+      job,
+    });
+  } catch (e) {
+    console.error('[MAIL] scheduled cancel failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'scheduled_mail_cancel_failed', message: String(e?.message) });
   }
 });
 
@@ -3291,6 +3904,12 @@ function getRequestOrigin(req) {
   return `${proto}://${host}`.toLowerCase();
 }
 
+function getAuthTokenFromRequest(req) {
+  const headerToken = String(req.headers['x-nez-token'] || '').trim();
+  const bearerToken = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  return headerToken || bearerToken;
+}
+
 function isRecursiveOpenAIUpstream(req, upstreamUrl) {
   const normalizedUpstream = String(upstreamUrl || '').trim();
   if (!normalizedUpstream) return false;
@@ -3453,9 +4072,52 @@ function normalizeAssistantOutput(value) {
 
 function normalizeDevActionName(name) {
   const normalized = String(name || '').trim();
+  const lowered = normalized.toLowerCase();
   if (!normalized) return normalized;
-  if (normalized === 'generate_image') return 'generate_png';
-  if (normalized === 'websearch') return 'web_search';
+  if (lowered === 'generate_image') return 'generate_png';
+  if (lowered === 'websearch') return 'web_search';
+  if (lowered === 'share-file' || lowered === 'sharefile' || lowered === 'upload_file' || lowered === 'publish_file') {
+    return 'share_file';
+  }
+  if (lowered === 'list-stored-files' || lowered === 'list_files' || lowered === 'stored_files' || lowered === 'listfiles') {
+    return 'list_stored_files';
+  }
+  if (lowered === 'list_resources' || lowered === 'list-resource' || lowered === 'list_resource' || lowered === 'list_conversation_resources') {
+    return 'list_resources';
+  }
+  if (lowered === 'get_latest_resource' || lowered === 'latest_resource' || lowered === 'get-latest-resource') {
+    return 'get_latest_resource';
+  }
+  if (lowered === 'send-email' || lowered === 'send_mail' || lowered === 'mail_user' || lowered === 'email_user') {
+    return 'send_email';
+  }
+  if (lowered === 'email_latest_resource' || lowered === 'send_latest_resource_email' || lowered === 'latest_resource_email') {
+    return 'email_latest_resource';
+  }
+  if (lowered === 'email-resource' || lowered === 'emailresource' || lowered === 'send_resource_email' || lowered === 'resource_email') {
+    return 'email_resource';
+  }
+  if (lowered === 'schedule-email' || lowered === 'schedule_mail' || lowered === 'mail_later' || lowered === 'delayed_email') {
+    return 'schedule_email';
+  }
+  if (lowered === 'schedule_resource_email' || lowered === 'schedule-resource-email' || lowered === 'resource_email_later') {
+    return 'schedule_resource_email';
+  }
+  if (lowered === 'schedule_latest_resource_email' || lowered === 'latest_resource_email_later') {
+    return 'schedule_latest_resource_email';
+  }
+  if (lowered === 'list_scheduled_emails' || lowered === 'scheduled_emails' || lowered === 'list-mail-jobs') {
+    return 'list_scheduled_emails';
+  }
+  if (lowered === 'cancel_scheduled_email' || lowered === 'cancel-mail-job' || lowered === 'cancel_scheduled_mail') {
+    return 'cancel_scheduled_email';
+  }
+  if (lowered === 'zip_and_email' || lowered === 'zip-email' || lowered === 'bundle_and_email') {
+    return 'zip_and_email';
+  }
+  if (lowered === 'email_file' || lowered === 'mail_file' || lowered === 'share_and_email_file') {
+    return 'share_file';
+  }
   return normalized;
 }
 
@@ -3503,6 +4165,162 @@ function normalizeDevActionArgs(actionName, rawAction) {
 
   if (actionName === 'download_file' && !args.outputPath && args.path) {
     args.outputPath = args.path;
+  }
+
+  if (actionName === 'share_file') {
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!args.emailTo) {
+      args.emailTo = args.to || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.emailSubject) {
+      args.emailSubject = args.subject || '';
+    }
+    if (!args.emailMessage) {
+      args.emailMessage = args.message || args.body || args.text || '';
+    }
+  }
+
+  if (actionName === 'send_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!Array.isArray(args.paths) && Array.isArray(args.attachments)) {
+      const attachmentPaths = args.attachments
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object') return item.path || '';
+          return '';
+        })
+        .filter(Boolean);
+      if (attachmentPaths.length) {
+        args.paths = attachmentPaths;
+      }
+    }
+  }
+
+  if (actionName === 'email_resource') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (args.attachToEmail == null && args.asAttachment != null) {
+      args.attachToEmail = args.asAttachment;
+    }
+  }
+
+  if (actionName === 'email_latest_resource') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'list_resources') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'get_latest_resource') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'schedule_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+  }
+
+  if (actionName === 'schedule_resource_email') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+  }
+
+  if (actionName === 'schedule_latest_resource_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'cancel_scheduled_email' && !args.jobId) {
+    args.jobId = args.id || args.scheduledId || args.job || null;
+  }
+
+  if (actionName === 'zip_and_email' && !args.inputPaths) {
+    args.inputPaths = Array.isArray(args.paths) ? args.paths : [];
+  }
+
+  if (actionName === 'list_stored_files' && !args.limit) {
+    args.limit = args.max || args.count || args.top || args.n || undefined;
   }
 
   return args;
@@ -3579,6 +4397,55 @@ function parseAssistantActionEnvelope(value, defaults = {}) {
   }
 }
 
+function parseAssistantEnvelope(value, defaults = {}) {
+  const raw = extractJsonObjectCandidate(value);
+  if (!raw.startsWith('{') || !raw.endsWith('}')) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    if (parsed.mode === 'actions') {
+      return normalizeActionEnvelopeShape(parsed, defaults);
+    }
+
+    if (parsed.mode === 'final') {
+      return {
+        version: 'a11-envelope-1',
+        mode: 'final',
+        answer: normalizeAssistantOutput(parsed.answer || parsed.message || parsed.content || ''),
+        conversationId: normalizeConversationId(parsed.conversationId || defaults.conversationId),
+        userId: String(parsed.userId || defaults.userId || '').trim() || undefined,
+      };
+    }
+
+    if (parsed.mode === 'need_user') {
+      return {
+        version: 'a11-envelope-1',
+        mode: 'need_user',
+        question: String(parsed.question || parsed.message || '').trim(),
+        choices: Array.isArray(parsed.choices) ? parsed.choices.map((choice) => String(choice || '').trim()).filter(Boolean) : [],
+        id: String(parsed.id || '').trim() || undefined,
+        conversationId: normalizeConversationId(parsed.conversationId || defaults.conversationId),
+        userId: String(parsed.userId || defaults.userId || '').trim() || undefined,
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function formatNeedUserEnvelope(envelope) {
+  const question = String(envelope?.question || '').trim() || 'J’ai besoin d’une precision.';
+  const choices = Array.isArray(envelope?.choices)
+    ? envelope.choices.map((choice) => String(choice || '').trim()).filter(Boolean)
+    : [];
+  if (!choices.length) return question;
+  return `${question}\n\nChoix: ${choices.join(' | ')}`;
+}
+
 function applyAssistantTextToPayload(payload, content, extras = null) {
   const normalizedContent = normalizeAssistantOutput(content);
   if (!payload || typeof payload !== 'object') {
@@ -3617,6 +4484,8 @@ async function resolveAssistantActionEnvelope({
   conversationId,
   userId,
   requestOrigin = '',
+  executionContext = null,
+  messages = [],
 }) {
   const envelope = parseAssistantActionEnvelope(content, { conversationId, userId });
   if (!envelope) {
@@ -3644,12 +4513,13 @@ async function resolveAssistantActionEnvelope({
     };
   }
 
-  const cerbere = await runActionsEnvelope(envelope);
-  let explanation = summarizeCerbereResults(cerbere);
+  const cerbere = await runActionsEnvelope(envelope, executionContext || {});
   const publicImageUrl = extractImagePathFromCerbere(cerbere, requestOrigin);
-  if (publicImageUrl) {
-    explanation += `\n\n![resultat](${publicImageUrl})`;
-  }
+  const explanation = await generateDevActionReply({
+    messages,
+    cerbere,
+    imagePath: publicImageUrl,
+  });
 
   appendConversationLog({
     type: 'agent_actions',
@@ -3673,6 +4543,274 @@ async function resolveAssistantActionEnvelope({
       imagePath: publicImageUrl || null,
     },
   };
+}
+
+const DEV_ACTION_REPLY_SYSTEM_PROMPT = [
+  'Tu es A11.',
+  'Tu reformules le resultat final d\'une demande executee en mode dev.',
+  'Reponds en francais, en 1 ou 2 phrases courtes maximum.',
+  'Ne mentionne jamais Cerbere, Qflush, JSON, outil, pipeline, phase, log, backend ou mode dev.',
+  'Si tout a reussi, confirme simplement que c\'est fait.',
+  'Si une partie echoue, explique brievement la vraie raison du blocage.',
+  'Si plusieurs actions ont ete executees, donne seulement le resultat global.',
+  'Si un fichier, PDF, image, archive ou email a ete produit, dis juste qu\'il est pret ou envoye.',
+  'N\'invente rien.'
+].join(' ');
+
+function stripDevEnginePrefix(value) {
+  return String(value || '').replace(/^\s*\[DEV_ENGINE\]\s*/i, '').trim();
+}
+
+function getLatestUserMessageFromMessages(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const message = list[index];
+    if (message?.role === 'user' && typeof message.content === 'string' && message.content.trim()) {
+      return stripDevEnginePrefix(message.content);
+    }
+  }
+  return '';
+}
+
+function isThinDevFinalReply(value) {
+  const normalized = normalizeAssistantOutput(value).toLowerCase();
+  if (!normalized) return true;
+  return [
+    'ok',
+    'fait',
+    'termine',
+    'termine.',
+    'cest fait',
+    'cest fait.',
+    "c'est fait",
+    "c'est fait.",
+  ].includes(normalized);
+}
+
+function isUnsafeDevFollowupReply(value) {
+  const normalized = normalizeAssistantOutput(value);
+  if (!normalized) return true;
+  if (parseAssistantActionEnvelope(normalized)) return true;
+  if (/\[[^\]]+\]/.test(normalized)) return true;
+  if (/voici le resultat final/i.test(normalized)) return true;
+  if (/cerbere|qflush|json|pipeline|backend|tool/i.test(normalized)) return true;
+  return false;
+}
+
+function sanitizeDevActionError(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const line = raw.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean)[0] || raw;
+  return line.length > 180 ? `${line.slice(0, 177).trimEnd()}...` : line;
+}
+
+function extractPrimaryResultLabel(entry) {
+  const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+  const outputPath = String(
+    result.outputPath
+      || result.path
+      || result.filePath
+      || result.savedAs
+      || result?.file?.path
+      || result?.resource?.path
+      || ''
+  ).trim();
+  const filename = String(
+    result?.file?.filename
+      || result?.resource?.filename
+      || result?.artifact?.filename
+      || result?.zip?.outputPath
+      || ''
+  ).trim();
+  if (filename) {
+    return path.basename(filename);
+  }
+  if (outputPath) {
+    return path.basename(outputPath);
+  }
+  return '';
+}
+
+function extractPrimaryRecipient(entry) {
+  const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+  const rawRecipients = []
+    .concat(Array.isArray(result?.to) ? result.to : [])
+    .concat(Array.isArray(result?.mail?.to) ? result.mail.to : [])
+    .concat(
+      result?.to && !Array.isArray(result.to) ? [result.to] : [],
+      result?.mail?.to && !Array.isArray(result.mail.to) ? [result.mail.to] : [],
+      result?.mail?.emailTo ? [result.mail.emailTo] : []
+    )
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  return rawRecipients[0] || '';
+}
+
+function buildDevActionReplyContext(cerbere, imagePath = null, userRequest = '') {
+  const rawResults = Array.isArray(cerbere?.results)
+    ? cerbere.results
+    : (Array.isArray(cerbere?.actions) ? cerbere.actions : []);
+  const results = rawResults.slice(0, 12).map((entry) => {
+    const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+    const explicitOk = typeof result.ok === 'boolean'
+      ? result.ok
+      : (typeof entry?.ok === 'boolean' ? entry.ok : null);
+    const error = sanitizeDevActionError(entry?.error || result?.error || result?.message || '');
+    const ok = explicitOk === null ? !error : explicitOk;
+    return {
+      action: String(entry?.name || entry?.tool || entry?.action || 'action').trim() || 'action',
+      ok,
+      label: extractPrimaryResultLabel(entry) || undefined,
+      to: extractPrimaryRecipient(entry) || undefined,
+      count: Number(
+        result?.count
+        || (Array.isArray(result?.jobs) ? result.jobs.length : 0)
+        || (Array.isArray(result?.resources) ? result.resources.length : 0)
+        || (Array.isArray(result?.files) ? result.files.length : 0)
+      ) || undefined,
+      error: error || undefined,
+    };
+  });
+  const successCount = results.filter((entry) => entry.ok).length;
+  const failureCount = results.length - successCount;
+  return {
+    userRequest: stripDevEnginePrefix(userRequest),
+    imageReady: Boolean(imagePath),
+    successCount,
+    failureCount,
+    results,
+  };
+}
+
+function buildDeterministicDevActionReply(context) {
+  const results = Array.isArray(context?.results) ? context.results : [];
+  if (!results.length) {
+    return "Je n'ai rien execute pour cette demande.";
+  }
+
+  const successCount = Number(context?.successCount || 0);
+  const failureCount = Number(context?.failureCount || 0);
+  const firstResult = results[0] || null;
+  const firstError = results.find((entry) => !entry.ok);
+  const errorReason = sanitizeDevActionError(firstError?.error || '');
+
+  if (failureCount === 0) {
+    if (results.length > 1) {
+      return context?.imageReady
+        ? "C'est fait. La demande a bien ete executee et le resultat est pret."
+        : "C'est fait. La demande a bien ete executee.";
+    }
+
+    if (firstResult?.action === 'generate_png') return "C'est fait. L'image est prete.";
+    if (firstResult?.action === 'generate_pdf') return "C'est fait. Le PDF est pret.";
+    if (firstResult?.action === 'send_email') {
+      return firstResult?.to
+        ? `C'est fait. Le mail a bien ete envoye a ${firstResult.to}.`
+        : "C'est fait. Le mail a bien ete envoye.";
+    }
+    if (firstResult?.action === 'share_file') {
+      return firstResult?.to
+        ? `C'est fait. Le fichier a bien ete partage et envoye a ${firstResult.to}.`
+        : "C'est fait. Le fichier a bien ete partage.";
+    }
+    if (firstResult?.action === 'zip_and_email') return "C'est fait. L'archive a ete creee et envoyee.";
+    if (firstResult?.action === 'list_scheduled_emails') {
+      if (!firstResult?.count) return "C'est fait. Il n'y a aucun email planifie pour le moment.";
+      return firstResult.count === 1
+        ? "C'est fait. J'ai retrouve 1 email planifie."
+        : `C'est fait. J'ai retrouve ${firstResult.count} emails planifies.`;
+    }
+    if (firstResult?.action === 'list_resources') {
+      if (!firstResult?.count) return "C'est fait. Je n'ai trouve aucune ressource pour le moment.";
+      return firstResult.count === 1
+        ? "C'est fait. J'ai retrouve 1 ressource."
+        : `C'est fait. J'ai retrouve ${firstResult.count} ressources.`;
+    }
+    if (firstResult?.action === 'list_stored_files') {
+      if (!firstResult?.count) return "C'est fait. Je n'ai trouve aucun fichier stocke pour le moment.";
+      return firstResult.count === 1
+        ? "C'est fait. J'ai retrouve 1 fichier stocke."
+        : `C'est fait. J'ai retrouve ${firstResult.count} fichiers stockes.`;
+    }
+    if (firstResult?.action === 'schedule_email' || firstResult?.action === 'schedule_resource_email' || firstResult?.action === 'schedule_latest_resource_email') {
+      return "C'est bon. L'envoi a bien ete planifie.";
+    }
+    return context?.imageReady
+      ? "C'est fait. Le resultat est pret."
+      : "C'est fait. L'action demandee a bien ete executee.";
+  }
+
+  if (successCount > 0) {
+    return errorReason
+      ? `J'ai bien avance, mais je n'ai pas pu tout terminer : ${errorReason}`
+      : "J'ai bien avance, mais je n'ai pas pu tout terminer.";
+  }
+
+  return errorReason
+    ? `Je n'ai pas pu executer la demande : ${errorReason}`
+    : "Je n'ai pas pu executer la demande.";
+}
+
+async function generateDevActionReply({ messages = [], cerbere, imagePath = null }) {
+  const latestUserMessage = getLatestUserMessageFromMessages(messages);
+  const context = buildDevActionReplyContext(cerbere, imagePath, latestUserMessage);
+  const fallbackReply = buildDeterministicDevActionReply(context);
+  if (!context.results.length) {
+    return fallbackReply;
+  }
+  if (Number(context.failureCount || 0) === 0) {
+    return fallbackReply;
+  }
+
+  const promptMessages = [
+    { role: 'system', content: DEV_ACTION_REPLY_SYSTEM_PROMPT },
+    {
+      role: 'user',
+      content: [
+        `Demande utilisateur: ${context.userRequest || '(non fournie)'}`,
+        '',
+        'Resultat brut:',
+        JSON.stringify(context, null, 2),
+        '',
+        'Redige maintenant la reponse finale utilisateur.'
+      ].join('\n')
+    }
+  ];
+
+  const qflushChatFlow = getQflushChatFlow();
+  if (qflushChatFlow) {
+    try {
+      const qflushResult = await runQflushFlow(qflushChatFlow, {
+        prompt: context.userRequest || 'Confirme le resultat final.',
+        messages: promptMessages,
+        systemPrompt: DEV_ACTION_REPLY_SYSTEM_PROMPT,
+        request: {
+          mode: 'dev_followup_confirmation',
+          userRequest: context.userRequest || null,
+        },
+      });
+      const qflushText = normalizeAssistantOutput(extractAssistantText(qflushResult));
+      if (qflushText && !isUnsafeDevFollowupReply(qflushText) && !isThinDevFinalReply(qflushText)) {
+        return qflushText;
+      }
+    } catch (error_) {
+      console.warn('[A11][dev-followup] qflush follow-up failed:', error_?.message || error_);
+    }
+  }
+
+  try {
+    const llmText = normalizeAssistantOutput(await callChatBackend(promptMessages, {
+      provider: getMemorySummaryProvider(),
+      model: process.env.MEMORY_SUMMARY_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    }));
+    if (llmText && !isUnsafeDevFollowupReply(llmText) && !isThinDevFinalReply(llmText)) {
+      return llmText;
+    }
+  } catch (error_) {
+    console.warn('[A11][dev-followup] llm follow-up failed:', error_?.message || error_);
+  }
+
+  return fallbackReply;
 }
 
 function isSiwisStatusQuestion(value) {
@@ -4099,6 +5237,10 @@ async function proxyQflushChat(req, res) {
       conversationId,
       userId,
       requestOrigin: getRequestOrigin(req),
+      executionContext: {
+        authToken: getAuthTokenFromRequest(req),
+      },
+      messages: Array.isArray(body.messages) ? body.messages : [],
     });
     const content = resolvedAssistant.content;
     if (userId && content) {
@@ -4177,6 +5319,10 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
       conversationId,
       userId,
       requestOrigin: getRequestOrigin(req),
+      executionContext: {
+        authToken: getAuthTokenFromRequest(req),
+      },
+      messages: Array.isArray(body.messages) ? body.messages : [],
     });
     const content = resolvedAssistant.content;
     const data = {
@@ -4302,6 +5448,10 @@ async function proxyChatToOpenAI(req, res) {
       conversationId,
       userId,
       requestOrigin: getRequestOrigin(req),
+      executionContext: {
+        authToken: getAuthTokenFromRequest(req),
+      },
+      messages: Array.isArray(req.body?.messages) ? req.body.messages : [],
     });
     const content = resolvedAssistant.content;
     applyAssistantTextToPayload(data, content, resolvedAssistant.extras);
@@ -4526,17 +5676,39 @@ app.post('/ai', async (req, res) => {
 });
 
 const { A11_AGENT_SYSTEM_PROMPT, A11_AGENT_DEV_PROMPT } = require('./lib/a11Agent.js');
-const { runAction, runActionsEnvelope } = require('./src/a11/tools-dispatcher.cjs');
+const { runAction, runActionsEnvelope, getAllowedActionNames } = require('./src/a11/tools-dispatcher.cjs');
 
-async function callA11LLM(messages) {
+function buildA11AgentInjectedContext(messages, toolResults = []) {
+  const userPrompt = buildPromptFromMessages(Array.isArray(messages) ? messages : []);
+  const workspaceRoot = String(
+    process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || path.resolve(__dirname, '..', '..')
+  ).trim();
+  const allowedActions = getAllowedActionNames();
+  return [
+    '[TOOLS]',
+    `AllowedActions=${JSON.stringify(allowedActions)}`,
+    '',
+    '[CONTEXT]',
+    `workspaceRoot=${workspaceRoot}`,
+    '',
+    '[TOOL_RESULTS]',
+    JSON.stringify(Array.isArray(toolResults) ? toolResults : [], null, 2),
+    '',
+    '[USER_PROMPT]',
+    userPrompt,
+  ].join('\n');
+}
+
+async function callA11LLM(messages, options = {}) {
   const backend = BACKENDS.llama_local;
   const upstreamUrl = `${backend.replace(/\/$/, '')}/v1/chat/completions`;
+  const injectedContext = buildA11AgentInjectedContext(messages, options.toolResults);
   const body = {
     model: 'llama3.2:latest',
     messages: [
       { role: 'system', content: A11_AGENT_SYSTEM_PROMPT },
       { role: 'system', content: A11_AGENT_DEV_PROMPT },
-      ...messages
+      { role: 'user', content: injectedContext }
     ],
     stream: false
   };
@@ -4581,6 +5753,62 @@ function summarizeCerbereResults(cerbere) {
       }
       if (tool === 'write_file') {
         return `• Fichier écrit${label ? ` (${label})` : ''}`;
+      }
+      if (tool === 'share_file') {
+        const fileLabel = result?.file?.filename || label;
+        const mailedTo = Array.isArray(result?.mail?.to)
+          ? result.mail.to.join(', ')
+          : String(result?.mail?.to || result?.mail?.emailTo || '').trim();
+        return `• Fichier partagé${fileLabel ? ` (${fileLabel})` : ''}${mailedTo ? ` et envoyé à ${mailedTo}` : ''}`;
+      }
+      if (tool === 'send_email') {
+        const mailedTo = Array.isArray(result?.to)
+          ? result.to.join(', ')
+          : Array.isArray(result?.mail?.to)
+            ? result.mail.to.join(', ')
+            : String(result?.to || result?.mail?.to || '').trim();
+        return `• Email envoyé${mailedTo ? ` à ${mailedTo}` : ''}`;
+      }
+      if (tool === 'list_stored_files') {
+        const count = Number(result?.count || (Array.isArray(result?.files) ? result.files.length : 0));
+        return `• ${count} fichier(s) stocké(s) listé(s)`;
+      }
+      if (tool === 'list_resources') {
+        const count = Number(result?.count || (Array.isArray(result?.resources) ? result.resources.length : 0));
+        return `• ${count} ressource(s) listée(s)`;
+      }
+      if (tool === 'get_latest_resource') {
+        const labelResource = result?.resource?.filename ? ` (${result.resource.filename})` : '';
+        return `• Dernière ressource trouvée${labelResource}`;
+      }
+      if (tool === 'email_resource') {
+        const mailedTo = Array.isArray(result?.to)
+          ? result.to.join(', ')
+          : String(result?.to || result?.mail?.to || '').trim();
+        const labelResource = result?.resource?.filename ? ` (${result.resource.filename})` : '';
+        return `• Ressource envoyée${labelResource}${mailedTo ? ` à ${mailedTo}` : ''}`;
+      }
+      if (tool === 'email_latest_resource') {
+        const mailedTo = Array.isArray(result?.to)
+          ? result.to.join(', ')
+          : String(result?.to || result?.mail?.to || '').trim();
+        const labelResource = result?.resource?.filename ? ` (${result.resource.filename})` : '';
+        return `• Dernière ressource envoyée${labelResource}${mailedTo ? ` à ${mailedTo}` : ''}`;
+      }
+      if (tool === 'schedule_email' || tool === 'schedule_resource_email' || tool === 'schedule_latest_resource_email') {
+        const sendAt = String(result?.job?.sendAt || '').trim();
+        return `• Email planifié${sendAt ? ` pour ${sendAt}` : ''}`;
+      }
+      if (tool === 'list_scheduled_emails') {
+        const count = Number(result?.count || (Array.isArray(result?.jobs) ? result.jobs.length : 0));
+        return `• ${count} email(s) planifié(s) listé(s)`;
+      }
+      if (tool === 'cancel_scheduled_email') {
+        return `• Email planifié annulé`;
+      }
+      if (tool === 'zip_and_email') {
+        const labelZip = result?.zip?.outputPath ? ` (${path.basename(result.zip.outputPath)})` : '';
+        return `• Archive ZIP créée et envoyée${labelZip}`;
       }
       return `• ${tool} → ok`;
     });
@@ -4648,6 +5876,164 @@ function extractImagePathFromCerbere(cerbere, requestOrigin = '') {
   return null;
 }
 
+async function runA11AgentLoop({
+  messages,
+  conversationId,
+  userId,
+  requestOrigin = '',
+  executionContext = null,
+  maxLoops = 5,
+}) {
+  const aggregatedActions = [];
+  const aggregatedResults = [];
+  let toolResults = [];
+  let latestOutput = '';
+  let imagePath = null;
+
+  for (let loopIndex = 0; loopIndex < maxLoops; loopIndex += 1) {
+    latestOutput = await callA11LLM(messages, { toolResults });
+    const envelope = parseAssistantEnvelope(latestOutput, { conversationId, userId });
+
+    if (!envelope) {
+      const text = normalizeAssistantOutput(latestOutput);
+      if (!aggregatedResults.length) {
+        return {
+          ok: true,
+          mode: 'text',
+          explanation: text,
+          text,
+          imagePath,
+          cerbere: null,
+          envelope: null,
+        };
+      }
+      const generatedReply = await generateDevActionReply({
+        messages,
+        cerbere: { ok: true, results: aggregatedResults },
+        imagePath,
+      });
+      return {
+        ok: true,
+        mode: 'dev',
+        explanation: text && !isThinDevFinalReply(text) ? text : generatedReply,
+        text: null,
+        imagePath,
+        cerbere: { ok: true, results: aggregatedResults },
+        envelope: {
+          version: 'a11-envelope-1',
+          mode: 'actions',
+          conversationId,
+          userId,
+          actions: aggregatedActions,
+        },
+      };
+    }
+
+    if (envelope.mode === 'final') {
+      const text = normalizeAssistantOutput(envelope.answer || 'Termine.');
+      if (!aggregatedResults.length) {
+        return {
+          ok: true,
+          mode: 'text',
+          explanation: text,
+          text,
+          imagePath,
+          cerbere: null,
+          envelope,
+        };
+      }
+      const generatedReply = await generateDevActionReply({
+        messages,
+        cerbere: { ok: true, results: aggregatedResults },
+        imagePath,
+      });
+      return {
+        ok: true,
+        mode: 'dev',
+        explanation: text && !isThinDevFinalReply(text) ? text : generatedReply,
+        text: null,
+        imagePath,
+        cerbere: { ok: true, results: aggregatedResults },
+        envelope: {
+          version: 'a11-envelope-1',
+          mode: 'actions',
+          conversationId,
+          userId,
+          actions: aggregatedActions,
+        },
+      };
+    }
+
+    if (envelope.mode === 'need_user') {
+      const text = formatNeedUserEnvelope(envelope);
+      if (!aggregatedResults.length) {
+        return {
+          ok: true,
+          mode: 'text',
+          explanation: text,
+          text,
+          imagePath,
+          cerbere: null,
+          envelope,
+        };
+      }
+      return {
+        ok: true,
+        mode: 'dev',
+        explanation: text,
+        text: null,
+        imagePath,
+        cerbere: { ok: true, results: aggregatedResults },
+        envelope: {
+          version: 'a11-envelope-1',
+          mode: 'actions',
+          conversationId,
+          userId,
+          actions: aggregatedActions,
+        },
+      };
+    }
+
+    aggregatedActions.push(...(Array.isArray(envelope.actions) ? envelope.actions : []));
+    const cerbere = await runActionsEnvelope(envelope, executionContext || {});
+    const batchResults = Array.isArray(cerbere?.results) ? cerbere.results : [];
+    aggregatedResults.push(...batchResults);
+    toolResults = batchResults;
+
+    const batchImagePath = extractImagePathFromCerbere(cerbere, requestOrigin);
+    if (batchImagePath) {
+      imagePath = batchImagePath;
+    }
+
+    if (!batchResults.length) {
+      break;
+    }
+  }
+
+  const combinedCerbere = aggregatedResults.length ? { ok: true, results: aggregatedResults } : null;
+  const explanation = combinedCerbere
+    ? await generateDevActionReply({ messages, cerbere: combinedCerbere, imagePath })
+    : normalizeAssistantOutput(latestOutput);
+
+  return {
+    ok: true,
+    mode: combinedCerbere ? 'dev' : 'text',
+    explanation,
+    text: combinedCerbere ? null : explanation,
+    imagePath,
+    cerbere: combinedCerbere,
+    envelope: aggregatedActions.length
+      ? {
+          version: 'a11-envelope-1',
+          mode: 'actions',
+          conversationId,
+          userId,
+          actions: aggregatedActions,
+        }
+      : null,
+  };
+}
+
 app.post('/api/agent', express.json(), async (req, res) => {
   try {
     const body = req.body || {};
@@ -4661,6 +6047,9 @@ app.post('/api/agent', express.json(), async (req, res) => {
 
     const userId = String(req.user?.id || body.userId || '').trim();
     const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
+    const executionContext = {
+      authToken: getAuthTokenFromRequest(req),
+    };
 
     let envelope = normalizeActionEnvelopeShape(body.envelope, {
       conversationId,
@@ -4668,19 +6057,22 @@ app.post('/api/agent', express.json(), async (req, res) => {
     });
 
     if (!envelope && Array.isArray(body.messages) && body.messages.length > 0) {
-      const llmOutput = await callA11LLM(body.messages);
-      envelope = parseAssistantActionEnvelope(llmOutput, {
+      const loopResult = await runA11AgentLoop({
+        messages: body.messages,
         conversationId,
         userId,
+        requestOrigin: getRequestOrigin(req),
+        executionContext,
       });
-      if (!envelope) {
-        return res.json({
-          ok: true,
-          mode: 'text',
-          explanation: normalizeAssistantOutput(llmOutput),
-          text: normalizeAssistantOutput(llmOutput),
-        });
-      }
+      return res.json({
+        ok: true,
+        mode: loopResult.mode,
+        explanation: loopResult.explanation,
+        text: loopResult.text,
+        imagePath: loopResult.imagePath || null,
+        cerbere: loopResult.cerbere,
+        envelope: loopResult.envelope,
+      });
     }
 
     if (!envelope) {
@@ -4696,6 +6088,8 @@ app.post('/api/agent', express.json(), async (req, res) => {
       conversationId,
       userId,
       requestOrigin: getRequestOrigin(req),
+      executionContext,
+      messages: Array.isArray(body.messages) ? body.messages : [],
     });
 
     return res.json({
