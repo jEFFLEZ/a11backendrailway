@@ -340,6 +340,60 @@ async function resolveStoredConversationResource(ref, options = {}) {
   return selected;
 }
 
+async function listStoredFilesForContext(options = {}) {
+  const context = options.context || {};
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.storedFilesPromise) return cache.storedFilesPromise;
+
+  const limit = Math.max(10, Math.min(80, Number(options.limit || 50)));
+  const promise = fetchInternalJson(`/api/files/my?limit=${limit}`, {
+    method: 'GET',
+  }, context)
+    .then((result) => (result?.ok && Array.isArray(result.files) ? result.files : []))
+    .catch(() => []);
+
+  if (cache) cache.storedFilesPromise = promise;
+  return promise;
+}
+
+async function resolveStoredUserFile(ref, options = {}) {
+  const rawRef = String(ref || '').trim();
+  if (!rawRef) return null;
+
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resolvedStoredFilesByRef instanceof Map && cache.resolvedStoredFilesByRef.has(rawRef)) {
+    return cache.resolvedStoredFilesByRef.get(rawRef) || null;
+  }
+
+  const candidates = buildResourceRefCandidates(rawRef);
+  if (!candidates.length) return null;
+
+  const files = await listStoredFilesForContext(options);
+  if (!files.length) {
+    if (cache?.resolvedStoredFilesByRef instanceof Map) cache.resolvedStoredFilesByRef.set(rawRef, null);
+    return null;
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const file of files) {
+    const score = scoreConversationResourceMatch({
+      id: file?.id,
+      filename: file?.filename,
+      url: file?.url,
+      contentType: file?.content_type || file?.contentType,
+    }, candidates);
+    if (score > bestScore) {
+      best = file;
+      bestScore = score;
+    }
+  }
+
+  const selected = bestScore >= 68 ? best : null;
+  if (cache?.resolvedStoredFilesByRef instanceof Map) cache.resolvedStoredFilesByRef.set(rawRef, selected);
+  return selected;
+}
+
 function normalizeRecipientsInput(value) {
   if (Array.isArray(value)) {
     return Array.from(new Set(
@@ -667,6 +721,9 @@ async function t_share_file(args = {}) {
 
   const buffer = fsSync.readFileSync(fullPath);
   const recipients = normalizeRecipientsInput(args.emailTo || args.to || args.email || args.recipient || args.recipients || '');
+  const attachToEmail = recipients.length
+    ? args.attachToEmail !== false && args.asAttachment !== false
+    : (args.attachToEmail === true || args.asAttachment === true);
   const conversationId = String(
     args.conversationId ||
     args.convId ||
@@ -684,7 +741,7 @@ async function t_share_file(args = {}) {
     emailTo: recipients.length ? recipients : '',
     emailSubject: args.emailSubject || args.subject || '',
     emailMessage: args.emailMessage || args.message || args.body || args.text || '',
-    attachToEmail: args.attachToEmail === true || args.asAttachment === true,
+    attachToEmail,
     ttlSeconds: Number.isFinite(Number(args.ttlSeconds)) && Number(args.ttlSeconds) > 0
       ? Number(args.ttlSeconds)
       : 3600,
@@ -706,6 +763,36 @@ async function t_share_file(args = {}) {
       url: result?.file?.downloadUrl || result?.file?.url || result?.conversationResource?.downloadUrl || result?.conversationResource?.url || '',
       expiresAt: result?.file?.expiresAt || result?.conversationResource?.expiresAt || null,
     };
+  }
+
+  const errorCode = String(result?.error || result?.message || '').trim();
+  const storageLikelyFailed = /r2_|upload_failed|signature|storage/i.test(errorCode)
+    || /signature/i.test(String(result?.detail?.message || result?.detail?.error || ''));
+  if (recipients.length && storageLikelyFailed) {
+    const mailFallback = await t_send_email({
+      ...args,
+      to: recipients,
+      path: fullPath,
+      filename: payload.filename,
+      attachToEmail: true,
+      _context: context,
+      conversationId: conversationId || null,
+    });
+
+    if (mailFallback?.ok) {
+      return {
+        ok: true,
+        path: fullPath,
+        file: null,
+        mail: mailFallback.mail || null,
+        record: null,
+        conversationResource: null,
+        url: '',
+        expiresAt: null,
+        mailOnly: true,
+        storageFallbackReason: errorCode || 'storage_failed',
+      };
+    }
   }
 
   return {
@@ -1404,16 +1491,23 @@ async function t_web_search(args = {}) {
   }
 
   const url = "https://duckduckgo.com/html/?q=" + encodeURIComponent(q);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  let html = "";
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      signal: controller.signal,
+    });
+    html = await resp.text();
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
-  const resp = await axios.get(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-  });
-
-  const html = resp.data || "";
   const results = [];
   // Extraction des liens classiques
   const regex = /<a[^>]+class=\"result__a\"[^>]*href=\"([^\"]+)\"[^>]*>(.*?)<\/a>[\s\S]*?<a[^>]+class=\"result__snippet\"[^>]*>(.*?)<\/a>/gi;
@@ -1423,13 +1517,14 @@ async function t_web_search(args = {}) {
     const href = match[1];
     const rawTitle = match[2] || "";
     const rawSnippet = match[3] || "";
+    const decodedHref = decodeDuckDuckGoResultUrl(href);
 
     const title = rawTitle.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
     const snippet = rawSnippet.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
 
     results.push({
       title,
-      url: href,
+      url: decodedHref,
       snippet,
       isImage: false
     });
@@ -1458,6 +1553,20 @@ async function t_web_search(args = {}) {
     query: q,
     results
   };
+}
+
+function decodeDuckDuckGoResultUrl(rawUrl) {
+  const candidate = String(rawUrl || '').trim();
+  if (!candidate) return '';
+
+  const normalized = candidate.startsWith('//') ? `https:${candidate}` : candidate;
+  try {
+    const url = new URL(normalized);
+    const uddg = url.searchParams.get('uddg');
+    return uddg ? decodeURIComponent(uddg) : normalized;
+  } catch {
+    return normalized;
+  }
 }
 
 // FS SEARCH (via QFlush)
@@ -1525,6 +1634,19 @@ async function loadImageBuffer(ref, options = {}) {
       }
       console.warn('[generate_pdf] stored image download failed:', matchedResource.id, downloaded?.error || downloaded?.status || 'unknown');
     }
+    const matchedFile = await resolveStoredUserFile(ref, options).catch(() => null);
+    if (matchedFile?.url) {
+      try {
+        const remote = await fetch(String(matchedFile.url));
+        if (remote.ok) {
+          const arrayBuffer = await remote.arrayBuffer();
+          return Buffer.from(arrayBuffer);
+        }
+        console.warn('[generate_pdf] stored file image URL failed:', matchedFile.url, remote.status);
+      } catch (remoteError) {
+        console.warn('[generate_pdf] stored file image URL error:', matchedFile.url, remoteError?.message || remoteError);
+      }
+    }
     console.warn('[generate_pdf] image file not found:', filePath);
     return null;
   }
@@ -1545,7 +1667,9 @@ async function t_generate_pdf(args = {}) {
   ).trim();
   const resourceCache = {
     resolvedByRef: new Map(),
+    resolvedStoredFilesByRef: new Map(),
     resourcesPromise: null,
+    storedFilesPromise: null,
   };
 
   outputPath = outputPath

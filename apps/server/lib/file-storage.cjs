@@ -31,9 +31,43 @@ function normalizePublicAppUrl(rawUrl) {
   return url.replace(/\/+$/, '');
 }
 
+function normalizeStorageEndpoint(rawEndpoint, bucket = '') {
+  let endpoint = String(rawEndpoint || '').trim();
+  if (!endpoint) return '';
+  if (!/^https?:\/\//i.test(endpoint)) {
+    endpoint = `https://${endpoint.replace(/^\/+/, '')}`;
+  }
+
+  try {
+    const url = new URL(endpoint);
+    url.hash = '';
+    url.search = '';
+
+    const normalizedBucket = String(bucket || '').trim().toLowerCase();
+    const normalizedHost = String(url.hostname || '').trim().toLowerCase();
+
+    if (
+      normalizedBucket &&
+      normalizedHost.startsWith(`${normalizedBucket}.`) &&
+      normalizedHost.includes('.r2.cloudflarestorage.com')
+    ) {
+      url.hostname = url.hostname.slice(normalizedBucket.length + 1);
+    }
+
+    const normalizedPathname = String(url.pathname || '').replace(/\/+$/, '');
+    if (normalizedBucket && normalizedPathname.toLowerCase() === `/${normalizedBucket}`) {
+      url.pathname = '';
+    }
+
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    return endpoint.replace(/\/+$/, '');
+  }
+}
+
 function createFileStorage(config = {}) {
   const r2Config = {
-    endpoint: String(config.endpoint || '').trim(),
+    endpoint: normalizeStorageEndpoint(config.endpoint, config.bucket),
     accessKeyId: String(config.accessKeyId || '').trim(),
     secretAccessKey: String(config.secretAccessKey || '').trim(),
     bucket: String(config.bucket || '').trim(),
@@ -53,6 +87,7 @@ function createFileStorage(config = {}) {
     clientSingleton = new S3Client({
       region: 'auto',
       endpoint: r2Config.endpoint,
+      forcePathStyle: true,
       credentials: {
         accessKeyId: r2Config.accessKeyId,
         secretAccessKey: r2Config.secretAccessKey,
@@ -81,12 +116,20 @@ function createFileStorage(config = {}) {
 
     const safeFilename = sanitizeFileName(filename);
     const storageKey = buildStorageKey(userId, safeFilename);
-    await client.send(new PutObjectCommand({
-      Bucket: r2Config.bucket,
-      Key: storageKey,
-      Body: buffer,
-      ContentType: contentType || 'application/octet-stream',
-    }));
+    try {
+      await client.send(new PutObjectCommand({
+        Bucket: r2Config.bucket,
+        Key: storageKey,
+        Body: buffer,
+        ContentType: contentType || 'application/octet-stream',
+      }));
+    } catch (error) {
+      const message = String(error?.message || error || '').trim();
+      if (/signature/i.test(message)) {
+        error.message = `${message} (verifie R2_ENDPOINT, R2_BUCKET et les cles d'acces)`;
+      }
+      throw error;
+    }
 
     return {
       filename: safeFilename,
@@ -160,4 +203,5 @@ module.exports = {
   createFileStorage,
   sanitizeFileName,
   normalizePublicAppUrl,
+  normalizeStorageEndpoint,
 };
