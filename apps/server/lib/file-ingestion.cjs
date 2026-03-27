@@ -33,6 +33,7 @@ async function ingestUploadedFile({
   saveFileRecord,
   saveUserFileMemory,
   sanitizeFileName,
+  expiresAt,
 }) {
   const normalizedUserId = String(userId || '').trim();
   if (!normalizedUserId) {
@@ -89,6 +90,7 @@ async function ingestUploadedFile({
     url: uploaded.url,
     contentType: normalizedContentType,
     sizeBytes: buffer.length,
+    expiresAt,
   });
 
   await saveUserFileMemory({
@@ -99,6 +101,7 @@ async function ingestUploadedFile({
     contentType: normalizedContentType,
     sizeBytes: buffer.length,
     origin,
+    expiresAt,
   });
 
   let conversationResource = null;
@@ -114,6 +117,7 @@ async function ingestUploadedFile({
       contentType: normalizedContentType,
       sizeBytes: buffer.length,
       metadata: effectiveResourceMetadata,
+      expiresAt,
     });
   }
 
@@ -124,6 +128,7 @@ async function ingestUploadedFile({
       url: uploaded.url,
       contentType: normalizedContentType,
       sizeBytes: buffer.length,
+      expiresAt: expiresAt || null,
     },
     record,
     buffer,

@@ -1,4 +1,4 @@
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 
 async function streamToBuffer(stream) {
   if (!stream) return Buffer.alloc(0);
@@ -121,6 +121,28 @@ function createFileStorage(config = {}) {
     };
   }
 
+  async function deleteObject(storageKey) {
+    const client = getClient();
+    if (!client) {
+      throw new Error('R2 is not configured');
+    }
+
+    const normalizedStorageKey = String(storageKey || '').trim();
+    if (!normalizedStorageKey) {
+      throw new Error('missing_storage_key');
+    }
+
+    await client.send(new DeleteObjectCommand({
+      Bucket: r2Config.bucket,
+      Key: normalizedStorageKey,
+    }));
+
+    return {
+      ok: true,
+      storageKey: normalizedStorageKey,
+    };
+  }
+
   return {
     isConfigured,
     getClient,
@@ -128,6 +150,7 @@ function createFileStorage(config = {}) {
     getPublicUrl,
     uploadBuffer,
     downloadBuffer,
+    deleteObject,
     sanitizeFileName,
     normalizePublicAppUrl,
   };

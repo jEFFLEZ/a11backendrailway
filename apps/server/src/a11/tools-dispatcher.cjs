@@ -184,6 +184,42 @@ async function fetchInternalJson(pathname, options = {}, context = {}) {
   return data;
 }
 
+async function fetchInternalBuffer(pathname, options = {}, context = {}) {
+  const authToken = getAuthTokenFromContext(context);
+  if (!authToken) {
+    throw new Error(`${pathname}: authenticated user context required`);
+  }
+
+  const url = `${getInternalApiBaseUrl()}${pathname}`;
+  const headers = {
+    'X-NEZ-TOKEN': authToken,
+    ...(options.headers || {}),
+  };
+
+  const res = await fetch(url, {
+    method: options.method || 'GET',
+    headers,
+  });
+
+  const arrayBuffer = await res.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      error: buffer.toString('utf8') || `${pathname}: request_failed`,
+    };
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    buffer,
+    contentType: String(res.headers.get('content-type') || '').trim(),
+    contentLength: Number(res.headers.get('content-length') || buffer.length || 0),
+  };
+}
+
 function listAttachmentPaths(args = {}) {
   const items = [];
   if (typeof args.path === 'string' && args.path.trim()) items.push(args.path);
@@ -198,6 +234,110 @@ function listAttachmentPaths(args = {}) {
     }
   }
   return Array.from(new Set(items.map((item) => String(item || '').trim()).filter(Boolean)));
+}
+
+function buildResourceRefCandidates(ref) {
+  const raw = String(ref || '').trim();
+  if (!raw) return [];
+
+  const filename = path.basename(raw);
+  const noQuery = filename.split('?')[0].split('#')[0];
+  const stem = noQuery.replace(/\.[^.]+$/, '');
+  const normalized = [raw, filename, noQuery, stem]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(normalized));
+}
+
+function isLikelyImageResource(resource) {
+  const contentType = String(resource?.contentType || '').toLowerCase();
+  if (contentType.startsWith('image/')) return true;
+  const filename = String(resource?.filename || '').toLowerCase();
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filename);
+}
+
+function scoreConversationResourceMatch(resource, candidates) {
+  const id = Number(resource?.id || 0);
+  const filename = String(resource?.filename || '').trim().toLowerCase();
+  const url = String(resource?.url || '').trim().toLowerCase();
+  const stem = filename.replace(/\.[^.]+$/, '');
+  let score = 0;
+
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim().toLowerCase();
+    if (!normalized) continue;
+    if (Number.isFinite(id) && id > 0 && normalized === String(id)) score = Math.max(score, 120);
+    if (normalized === filename) score = Math.max(score, 110);
+    if (normalized === path.basename(filename)) score = Math.max(score, 105);
+    if (normalized === stem) score = Math.max(score, 95);
+    if (filename.includes(normalized)) score = Math.max(score, 72);
+    if (url && (url === normalized || url.includes(normalized))) score = Math.max(score, 68);
+  }
+
+  if (isLikelyImageResource(resource)) score += 12;
+  return score;
+}
+
+async function listConversationResourcesForContext(options = {}) {
+  const context = options.context || {};
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resourcesPromise) return cache.resourcesPromise;
+
+  const conversationId = String(
+    options.conversationId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  if (!conversationId) return [];
+
+  const search = new URLSearchParams();
+  search.set('conversationId', conversationId);
+  search.set('limit', String(Math.max(10, Math.min(60, Number(options.limit || 40)))));
+
+  const promise = fetchInternalJson(`/api/resources/my?${search.toString()}`, {
+    method: 'GET',
+  }, context)
+    .then((result) => (result?.ok && Array.isArray(result.resources) ? result.resources : []))
+    .catch(() => []);
+
+  if (cache) cache.resourcesPromise = promise;
+  return promise;
+}
+
+async function resolveStoredConversationResource(ref, options = {}) {
+  const rawRef = String(ref || '').trim();
+  if (!rawRef) return null;
+
+  const cache = options.resourceCache && typeof options.resourceCache === 'object' ? options.resourceCache : null;
+  if (cache?.resolvedByRef instanceof Map && cache.resolvedByRef.has(rawRef)) {
+    return cache.resolvedByRef.get(rawRef) || null;
+  }
+
+  const candidates = buildResourceRefCandidates(rawRef);
+  if (!candidates.length) return null;
+
+  const resources = await listConversationResourcesForContext(options);
+  if (!resources.length) {
+    if (cache?.resolvedByRef instanceof Map) cache.resolvedByRef.set(rawRef, null);
+    return null;
+  }
+
+  let best = null;
+  let bestScore = 0;
+  for (const resource of resources) {
+    const score = scoreConversationResourceMatch(resource, candidates);
+    if (score > bestScore) {
+      best = resource;
+      bestScore = score;
+    }
+  }
+
+  const selected = bestScore >= 68 ? best : null;
+  if (cache?.resolvedByRef instanceof Map) cache.resolvedByRef.set(rawRef, selected);
+  return selected;
 }
 
 function normalizeRecipientsInput(value) {
@@ -527,15 +667,27 @@ async function t_share_file(args = {}) {
 
   const buffer = fsSync.readFileSync(fullPath);
   const recipients = normalizeRecipientsInput(args.emailTo || args.to || args.email || args.recipient || args.recipients || '');
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
   const payload = {
     filename: args.filename || path.basename(fullPath),
     contentBase64: buffer.toString('base64'),
     contentType: args.contentType || guessContentType(fullPath),
-    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    conversationId: conversationId || null,
     emailTo: recipients.length ? recipients : '',
     emailSubject: args.emailSubject || args.subject || '',
     emailMessage: args.emailMessage || args.message || args.body || args.text || '',
     attachToEmail: args.attachToEmail === true || args.asAttachment === true,
+    ttlSeconds: Number.isFinite(Number(args.ttlSeconds)) && Number(args.ttlSeconds) > 0
+      ? Number(args.ttlSeconds)
+      : 3600,
   };
 
   const result = await fetchInternalJson('/api/files/upload', {
@@ -551,6 +703,8 @@ async function t_share_file(args = {}) {
       mail: result.mail || null,
       record: result.record || null,
       conversationResource: result.conversationResource || null,
+      url: result?.file?.downloadUrl || result?.file?.url || result?.conversationResource?.downloadUrl || result?.conversationResource?.url || '',
+      expiresAt: result?.file?.expiresAt || result?.conversationResource?.expiresAt || null,
     };
   }
 
@@ -1201,7 +1355,42 @@ async function t_web_fetch(args = {}) {
   if (!url || typeof url !== 'string') {
     throw new Error('web_fetch: missing "url"');
   }
-  return await runQflushFlow('web_fetch', { url });
+  try {
+    return await runQflushFlow('web_fetch', { url });
+  } catch (error_) {
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      }
+    });
+
+    const html = String(response.data || '');
+    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const text = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&quot;/gi, '"')
+      .replace(/&#39;/gi, "'")
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      ok: true,
+      url,
+      status: Number(response.status || 0) || 200,
+      title: titleMatch?.[1]?.replace(/\s+/g, ' ').trim() || undefined,
+      content: text.slice(0, 8000),
+      fetchedVia: 'http-fallback',
+      warning: `web_fetch fallback utilise (QFLUSH indisponible: ${error_?.message || error_})`,
+    };
+  }
 }
 
 // WEB SEARCH (DuckDuckGo minimal)
@@ -1290,8 +1479,8 @@ async function t_llm_analyze_text(args = {}) {
   };
 }
 
-// Helper pour charger une image (URL ou path)
-async function loadImageBuffer(ref) {
+// Helper pour charger une image (URL, path, ou ressource de conversation)
+async function loadImageBuffer(ref, options = {}) {
   if (!ref || typeof ref !== 'string') return null;
 
   // URL HTTP/HTTPS
@@ -1310,6 +1499,13 @@ async function loadImageBuffer(ref) {
     }
   }
 
+  if (/^\/api\//i.test(ref)) {
+    const downloaded = await fetchInternalBuffer(ref, { method: 'GET' }, options.context || {});
+    if (downloaded?.ok && downloaded.buffer) {
+      return downloaded.buffer;
+    }
+  }
+
   // Chemin local
   let filePath = String(ref).trim();
   if (!path.isAbsolute(filePath)) {
@@ -1319,6 +1515,16 @@ async function loadImageBuffer(ref) {
   try {
     return await fsp.readFile(filePath);
   } catch (e) {
+    const matchedResource = await resolveStoredConversationResource(ref, options).catch(() => null);
+    if (matchedResource?.id) {
+      const downloaded = await fetchInternalBuffer(`/api/resources/${matchedResource.id}/download`, {
+        method: 'GET',
+      }, options.context || {});
+      if (downloaded?.ok && downloaded.buffer) {
+        return downloaded.buffer;
+      }
+      console.warn('[generate_pdf] stored image download failed:', matchedResource.id, downloaded?.error || downloaded?.status || 'unknown');
+    }
     console.warn('[generate_pdf] image file not found:', filePath);
     return null;
   }
@@ -1327,6 +1533,20 @@ async function loadImageBuffer(ref) {
 // PDF (generate)
 async function t_generate_pdf(args = {}) {
   let { outputPath, title, content, sections, author, date } = args;
+  const context = args._context || {};
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  const resourceCache = {
+    resolvedByRef: new Map(),
+    resourcesPromise: null,
+  };
 
   outputPath = outputPath
     ? resolveSafePath(outputPath, 'generate_pdf.outputPath')
@@ -1383,7 +1603,11 @@ async function t_generate_pdf(args = {}) {
     }
     // Images centrées
     for (const ref of images) {
-      const buf = await loadImageBuffer(ref);
+      const buf = await loadImageBuffer(ref, {
+        context,
+        conversationId,
+        resourceCache,
+      });
       if (!buf) continue;
       const maxWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
       doc.moveDown(0.5).image(buf, {
@@ -2012,6 +2236,9 @@ function normalizeDispatchActionArgs(actionName, rawArgs = {}) {
     if (!args.path) {
       args.path = args.outputPath || args.filePath || args.attachmentPath || null;
     }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || args?._context?.conversationId || null;
+    }
     if (!args.emailTo) {
       args.emailTo = args.to || args.email || args.recipient || args.recipients || '';
     }
@@ -2316,12 +2543,22 @@ async function runActionsEnvelope(envelope, context = {}) {
   const contextualAllowedActions = Array.isArray(context.allowedActions)
     ? new Set(context.allowedActions.map((entry) => String(entry || '').trim()).filter(Boolean))
     : null;
+  const executionContext = {
+    ...context,
+    conversationId: String(
+      context.conversationId ||
+      envelope.conversationId ||
+      envelope.convId ||
+      envelope.sessionId ||
+      ''
+    ).trim() || context.conversationId || null,
+  };
   for (const a of envelope.actions) {
     const rawName = a.action || a.name;
     const name = normalizeDispatchActionName(rawName);
     const args = normalizeDispatchActionArgs(name, {
       ...(a.arguments || a.input || {}),
-      _context: context,
+      _context: executionContext,
     });
     // Validation stricte du nom d'action
     const valid = validateActionName(name);

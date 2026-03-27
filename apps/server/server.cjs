@@ -85,6 +85,8 @@ const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
 const PARALLEL = Number(process.env.PARALLEL) || 8;
 
 const runtimeConfig = buildRuntimeConfig(process.env);
+const CHAT_TIMEZONE = String(process.env.A11_CHAT_TIMEZONE || process.env.TZ || 'Europe/Paris').trim() || 'Europe/Paris';
+const CHAT_TIME_LOCALE = String(process.env.A11_CHAT_LOCALE || 'fr-FR').trim() || 'fr-FR';
 
 // Set remote qflush URL for production (allow env override)
 process.env.QFLUSH_URL = runtimeConfig.qflush.remoteUrl;
@@ -881,6 +883,8 @@ const R2_SECRET_KEY = String(process.env.R2_SECRET_KEY || '').trim();
 const R2_BUCKET = String(process.env.R2_BUCKET || '').trim();
 const R2_PUBLIC_BASE_URL = String(process.env.R2_PUBLIC_BASE_URL || '').trim();
 const FILE_UPLOAD_MAX_BYTES = Number(process.env.FILE_UPLOAD_MAX_BYTES || 10 * 1024 * 1024);
+const TEMP_SHARED_FILE_TTL_MS = Math.max(60 * 1000, Number(process.env.A11_SHARED_FILE_TTL_MS || 60 * 60 * 1000));
+const TEMP_SHARED_FILE_CLEANUP_INTERVAL_MS = Math.max(60 * 1000, Number(process.env.A11_SHARED_FILE_CLEANUP_INTERVAL_MS || 60 * 1000));
 const DEFAULT_ADMIN_USERNAME = String(process.env.DEFAULT_ADMIN_USERNAME || 'Djeff').trim();
 const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || '1991');
 const DEFAULT_ADMIN_EMAIL = String(process.env.DEFAULT_ADMIN_EMAIL || 'djeff@a11.local').trim().toLowerCase();
@@ -927,7 +931,9 @@ if (db) {
         `);
         await db.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS content_type TEXT');
         await db.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS size_bytes INTEGER');
+        await db.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP');
         await db.query('CREATE INDEX IF NOT EXISTS idx_files_user_created_at ON files (user_id, created_at DESC)');
+        await db.query('CREATE INDEX IF NOT EXISTS idx_files_expires_at ON files (expires_at)');
         await db.query(`
           CREATE TABLE IF NOT EXISTS user_facts (
             id SERIAL PRIMARY KEY,
@@ -980,7 +986,9 @@ if (db) {
         `);
         await db.query('ALTER TABLE user_files ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT \'upload\'');
         await db.query('ALTER TABLE user_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+        await db.query('ALTER TABLE user_files ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP');
         await db.query('CREATE INDEX IF NOT EXISTS idx_user_files_user_created ON user_files (user_id, created_at DESC)');
+        await db.query('CREATE INDEX IF NOT EXISTS idx_user_files_expires_at ON user_files (expires_at)');
         await db.query(`
           CREATE TABLE IF NOT EXISTS conversation_resources (
             id SERIAL PRIMARY KEY,
@@ -1006,8 +1014,10 @@ if (db) {
         await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS size_bytes INTEGER');
         await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS metadata_json JSONB');
         await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()');
+        await db.query('ALTER TABLE conversation_resources ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP');
         await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_conversation_created ON conversation_resources (user_id, conversation_id, created_at DESC)');
         await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_user_kind_updated ON conversation_resources (user_id, resource_kind, updated_at DESC)');
+        await db.query('CREATE INDEX IF NOT EXISTS idx_conversation_resources_expires_at ON conversation_resources (expires_at)');
 
         const adminLookup = await db.query(
           'SELECT id FROM users WHERE LOWER(username)=LOWER($1) OR LOWER(email)=LOWER($2) LIMIT 1',
@@ -1461,17 +1471,34 @@ async function saveStructuredMemoryFromMessage(userId, message) {
   }
 }
 
-async function saveUserFileMemory({ userId, filename, storageKey, url, contentType, sizeBytes, origin }) {
+function buildTemporaryFileExpiryDate(ttlMs = TEMP_SHARED_FILE_TTL_MS) {
+  return new Date(Date.now() + Math.max(60 * 1000, Number(ttlMs || TEMP_SHARED_FILE_TTL_MS)));
+}
+
+function normalizeOptionalTimestamp(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function isResourceExpired(resource) {
+  const expiresAt = normalizeOptionalTimestamp(resource?.expiresAt || resource?.expires_at || null);
+  return !!(expiresAt && expiresAt.getTime() <= Date.now());
+}
+
+async function saveUserFileMemory({ userId, filename, storageKey, url, contentType, sizeBytes, origin, expiresAt }) {
   const normalizedUserId = String(userId || '').trim();
   const normalizedFilename = normalizeMemoryText(filename).slice(0, 220);
   const normalizedStorageKey = normalizeMemoryText(storageKey).slice(0, 500);
   const normalizedUrl = normalizeMemoryText(url).slice(0, 1200);
+  const normalizedExpiresAt = normalizeOptionalTimestamp(expiresAt);
   if (!db || !normalizedUserId || !normalizedFilename) return;
 
   if (normalizedStorageKey) {
     await db.query(
-      `INSERT INTO user_files (user_id, filename, storage_key, url, content_type, size_bytes, origin, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+      `INSERT INTO user_files (user_id, filename, storage_key, url, content_type, size_bytes, origin, expires_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
        ON CONFLICT (user_id, storage_key)
        DO UPDATE SET
          filename=EXCLUDED.filename,
@@ -1479,6 +1506,7 @@ async function saveUserFileMemory({ userId, filename, storageKey, url, contentTy
          content_type=EXCLUDED.content_type,
          size_bytes=EXCLUDED.size_bytes,
          origin=EXCLUDED.origin,
+         expires_at=EXCLUDED.expires_at,
          updated_at=NOW()`,
       [
         normalizedUserId,
@@ -1488,14 +1516,15 @@ async function saveUserFileMemory({ userId, filename, storageKey, url, contentTy
         normalizeMemoryText(contentType || '').slice(0, 100) || null,
         Number(sizeBytes || 0),
         normalizeMemoryText(origin || 'upload').slice(0, 80) || 'upload',
+        normalizedExpiresAt,
       ]
     );
     return;
   }
 
   await db.query(
-    `INSERT INTO user_files (user_id, filename, storage_key, url, content_type, size_bytes, origin, created_at, updated_at)
-     VALUES ($1, $2, NULL, $3, $4, $5, $6, NOW(), NOW())`,
+    `INSERT INTO user_files (user_id, filename, storage_key, url, content_type, size_bytes, origin, expires_at, created_at, updated_at)
+     VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, NOW(), NOW())`,
     [
       normalizedUserId,
       normalizedFilename,
@@ -1503,6 +1532,7 @@ async function saveUserFileMemory({ userId, filename, storageKey, url, contentTy
       normalizeMemoryText(contentType || '').slice(0, 100) || null,
       Number(sizeBytes || 0),
       normalizeMemoryText(origin || 'upload').slice(0, 80) || 'upload',
+      normalizedExpiresAt,
     ]
   );
 }
@@ -1536,12 +1566,14 @@ async function linkConversationResource({
   contentType,
   sizeBytes,
   metadata,
+  expiresAt,
 }) {
   const normalizedUserId = String(userId || '').trim();
   const normalizedConversationId = normalizeConversationId(conversationId);
   const normalizedFilename = normalizeMemoryText(filename).slice(0, 220);
   const normalizedStorageKey = normalizeMemoryText(storageKey).slice(0, 500);
   const normalizedUrl = normalizeMemoryText(url).slice(0, 1200);
+  const normalizedExpiresAt = normalizeOptionalTimestamp(expiresAt);
   if (!db || !normalizedUserId || !normalizedFilename || !normalizedStorageKey) return null;
 
   const metadataJson = metadata == null ? null : JSON.stringify(metadata);
@@ -1557,10 +1589,11 @@ async function linkConversationResource({
        content_type,
        size_bytes,
        metadata_json,
+       expires_at,
        created_at,
        updated_at
      )
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, NOW(), NOW())
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, NOW(), NOW())
      ON CONFLICT (user_id, conversation_id, storage_key)
      DO UPDATE SET
        resource_kind=EXCLUDED.resource_kind,
@@ -1570,8 +1603,9 @@ async function linkConversationResource({
        content_type=EXCLUDED.content_type,
        size_bytes=EXCLUDED.size_bytes,
        metadata_json=EXCLUDED.metadata_json,
+       expires_at=EXCLUDED.expires_at,
        updated_at=NOW()
-     RETURNING id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at`,
+     RETURNING id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, expires_at, created_at, updated_at`,
     [
       normalizedUserId,
       normalizedConversationId,
@@ -1583,6 +1617,7 @@ async function linkConversationResource({
       normalizeMemoryText(contentType || '').slice(0, 100) || null,
       Number(sizeBytes || 0),
       metadataJson,
+      normalizedExpiresAt,
     ]
   );
 
@@ -1600,6 +1635,7 @@ async function linkConversationResource({
     contentType: String(row.content_type || ''),
     sizeBytes: Number(row.size_bytes || 0),
     metadata: parseConversationResourceMetadata(row.metadata_json),
+    expiresAt: row.expires_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1631,9 +1667,10 @@ async function listConversationResources(userId, { conversationId, resourceKind,
 
   params.push(normalizedLimit);
   const result = await db.query(
-    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at
+    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, expires_at, created_at, updated_at
      FROM conversation_resources
      WHERE ${conditions.join(' AND ')}
+       AND (expires_at IS NULL OR expires_at > NOW())
      ORDER BY updated_at DESC, created_at DESC, id DESC
      LIMIT $${params.length}`,
     params
@@ -1651,6 +1688,7 @@ async function listConversationResources(userId, { conversationId, resourceKind,
     contentType: String(row.content_type || ''),
     sizeBytes: Number(row.size_bytes || 0),
     metadata: parseConversationResourceMetadata(row.metadata_json),
+    expiresAt: row.expires_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }));
@@ -1662,9 +1700,10 @@ async function getConversationResourceById(userId, resourceId) {
   if (!db || !normalizedUserId || !Number.isFinite(normalizedResourceId) || normalizedResourceId <= 0) return null;
 
   const result = await db.query(
-    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, created_at, updated_at
+    `SELECT id, user_id, conversation_id, resource_kind, origin, filename, storage_key, url, content_type, size_bytes, metadata_json, expires_at, created_at, updated_at
      FROM conversation_resources
      WHERE user_id=$1 AND id=$2
+       AND (expires_at IS NULL OR expires_at > NOW())
      LIMIT 1`,
     [normalizedUserId, normalizedResourceId]
   );
@@ -1683,6 +1722,7 @@ async function getConversationResourceById(userId, resourceId) {
     contentType: String(row.content_type || ''),
     sizeBytes: Number(row.size_bytes || 0),
     metadata: parseConversationResourceMetadata(row.metadata_json),
+    expiresAt: row.expires_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2244,9 +2284,10 @@ async function getUserFilesMemory(userId, limit = FILE_MEMORY_LIMIT) {
 
   const normalizedLimit = Math.max(1, Math.min(50, Number(limit || FILE_MEMORY_LIMIT)));
   const result = await db.query(
-    `SELECT filename, storage_key, url, content_type, size_bytes, origin, created_at
+    `SELECT filename, storage_key, url, content_type, size_bytes, origin, expires_at, created_at
      FROM user_files
      WHERE user_id=$1
+       AND (expires_at IS NULL OR expires_at > NOW())
      ORDER BY created_at DESC, id DESC
      LIMIT $2`,
     [normalizedUserId, normalizedLimit]
@@ -2259,6 +2300,7 @@ async function getUserFilesMemory(userId, limit = FILE_MEMORY_LIMIT) {
     contentType: String(row.content_type || ''),
     sizeBytes: Number(row.size_bytes || 0),
     origin: String(row.origin || ''),
+    expiresAt: row.expires_at || null,
     createdAt: row.created_at,
   }));
 }
@@ -2336,18 +2378,122 @@ async function downloadBufferFromR2(storageKey) {
   return fileStorage.downloadBuffer(storageKey);
 }
 
-async function saveFileRecord({ userId, filename, storageKey, url, contentType, sizeBytes }) {
+async function deleteObjectFromR2(storageKey) {
+  return fileStorage.deleteObject(storageKey);
+}
+
+async function saveFileRecord({ userId, filename, storageKey, url, contentType, sizeBytes, expiresAt }) {
   if (!db) return null;
 
   const result = await db.query(
-    `INSERT INTO files (user_id, filename, storage_key, url, content_type, size_bytes)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, user_id, filename, storage_key, url, content_type, size_bytes, created_at`,
-    [userId, filename, storageKey, url, contentType || null, Number(sizeBytes || 0)]
+    `INSERT INTO files (user_id, filename, storage_key, url, content_type, size_bytes, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id, user_id, filename, storage_key, url, content_type, size_bytes, expires_at, created_at`,
+    [userId, filename, storageKey, url, contentType || null, Number(sizeBytes || 0), normalizeOptionalTimestamp(expiresAt)]
   );
 
   return result.rows[0] || null;
 }
+
+async function cleanupExpiredSharedFiles({ userId = null, limit = 100 } = {}) {
+  const normalizedUserId = String(userId || '').trim();
+  if (!db) {
+    return { ok: true, removedFiles: 0, removedResources: 0, removedUserFiles: 0, removedStorageObjects: 0 };
+  }
+
+  const params = [];
+  const conditions = ['expires_at IS NOT NULL', 'expires_at <= NOW()'];
+  if (normalizedUserId) {
+    params.push(normalizedUserId);
+    conditions.push(`user_id=$${params.length}`);
+  }
+  params.push(Math.max(1, Math.min(500, Number(limit || 100))));
+
+  const expired = await db.query(
+    `SELECT id, user_id, storage_key
+     FROM files
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY expires_at ASC, id ASC
+     LIMIT $${params.length}`,
+    params
+  );
+
+  const rows = expired.rows || [];
+  if (!rows.length) {
+    return { ok: true, removedFiles: 0, removedResources: 0, removedUserFiles: 0, removedStorageObjects: 0 };
+  }
+
+  const fileIds = rows
+    .map((row) => Number(row.id || 0))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const storageKeys = Array.from(new Set(
+    rows.map((row) => String(row.storage_key || '').trim()).filter(Boolean)
+  ));
+  const deletedKeys = [];
+
+  for (const storageKey of storageKeys) {
+    try {
+      await deleteObjectFromR2(storageKey);
+      deletedKeys.push(storageKey);
+    } catch (error_) {
+      console.warn('[FILES] expired object cleanup failed:', storageKey, error_?.message);
+    }
+  }
+
+  await db.query('BEGIN');
+  try {
+    let removedResources = { rowCount: 0 };
+    let removedUserFiles = { rowCount: 0 };
+    if (storageKeys.length) {
+      removedResources = await db.query(
+        'DELETE FROM conversation_resources WHERE storage_key = ANY($1::text[]) AND expires_at IS NOT NULL AND expires_at <= NOW()',
+        [storageKeys]
+      );
+      removedUserFiles = await db.query(
+        'DELETE FROM user_files WHERE storage_key = ANY($1::text[]) AND expires_at IS NOT NULL AND expires_at <= NOW()',
+        [storageKeys]
+      );
+    }
+
+    const removedFiles = fileIds.length
+      ? await db.query('DELETE FROM files WHERE id = ANY($1::int[])', [fileIds])
+      : { rowCount: 0 };
+
+    await db.query('COMMIT');
+    return {
+      ok: true,
+      removedFiles: Number(removedFiles.rowCount || 0),
+      removedResources: Number(removedResources.rowCount || 0),
+      removedUserFiles: Number(removedUserFiles.rowCount || 0),
+      removedStorageObjects: deletedKeys.length,
+    };
+  } catch (error_) {
+    try { await db.query('ROLLBACK'); } catch {}
+    throw error_;
+  }
+}
+
+let expiredSharedFilesCleanupTimer = globalThis.__A11_EXPIRED_SHARED_FILES_CLEANUP_TIMER || null;
+function ensureExpiredSharedFilesCleanupTimer() {
+  if (!db || expiredSharedFilesCleanupTimer) return;
+  expiredSharedFilesCleanupTimer = setInterval(() => {
+    cleanupExpiredSharedFiles({ limit: 200 }).catch((error_) => {
+      console.warn('[FILES] scheduled expired cleanup failed:', error_?.message);
+    });
+  }, TEMP_SHARED_FILE_CLEANUP_INTERVAL_MS);
+  if (typeof expiredSharedFilesCleanupTimer?.unref === 'function') {
+    expiredSharedFilesCleanupTimer.unref();
+  }
+  globalThis.__A11_EXPIRED_SHARED_FILES_CLEANUP_TIMER = expiredSharedFilesCleanupTimer;
+
+  setTimeout(() => {
+    cleanupExpiredSharedFiles({ limit: 200 }).catch((error_) => {
+      console.warn('[FILES] startup expired cleanup failed:', error_?.message);
+    });
+  }, 10_000);
+}
+
+ensureExpiredSharedFilesCleanupTimer();
 
 // ============================================================
 // Email providers
@@ -3039,6 +3185,7 @@ app.get('/api/a11/history', verifyJWT, async (req, res) => {
                 MAX(updated_at) AS updated_at
          FROM conversation_resources
          WHERE user_id=$1
+           AND (expires_at IS NULL OR expires_at > NOW())
          GROUP BY conversation_id
        ),
        merged AS (
@@ -3358,8 +3505,12 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       emailSubject,
       emailMessage,
       attachToEmail,
+      expiresAt,
+      ttlSeconds,
     } = req.body || {};
     const normalizedConversationId = normalizeConversationId(conversationId || convId || sessionId);
+    const resolvedExpiresAt = normalizeOptionalTimestamp(expiresAt)
+      || buildTemporaryFileExpiryDate(Number(ttlSeconds || 0) > 0 ? Number(ttlSeconds) * 1000 : TEMP_SHARED_FILE_TTL_MS);
     const ingestion = await ingestUploadedFile({
       userId,
       filename,
@@ -3378,6 +3529,7 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       saveFileRecord,
       saveUserFileMemory,
       sanitizeFileName,
+      expiresAt: resolvedExpiresAt,
     });
 
     let mail = null;
@@ -3409,9 +3561,19 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
     return res.json({
       ok: true,
       conversationId: normalizedConversationId,
-      file: ingestion.file,
+      file: {
+        ...ingestion.file,
+        downloadUrl: ingestion.file.url,
+        expiresAt: resolvedExpiresAt.toISOString(),
+      },
       record: ingestion.record,
-      conversationResource: ingestion.conversationResource || null,
+      conversationResource: ingestion.conversationResource
+        ? {
+            ...ingestion.conversationResource,
+            downloadUrl: ingestion.conversationResource.url || ingestion.file.url,
+            expiresAt: ingestion.conversationResource.expiresAt || resolvedExpiresAt.toISOString(),
+          }
+        : null,
       mail,
     });
   } catch (e) {
@@ -3431,6 +3593,7 @@ app.get('/api/resources/my', async (req, res) => {
     const userId = String(req.user?.id || '').trim();
     if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
     if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    await cleanupExpiredSharedFiles({ userId, limit: 200 });
 
     const requestedConversationId = String(req.query.conversationId || '').trim();
     const requestedKind = String(req.query.kind || '').trim();
@@ -3458,6 +3621,7 @@ app.get('/api/resources/:id/download', async (req, res) => {
     const userId = String(req.user?.id || '').trim();
     if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
     if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    await cleanupExpiredSharedFiles({ userId, limit: 200 });
 
     const resourceId = Number(req.params?.id || 0);
     if (!Number.isFinite(resourceId) || resourceId <= 0) {
@@ -3467,6 +3631,9 @@ app.get('/api/resources/:id/download', async (req, res) => {
     const resource = await getConversationResourceById(userId, resourceId);
     if (!resource) {
       return res.status(404).json({ ok: false, error: 'resource_not_found' });
+    }
+    if (isResourceExpired(resource)) {
+      return res.status(410).json({ ok: false, error: 'resource_expired' });
     }
     if (!resource.storageKey || !isR2Configured()) {
       return res.status(409).json({ ok: false, error: 'resource_download_not_available' });
@@ -3509,6 +3676,7 @@ app.get('/api/resources/latest', async (req, res) => {
     const userId = String(req.user?.id || '').trim();
     if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
     if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    await cleanupExpiredSharedFiles({ userId, limit: 200 });
 
     const latestResource = await getLatestConversationResource(userId, {
       conversationId: req.query.conversationId,
@@ -3788,12 +3956,14 @@ app.get('/api/files/my', async (req, res) => {
     const userId = String(req.user?.id || '').trim();
     if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
     if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+    await cleanupExpiredSharedFiles({ userId, limit: 200 });
 
     const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
     const result = await db.query(
-      `SELECT id, user_id, filename, storage_key, url, content_type, size_bytes, created_at
+      `SELECT id, user_id, filename, storage_key, url, content_type, size_bytes, expires_at, created_at
        FROM files
        WHERE user_id=$1
+         AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY created_at DESC, id DESC
        LIMIT $2`,
       [userId, limit]
@@ -4257,6 +4427,77 @@ function normalizeChatRole(role) {
   const normalized = String(role || '').trim().toLowerCase();
   if (normalized === 'system' || normalized === 'assistant' || normalized === 'user') return normalized;
   return null;
+}
+
+function normalizeChatTimestamp(value) {
+  if (!value) return null;
+  const candidate = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(candidate.getTime()) ? null : candidate;
+}
+
+function formatChatTemporalValue(value, options = {}) {
+  const timestamp = normalizeChatTimestamp(value);
+  if (!timestamp) return '';
+  try {
+    return new Intl.DateTimeFormat(CHAT_TIME_LOCALE, {
+      timeZone: CHAT_TIMEZONE,
+      ...options,
+    }).format(timestamp);
+  } catch {
+    return timestamp.toISOString();
+  }
+}
+
+function truncateTemporalPreview(value, maxLength = 90) {
+  const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
+}
+
+function buildTemporalContextBlock(messages = []) {
+  const now = new Date();
+  const lines = [
+    `Fuseau horaire de reference: ${CHAT_TIMEZONE}.`,
+    `Maintenant: ${formatChatTemporalValue(now, { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}.`,
+    `Date de reference: ${formatChatTemporalValue(now, { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' })}.`,
+    "Quand l'utilisateur dit aujourd'hui, hier, demain, ce matin, ce soir ou maintenant, interprete-le par rapport a ce repere.",
+  ];
+
+  const recentTimestampedMessages = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message && typeof message.content === 'string' && message.content.trim())
+    .map((message) => ({
+      role: normalizeChatRole(message?.role) || 'assistant',
+      timestamp: normalizeChatTimestamp(message?.ts),
+      preview: truncateTemporalPreview(message?.content, 96),
+    }))
+    .filter((entry) => entry.timestamp && entry.role !== 'system')
+    .slice(-6);
+
+  if (recentTimestampedMessages.length) {
+    lines.push('', 'Horodatage recent du chat:');
+    for (const entry of recentTimestampedMessages) {
+      lines.push(
+        `- ${entry.role} @ ${formatChatTemporalValue(entry.timestamp, {
+          day: '2-digit',
+          month: '2-digit',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })}: ${entry.preview}`
+      );
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function buildTemporalSystemMessage(messages = []) {
+  const content = buildTemporalContextBlock(messages);
+  if (!content) return null;
+  return {
+    role: 'system',
+    content,
+  };
 }
 
 function sanitizePromptMessages(messages) {
@@ -4827,7 +5068,7 @@ async function resolveAssistantActionEnvelope({
 
   if (!allowDevActions) {
     return {
-      content: "Mode dev desactive: A11 a prepare une action outillee mais ne l'executera pas ici. Demande une reponse normale ou active le mode dev.",
+      content: buildDevModeRequiredReply(),
       envelope,
       blocked: true,
       executed: false,
@@ -4880,6 +5121,7 @@ const DEV_ACTION_REPLY_SYSTEM_PROMPT = [
   'Si une partie echoue, explique brievement la vraie raison du blocage.',
   'Si plusieurs actions ont ete executees, donne seulement le resultat global.',
   'Si un fichier, PDF, image, archive ou email a ete produit, dis juste qu\'il est pret ou envoye.',
+  'Si la demande concerne internet, resume directement les informations utiles trouvees.',
   'N\'invente rien.'
 ].join(' ');
 
@@ -4983,29 +5225,101 @@ function extractPrimaryRecipient(entry) {
   return rawRecipients[0] || '';
 }
 
+function extractPrimarySharedLink(entry) {
+  const directLink = String(entry?.link || entry?.url || '').trim();
+  if (directLink) return directLink;
+  const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+  return String(
+    result?.url
+    || result?.file?.downloadUrl
+    || result?.file?.url
+    || result?.conversationResource?.downloadUrl
+    || result?.conversationResource?.url
+    || ''
+  ).trim();
+}
+
+function extractPrimaryExpiry(entry) {
+  const directExpiry = String(entry?.expiresAt || entry?.expires_at || '').trim();
+  if (directExpiry) return directExpiry;
+  const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+  return String(
+    result?.expiresAt
+    || result?.file?.expiresAt
+    || result?.conversationResource?.expiresAt
+    || result?.record?.expiresAt
+    || ''
+  ).trim();
+}
+
+function buildTemporaryLinkSuffix(entry) {
+  const link = extractPrimarySharedLink(entry);
+  if (!link) return '';
+  const expiresAt = normalizeOptionalTimestamp(extractPrimaryExpiry(entry));
+  return expiresAt
+    ? ` Lien valable jusqu'a ${expiresAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })} : ${link}`
+    : ` Lien de telechargement : ${link}`;
+}
+
+function buildDevActionResultDetails(action, result = {}) {
+  if (!result || typeof result !== 'object') return undefined;
+
+  if (action === 'web_search') {
+    const entries = Array.isArray(result.results) ? result.results : [];
+    return {
+      query: String(result.query || '').trim() || undefined,
+      results: entries.slice(0, 5).map((entry) => ({
+        title: String(entry?.title || '').trim() || undefined,
+        url: String(entry?.url || '').trim() || undefined,
+        snippet: truncateTemporalPreview(entry?.snippet, 180) || undefined,
+      })),
+    };
+  }
+
+  if (action === 'web_fetch') {
+    const contentPreview = truncateTemporalPreview(
+      result.content || result.text || result.markdown || result.summary || '',
+      1200
+    );
+    return {
+      url: String(result.url || '').trim() || undefined,
+      title: String(result.title || '').trim() || undefined,
+      status: Number(result.status || 0) || undefined,
+      contentPreview: contentPreview || undefined,
+    };
+  }
+
+  return undefined;
+}
+
 function buildDevActionReplyContext(cerbere, imagePath = null, userRequest = '') {
   const rawResults = Array.isArray(cerbere?.results)
     ? cerbere.results
     : (Array.isArray(cerbere?.actions) ? cerbere.actions : []);
   const results = rawResults.slice(0, 12).map((entry) => {
     const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+    const action = String(entry?.name || entry?.tool || entry?.action || 'action').trim() || 'action';
     const explicitOk = typeof result.ok === 'boolean'
       ? result.ok
       : (typeof entry?.ok === 'boolean' ? entry.ok : null);
     const error = sanitizeDevActionError(entry?.error || result?.error || result?.message || '');
     const ok = explicitOk === null ? !error : explicitOk;
     return {
-      action: String(entry?.name || entry?.tool || entry?.action || 'action').trim() || 'action',
+      action,
       ok,
       label: extractPrimaryResultLabel(entry) || undefined,
       to: extractPrimaryRecipient(entry) || undefined,
+      link: extractPrimarySharedLink(entry) || undefined,
+      expiresAt: extractPrimaryExpiry(entry) || undefined,
       count: Number(
         result?.count
         || (Array.isArray(result?.jobs) ? result.jobs.length : 0)
         || (Array.isArray(result?.resources) ? result.resources.length : 0)
         || (Array.isArray(result?.files) ? result.files.length : 0)
+        || (Array.isArray(result?.results) ? result.results.length : 0)
       ) || undefined,
       error: error || undefined,
+      details: buildDevActionResultDetails(action, result),
     };
   });
   const successCount = results.filter((entry) => entry.ok).length;
@@ -5017,6 +5331,11 @@ function buildDevActionReplyContext(cerbere, imagePath = null, userRequest = '')
     failureCount,
     results,
   };
+}
+
+function shouldPreferInterpretiveDevReply(context) {
+  const results = Array.isArray(context?.results) ? context.results : [];
+  return results.some((entry) => entry?.action === 'web_search' || entry?.action === 'web_fetch');
 }
 
 function buildDeterministicDevActionReply(context) {
@@ -5038,13 +5357,13 @@ function buildDeterministicDevActionReply(context) {
 
     if (okActions.has('generate_pdf') && okActions.has('share_file')) {
       return sharedResult?.to
-        ? `C'est fait. Le PDF a bien ete cree, stocke et envoye a ${sharedResult.to}.`
-        : "C'est fait. Le PDF a bien ete cree et stocke dans tes donnees.";
+        ? `C'est fait. Le PDF a bien ete cree, stocke et envoye a ${sharedResult.to}.${buildTemporaryLinkSuffix(sharedResult)}`
+        : `C'est fait. Le PDF a bien ete cree, stocke dans le bucket et pret au telechargement.${buildTemporaryLinkSuffix(sharedResult)}`;
     }
     if (okActions.has('generate_png') && okActions.has('share_file')) {
       return sharedResult?.to
-        ? `C'est fait. L'image a bien ete creee, stockee et envoyee a ${sharedResult.to}.`
-        : "C'est fait. L'image a bien ete creee et stockee dans tes donnees.";
+        ? `C'est fait. L'image a bien ete creee, stockee et envoyee a ${sharedResult.to}.${buildTemporaryLinkSuffix(sharedResult)}`
+        : `C'est fait. L'image a bien ete creee, stockee dans le bucket et prete au telechargement.${buildTemporaryLinkSuffix(sharedResult)}`;
     }
     if (mailedLatestResult?.to) {
       return `C'est fait. Le dernier fichier stocke a bien ete envoye a ${mailedLatestResult.to}.`;
@@ -5065,9 +5384,15 @@ function buildDeterministicDevActionReply(context) {
     }
     if (firstResult?.action === 'share_file') {
       return firstResult?.to
-        ? `C'est fait. Le fichier a bien ete partage et envoye a ${firstResult.to}.`
-        : "C'est fait. Le fichier a bien ete partage.";
+        ? `C'est fait. Le fichier a bien ete partage et envoye a ${firstResult.to}.${buildTemporaryLinkSuffix(firstResult)}`
+        : `C'est fait. Le fichier a bien ete partage.${buildTemporaryLinkSuffix(firstResult)}`;
     }
+    if (firstResult?.action === 'web_search') {
+      return firstResult?.count
+        ? `J'ai trouve ${firstResult.count} resultat${firstResult.count > 1 ? 's' : ''} sur internet.`
+        : "J'ai lance la recherche sur internet.";
+    }
+    if (firstResult?.action === 'web_fetch') return "J'ai consulte la page demandee.";
     if (firstResult?.action === 'zip_and_email') return "C'est fait. L'archive a ete creee et envoyee.";
     if (firstResult?.action === 'list_scheduled_emails') {
       if (!firstResult?.count) return "C'est fait. Il n'y a aucun email planifie pour le moment.";
@@ -5113,7 +5438,7 @@ async function generateDevActionReply({ messages = [], cerbere, imagePath = null
   if (!context.results.length) {
     return fallbackReply;
   }
-  if (Number(context.failureCount || 0) === 0) {
+  if (Number(context.failureCount || 0) === 0 && !shouldPreferInterpretiveDevReply(context)) {
     return fallbackReply;
   }
 
@@ -5507,6 +5832,11 @@ function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemo
 
   messages.push(...explicitSystemMessages);
 
+  const temporalSystemMessage = buildTemporalSystemMessage(baseMessages);
+  if (temporalSystemMessage) {
+    messages.push(temporalSystemMessage);
+  }
+
   const memorySystemMessage = buildMemorySystemMessage(
     logicalMemory,
     structuredMemoryContext,
@@ -5539,11 +5869,44 @@ const USER_SAFE_AGENT_ACTIONS = Object.freeze([
   'zip_and_email',
 ]);
 
-function shouldAutoUseUserActionAgent(body) {
+const INTERNET_SAFE_AGENT_ACTIONS = Object.freeze([
+  'web_search',
+  'web_fetch',
+]);
+
+function buildRequestMessagesFromBody(body) {
+  const sourceMessages = Array.isArray(body?.messages) ? body.messages : [];
+  const normalizedMessages = sourceMessages
+    .filter((message) => normalizeChatRole(message?.role) && typeof message?.content === 'string' && message.content.trim())
+    .map((message) => {
+      const normalizedTimestamp = normalizeChatTimestamp(message?.ts);
+      return {
+        role: normalizeChatRole(message.role),
+        content: String(message.content || '').trim(),
+        ...(normalizedTimestamp ? { ts: normalizedTimestamp.toISOString() } : {}),
+      };
+    });
+
+  if (normalizedMessages.length) {
+    return normalizedMessages;
+  }
+
+  const prompt = String(body?.prompt || '').trim();
+  if (!prompt) return [];
+  return [
+    {
+      role: 'user',
+      content: prompt,
+      ts: new Date().toISOString(),
+    },
+  ];
+}
+
+function detectDevModeRequiredReason(body) {
   const latestUserMessage = getLatestUserMessage(body || {});
   const text = String(latestUserMessage || '').trim().toLowerCase();
-  if (!text) return false;
-  if (body?.a11Dev === true) return false;
+  if (!text) return null;
+  if (body?.a11Dev === true) return null;
 
   const hasEmailAddress = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
   const asksEmail = /(envoi(?:e|s|er)?|mail|email|e-mail|expedie|expédie|transmets?|partage)/i.test(text);
@@ -5555,14 +5918,46 @@ function shouldAutoUseUserActionAgent(body) {
   const asksSchedule = /(planifie|programme|plus tard|demain|ce soir|a \d{1,2}h|à \d{1,2}h)/i.test(text)
     && /(mail|email|e-mail|envoi(?:e|s|er)?)/i.test(text);
 
-  if (hasEmailAddress && asksEmail) return true;
-  if (asksStore) return true;
-  if (asksLatestResource) return true;
-  if (asksSchedule) return true;
-  if (asksCreate && asksPdfOrImage) return true;
-  if (asksEmail && /(pdf|fichier|document|image|piece jointe|pièce jointe|ressource|archive|zip|joint)/i.test(text)) return true;
+  if (asksSchedule) return 'planifier un envoi';
+  if (hasEmailAddress && asksEmail) return 'envoyer un email';
+  if (asksLatestResource) return 'retrouver ou renvoyer une ressource stockee';
+  if (asksStore) return 'stocker ou reutiliser des fichiers';
+  if (asksCreate && asksPdfOrImage) return 'generer un fichier';
+  if (asksEmail && /(pdf|fichier|document|image|piece jointe|pièce jointe|ressource|archive|zip|joint)/i.test(text)) {
+    return 'envoyer un fichier ou une piece jointe';
+  }
 
-  return false;
+  return null;
+}
+
+function buildDevModeRequiredReply(reason = 'executer cette action') {
+  return `J'ai besoin du mode DEV active pour ${reason}. Active-le en haut de l'ecran puis renvoie ta demande.`;
+}
+
+function shouldAutoUseUserActionAgent(body) {
+  return !!detectDevModeRequiredReason(body);
+}
+
+function detectInternetResearchReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+
+  const hasUrl = /https?:\/\/\S+/i.test(text);
+  const asksConsultUrl = hasUrl && /(analyse|ouvre|lis|resume|résume|explique|consulte|verifie|vérifie|inspecte|regarde)/i.test(text);
+  const mentionsInternet = /(internet|web|site|page|article|actualite|actualité|actu|news|google|en ligne)/i.test(text);
+  const asksSearch = /(cherche|recherche|trouve|regarde|consulte|compare|verifie|vérifie|check|liste|resume|résume|explique)/i.test(text);
+  const asksCurrentInfo = /(aujourd'hui|today|actuellement|en ce moment|maintenant|dernier|derniere|dernière|latest|recent|récent|récente|meteo|météo|prix|cours|score|resultat|résultat|horaire|programme|trafic|tendance|actualite|actualité|actu|news|version actuelle|derniere version|dernière version|latest version|date de sortie|sortie recente|sortie récente)/i.test(text);
+  const asksQuestion = /^(qui|que|quoi|quand|quel|quelle|quels|quelles|combien|ou|où|comment|donne|montre|dis|liste|compare|resume|résume|cherche|recherche|trouve)\b/i.test(text) || /\?$/.test(text);
+
+  if (asksConsultUrl) return 'consulter une page web';
+  if (mentionsInternet && asksSearch) return 'chercher sur internet';
+  if (asksCurrentInfo && (asksQuestion || asksSearch)) return 'recuperer une information actuelle';
+  return null;
+}
+
+function shouldAutoUseInternetAgent(body) {
+  return !!detectInternetResearchReason(body);
 }
 
 function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
@@ -5782,42 +6177,59 @@ async function proxyChatToOpenAI(req, res) {
   }
 
   if (shouldAutoUseUserActionAgent(req.body)) {
-    try {
-      const requestMessages = buildUserSafeAgentMessages(req.body);
-      const loopResult = await runA11AgentLoop({
-        messages: requestMessages,
-        conversationId,
-        userId,
-        requestOrigin: getRequestOrigin(req),
-        executionContext: {
-          authToken: getAuthTokenFromRequest(req),
-        },
-        allowedActions: USER_SAFE_AGENT_ACTIONS,
-      });
-
-      const content = normalizeAssistantOutput(loopResult.explanation || loopResult.text || "Je n'ai pas pu terminer la demande.");
-      const data = toSimpleAssistantCompletion(content, 'a11-user-actions');
-      if (loopResult.imagePath || loopResult.cerbere) {
-        data.a11Agent = {
-          actionMode: 'user',
-          imagePath: loopResult.imagePath || null,
-          cerbere: loopResult.cerbere || null,
-        };
-      }
-      if (userId && content) {
-        await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
-      }
-      appendChatTurnLogSafe(req.body, data, 'a11-user-actions', userId);
-      return res.status(200).json(data);
-    } catch (error_) {
-      const fallbackMessage = sanitizeDevActionError(error_?.message || error_) || "erreur interne";
-      const fallback = toSimpleAssistantCompletion(
-        `Je n'ai pas pu terminer l'action demandee : ${fallbackMessage}.`,
-        'a11-user-actions'
-      );
-      appendChatTurnLogSafe(req.body, fallback, 'a11-user-actions', userId);
-      return res.status(200).json(fallback);
+    const content = buildDevModeRequiredReply(detectDevModeRequiredReason(req.body) || 'executer cette action');
+    const data = toSimpleAssistantCompletion(content, 'a11-dev-required');
+    if (userId && content) {
+      await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
     }
+    appendChatTurnLogSafe(req.body, data, 'a11-dev-required', userId);
+    return res.status(200).json(data);
+  }
+
+  if (shouldAutoUseInternetAgent(req.body)) {
+    const requestMessages = buildRequestMessagesFromBody(req.body);
+    let internetMessages = requestMessages;
+
+    if (userId) {
+      const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);
+      internetMessages = buildChatMessagesWithMemory(
+        requestMessages,
+        memoryContext.logicalMemory,
+        memoryContext.structuredMemoryContext,
+        memoryContext.conversationResourceContext,
+        req.body?.systemPrompt
+      );
+    }
+
+    const loopResult = await runA11AgentLoop({
+      messages: internetMessages,
+      conversationId,
+      userId,
+      requestOrigin: getRequestOrigin(req),
+      executionContext: {
+        authToken: getAuthTokenFromRequest(req),
+      },
+      allowedActions: INTERNET_SAFE_AGENT_ACTIONS,
+      maxLoops: 4,
+    });
+
+    const content = normalizeAssistantOutput(
+      loopResult.explanation
+      || loopResult.text
+      || `Je n'ai pas pu ${detectInternetResearchReason(req.body) || 'consulter internet'}.`
+    );
+    const data = toSimpleAssistantCompletion(content, 'a11-web');
+    if (loopResult.imagePath || loopResult.cerbere) {
+      data.a11Agent = {
+        imagePath: loopResult.imagePath || null,
+        ...(loopResult.cerbere ? { results: loopResult.cerbere.results } : {}),
+      };
+    }
+    if (userId && content) {
+      await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
+    }
+    appendChatTurnLogSafe(req.body, data, 'a11-web', userId);
+    return res.status(200).json(data);
   }
 
   if (shouldUseQflushChat(req.body)) {
@@ -5828,9 +6240,7 @@ async function proxyChatToOpenAI(req, res) {
 
   if (userId) {
     const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);
-    const requestMessages = Array.isArray(req.body?.messages)
-      ? req.body.messages
-      : (String(req.body?.prompt || '').trim() ? [{ role: 'user', content: String(req.body.prompt).trim() }] : []);
+    const requestMessages = buildRequestMessagesFromBody(req.body);
     upstreamBody.messages = buildChatMessagesWithMemory(
       requestMessages,
       memoryContext.logicalMemory,
@@ -6123,6 +6533,7 @@ function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) 
   const workspaceRoot = String(
     process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || path.resolve(__dirname, '..', '..')
   ).trim();
+  const temporalContext = buildTemporalContextBlock(messages);
   const restrictedActions = Array.isArray(options.allowedActions)
     ? options.allowedActions.map((entry) => String(entry || '').trim()).filter(Boolean)
     : [];
@@ -6133,6 +6544,9 @@ function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) 
     '[TOOLS]',
     `AllowedActions=${JSON.stringify(allowedActions)}`,
     `ActionPolicy=${restrictedActions.length ? 'user-safe-only' : 'full'}`,
+    '',
+    '[TIME]',
+    temporalContext,
     '',
     '[CONTEXT]',
     `workspaceRoot=${workspaceRoot}`,
@@ -6521,7 +6935,8 @@ app.post('/api/agent', express.json(), async (req, res) => {
     if (!allowDevActions) {
       return res.status(403).json({
         ok: false,
-        error: 'dev_mode_required'
+        error: 'dev_mode_required',
+        message: buildDevModeRequiredReply(),
       });
     }
 
