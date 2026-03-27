@@ -3715,8 +3715,16 @@ const cookieParser = require('cookie-parser');
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cookieParser());
 
-// Serve frontend static files from the canonical web public folder only (not server/public_legacy)
-const webPublic = path.resolve(__dirname, '..', 'web', 'dist');
+// Serve frontend static files from a configurable embedded build directory.
+const webPublic = (() => {
+  const configured = String(process.env.A11_WEB_DIST_DIR || '').trim();
+  if (configured) {
+    return path.isAbsolute(configured)
+      ? configured
+      : path.resolve(__dirname, configured);
+  }
+  return path.resolve(__dirname, '..', 'web', 'dist');
+})();
 try {
   const serveStatic = process.env.SERVE_STATIC?.toLowerCase() === 'true' || process.env.NODE_ENV === 'production';
   if (serveStatic) {
