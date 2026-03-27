@@ -99,6 +99,9 @@ console.log("[Cerbère] Workspace root:", WORKSPACE_ROOT);
 const BACKENDS = {
   openai: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
 };
+const DEFAULT_OPENAI_MODEL = String(process.env.OPENAI_MODEL || process.env.A11_OPENAI_MODEL || "gpt-4o-mini").trim() || "gpt-4o-mini";
+const THINKER_MODEL = String(process.env.CERBERE_THINKER_MODEL || DEFAULT_OPENAI_MODEL).trim() || DEFAULT_OPENAI_MODEL;
+const MAKER_MODEL = String(process.env.CERBERE_MAKER_MODEL || DEFAULT_OPENAI_MODEL).trim() || DEFAULT_OPENAI_MODEL;
 
 logInfo("[Cerbère] Backends configurés: " + JSON.stringify(BACKENDS));
 
@@ -167,10 +170,10 @@ async function callStrategist(userPrompt) {
 }
 
 async function callThinker(prompt) {
-  logThinker("[Cerbère][THINKER] GPT-4.1 engagé pour analyse");
+  logThinker(`[Cerbère][THINKER] ${THINKER_MODEL} engagé pour analyse`);
 
   const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
-  const body = { model: "gpt-4.1", messages: [{ role: "user", content: prompt }] };
+  const body = { model: THINKER_MODEL, messages: [{ role: "user", content: prompt }] };
 
   try {
     const resp = await fetch(backendURL, {
@@ -189,12 +192,12 @@ async function callThinker(prompt) {
 }
 
 async function callMaker(input) {
-  logMaker("[Cerbère][MAKER] OpenAI engagé pour exécution");
+  logMaker(`[Cerbère][MAKER] ${MAKER_MODEL} engagé pour exécution`);
 
   const backendURL = buildOpenAICompletionsUrl(BACKENDS.openai);
   const messages = Array.isArray(input) ? input : [{ role: "user", content: input }];
 
-  const body = { model: "gpt-4o-mini", messages };
+  const body = { model: MAKER_MODEL, messages };
 
   try {
     const resp = await fetch(backendURL, {

@@ -283,38 +283,47 @@ def synthesize(text: str) -> str:
     env = os.environ.copy()
     if ESPEAK_DATA and os.path.exists(ESPEAK_DATA):
         env["ESPEAK_DATA_PATH"] = ESPEAK_DATA
-    if PIPER_LIB_DIR and os.path.isdir(PIPER_LIB_DIR):
+    if os.name != "nt" and PIPER_LIB_DIR and os.path.isdir(PIPER_LIB_DIR):
         existing_ld = env.get("LD_LIBRARY_PATH", "").strip()
         env["LD_LIBRARY_PATH"] = PIPER_LIB_DIR if not existing_ld else f"{PIPER_LIB_DIR}:{existing_ld}"
         env["PATH"] = PIPER_LIB_DIR + os.pathsep + env.get("PATH", "")
     cmd = [
         PIPER_EXE,
-        "-m", MODEL_PATH,
+        "--model", MODEL_PATH,
         "--output_file", out_path,
     ]
+    if ESPEAK_DATA and os.path.exists(ESPEAK_DATA):
+        cmd.extend(["--espeak_data", ESPEAK_DATA])
     print(f"[TTS] Texte envoyé : {text!r}")
     print(f"[TTS] Commande Piper : {cmd}")
     try:
-        result = subprocess.run(
-            cmd,
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "env": env,
+            "cwd": ROOT_DIR,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        stdout_bytes, stderr_bytes = proc.communicate(
             input=text.encode("utf-8"),
-            capture_output=True,
-            env=env,
-            cwd=ROOT_DIR,
             timeout=120,
         )
 
         print("=== PIPER DEBUG ===")
-        print("RETURN CODE:", result.returncode)
-        print("STDOUT:", result.stdout.decode(errors="ignore"))
-        print("STDERR:", result.stderr.decode(errors="ignore"))
+        print("RETURN CODE:", proc.returncode)
+        print("STDOUT:", stdout_bytes.decode(errors="ignore"))
+        print("STDERR:", stderr_bytes.decode(errors="ignore"))
         print("===================")
 
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="ignore").strip()
-            stdout = result.stdout.decode(errors="ignore").strip()
+        if proc.returncode != 0:
+            stderr = stderr_bytes.decode(errors="ignore").strip()
+            stdout = stdout_bytes.decode(errors="ignore").strip()
             details = stderr or stdout or "unknown error"
-            raise RuntimeError(f"Piper failed (exit {result.returncode}): {details[:500]}")
+            raise RuntimeError(f"Piper failed (exit {proc.returncode}): {details[:500]}")
 
     except Exception as e:
         print("🔥 CRASH TTS:", e)

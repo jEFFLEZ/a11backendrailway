@@ -18,18 +18,27 @@ function buildRuntimeConfig(env = process.env) {
   const frontendUrl = normalizeUrl(env.APP_URL || env.FRONT_URL || 'https://a11.funesterie.pro');
   const ttsInternalUrl = String(env.TTS_URL || env.TTS_HOST || '').trim();
   const ttsPublicBaseUrl = normalizeUrl(env.TTS_PUBLIC_BASE_URL || env.TTS_BASE_URL || '');
+  const publicApiUrl = normalizeUrl(env.PUBLIC_API_URL || env.API_URL || env.A11_SERVER_URL || '');
+  const r2Bucket = String(env.R2_BUCKET || env.R2_BUCKET_NAME || '').trim();
+  const hasTtsHttpConfig = Boolean(String(
+    env.TTS_URL ||
+    env.TTS_HOST ||
+    env.TTS_BASE_URL ||
+    env.TTS_PUBLIC_BASE_URL ||
+    ''
+  ).trim());
 
   return {
     app: {
       env: String(env.NODE_ENV || 'development').trim() || 'development',
       frontendUrl,
-      publicApiUrl: normalizeUrl(env.PUBLIC_API_URL || env.API_URL || ''),
+      publicApiUrl,
       serveStatic: toBoolean(env.SERVE_STATIC) || String(env.NODE_ENV || '').trim() === 'production',
     },
     tts: {
       internalUrl: ttsInternalUrl,
       publicBaseUrl: ttsPublicBaseUrl,
-      enableHttp: toBoolean(env.ENABLE_PIPER_HTTP) || Boolean(String(env.TTS_BASE_URL || env.TTS_HOST || '').trim()),
+      enableHttp: toBoolean(env.ENABLE_PIPER_HTTP) || hasTtsHttpConfig,
       port: Number(env.TTS_PORT || 5002),
     },
     qflush: {
@@ -40,7 +49,7 @@ function buildRuntimeConfig(env = process.env) {
     },
     r2: {
       endpoint: String(env.R2_ENDPOINT || '').trim(),
-      bucket: String(env.R2_BUCKET || '').trim(),
+      bucket: r2Bucket,
       publicBaseUrl: normalizeUrl(env.R2_PUBLIC_BASE_URL || ''),
     },
     mail: {

@@ -45,6 +45,35 @@ if (fs.existsSync(localEnvPath)) {
   envSource = 'ENVIRONMENT ONLY';
 }
 
+function adoptEnvAlias(target, aliases) {
+  const current = String(process.env[target] || '').trim();
+  if (current) {
+    process.env[target] = current;
+    return current;
+  }
+
+  for (const alias of aliases) {
+    const candidate = String(process.env[alias] || '').trim();
+    if (!candidate) continue;
+    process.env[target] = candidate;
+    return candidate;
+  }
+
+  return '';
+}
+
+adoptEnvAlias('PUBLIC_API_URL', ['API_URL', 'A11_SERVER_URL']);
+adoptEnvAlias('API_URL', ['PUBLIC_API_URL', 'A11_SERVER_URL']);
+adoptEnvAlias('LLM_ROUTER_URL', ['VITE_LLM_ROUTER_URL']);
+adoptEnvAlias('A11_OPENAI_BASE_URL', ['OPENAI_BASE_URL']);
+adoptEnvAlias('A11_OPENAI_MODEL', ['OPENAI_MODEL']);
+adoptEnvAlias('R2_BUCKET', ['R2_BUCKET_NAME']);
+adoptEnvAlias('R2_ACCESS_KEY', ['R2_ACCESS_KEY_ID']);
+adoptEnvAlias('R2_SECRET_KEY', ['R2_SECRET_ACCESS_KEY']);
+adoptEnvAlias('TTS_PUBLIC_BASE_URL', ['TTS_BASE_URL']);
+adoptEnvAlias('TTS_MODEL_PATH', ['MODEL_PATH']);
+adoptEnvAlias('MODEL_PATH', ['TTS_MODEL_PATH']);
+
 // DEBUG: log Nez env vars
 console.log('[NEZ ENV] NEZ_TOKENS=', process.env.NEZ_TOKENS);
 console.log('[NEZ ENV] NEZ_ADMIN_TOKEN=', process.env.NEZ_ADMIN_TOKEN);
@@ -656,6 +685,7 @@ const envCorsOrigins = (process.env.CORS_ORIGINS || '')
 const CORS_ORIGINS = (envCorsOrigins.length ? envCorsOrigins : defaultCorsOrigins)
   .map(normalizeOrigin)
   .filter(Boolean);
+const ALLOW_NETLIFY_PREVIEWS = String(process.env.CORS_ALLOW_NETLIFY_APP || '').trim().toLowerCase() === 'true';
 
 const corsOptions = {
   origin: function(origin, callback) {
@@ -668,7 +698,7 @@ const corsOptions = {
     
     // Allow Netlify preview deployments: https://xxxxx--a11funesterie.netlify.app
     const netlifyPreviewPattern = /https:\/\/[a-z0-9-]*--a11funesterie\.netlify\.app$/i;
-    if (netlifyPreviewPattern.test(incomingOrigin)) {
+    if (ALLOW_NETLIFY_PREVIEWS && netlifyPreviewPattern.test(incomingOrigin)) {
       console.log('[A11][CORS] ✅ allowed Netlify preview:', incomingOrigin);
       return callback(null, true);
     }
@@ -4571,13 +4601,21 @@ app.use(llmRouter);
 if (!LISTENING) {
   try {
     const HOST = process.env.HOST || '0.0.0.0';
-    app.listen(PORT, HOST, () => {
+    const server = app.listen(PORT, HOST, () => {
       LISTENING = true;
       const railwayDomain = process.env.RAILWAY_PUBLIC_DOMAIN || 'a11backendrailway.up.railway.app';
       const publicUrl = process.env.RAILWAY_PUBLIC_DOMAIN
         ? `https://${railwayDomain}`
         : `http://127.0.0.1:${PORT}`;
       console.log(`[A11] Server listening on ${HOST}:${PORT} (public: ${publicUrl})`);
+    });
+    server.on('error', (error_) => {
+      if (error_?.code === 'EADDRINUSE') {
+        console.error(`[A11] Port ${PORT} déjà occupé sur ${HOST}. Un autre backend A11 est probablement déjà lancé.`);
+      } else {
+        console.error('[A11] Failed to start server:', error_?.message || error_);
+      }
+      process.exit(1);
     });
   } catch (e) {
     console.error('[A11] Failed to start server:', e?.message);

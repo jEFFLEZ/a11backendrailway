@@ -1,0 +1,10 @@
+{
+  "id": "memo_qflush_snapshot_1774566402872",
+  "ts": "2026-03-26T23:06:42.872Z",
+  "type": "qflush_snapshot",
+  "data": {
+    "available": true,
+    "exePath": null,
+    "module": false
+  }
+}

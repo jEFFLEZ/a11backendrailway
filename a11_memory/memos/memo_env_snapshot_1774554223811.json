@@ -1,0 +1,16 @@
+{
+  "id": "memo_env_snapshot_1774554223811",
+  "ts": "2026-03-26T19:43:43.810Z",
+  "type": "env_snapshot",
+  "data": {
+    "ts": 1774554223810,
+    "env": {
+      "PORT": "3000"
+    },
+    "qflush": {
+      "available": true,
+      "module": false,
+      "exePath": null
+    }
+  }
+}
