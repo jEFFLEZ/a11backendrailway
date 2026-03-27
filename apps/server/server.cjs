@@ -4663,7 +4663,18 @@ function isUnsafeDevFollowupReply(value) {
   if (parseAssistantActionEnvelope(normalized)) return true;
   if (/\[[^\]]+\]/.test(normalized)) return true;
   if (/voici le resultat final/i.test(normalized)) return true;
-  if (/cerbere|qflush|json|pipeline|backend|tool/i.test(normalized)) return true;
+  if (/cerbere|qflush|json|pipeline|backend|tool_results|allowedactions|workspaceroot|tool/i.test(normalized)) return true;
+  return false;
+}
+
+function isUnsafeAgentFinalText(value) {
+  const normalized = normalizeAssistantOutput(value);
+  if (!normalized) return true;
+  if (parseAssistantEnvelope(normalized)) return true;
+  if (parseAssistantActionEnvelope(normalized)) return true;
+  if (/^\s*\{[\s\S]*"mode"\s*:\s*"(?:final|need_user|actions)"/i.test(normalized)) return true;
+  if (/\[tools\]|\[context\]|\[tool_results\]|\[user_prompt\]/i.test(normalized)) return true;
+  if (/tool_results|allowedactions|workspaceroot|cerbere|qflush|pipeline|backend interne/i.test(normalized)) return true;
   return false;
 }
 
@@ -6013,7 +6024,7 @@ async function runA11AgentLoop({
       return {
         ok: true,
         mode: 'dev',
-        explanation: text && !isThinDevFinalReply(text) ? text : generatedReply,
+        explanation: text && !isThinDevFinalReply(text) && !isUnsafeAgentFinalText(text) ? text : generatedReply,
         text: null,
         imagePath,
         cerbere: { ok: true, results: aggregatedResults },
@@ -6048,7 +6059,7 @@ async function runA11AgentLoop({
       return {
         ok: true,
         mode: 'dev',
-        explanation: text && !isThinDevFinalReply(text) ? text : generatedReply,
+        explanation: text && !isThinDevFinalReply(text) && !isUnsafeAgentFinalText(text) ? text : generatedReply,
         text: null,
         imagePath,
         cerbere: { ok: true, results: aggregatedResults },
