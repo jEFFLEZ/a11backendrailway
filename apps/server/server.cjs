@@ -4307,6 +4307,16 @@ function normalizeAssistantOutput(value) {
   let text = String(value || '').trim();
   if (!text) return '';
 
+  text = text
+    .replace(/^(?:voici|voila)\s+la\s+reponse\s+finale\s*:\s*/i, '')
+    .replace(/^la\s+reponse\s+finale\s+est\s*:\s*/i, '')
+    .replace(/^reponse\s+finale(?:\s+utilisateur)?\s*:\s*/i, '')
+    .trim();
+
+  if (/^["“][\s\S]*["”]$/.test(text)) {
+    text = text.slice(1, -1).trim();
+  }
+
   // Remove leading role prefixes repeatedly (assistant:, a-11:, bot:, etc.).
   for (let index = 0; index < 4; index += 1) {
     const next = text.replace(/^(assistant|a-11|bot)\s*:\s*/i, '').trim();
@@ -4356,6 +4366,34 @@ function normalizeAssistantOutput(value) {
   }
 
   return text;
+}
+
+function shouldKeepRecentUserActionContext(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return false;
+  return /\b(le|la|les|lui|leur|ca|ça|cela|celui|celle|celui-ci|celle-ci|ce fichier|ce pdf|ce document|cette image|dernier|derniere|dernière)\b/.test(text);
+}
+
+function buildUserSafeAgentMessages(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const normalizedLatest = String(latestUserMessage || '').trim();
+  const sourceMessages = Array.isArray(body?.messages) ? body.messages : [];
+  const visibleMessages = sourceMessages
+    .filter((entry) => entry && entry.role !== 'system' && typeof entry.content === 'string' && entry.content.trim())
+    .map((entry) => ({
+      role: entry.role === 'assistant' ? 'assistant' : 'user',
+      content: String(entry.content || '').trim(),
+    }));
+
+  if (!visibleMessages.length) {
+    return normalizedLatest ? [{ role: 'user', content: normalizedLatest }] : [];
+  }
+
+  if (shouldKeepRecentUserActionContext(normalizedLatest)) {
+    return visibleMessages.slice(-4);
+  }
+
+  return normalizedLatest ? [{ role: 'user', content: normalizedLatest }] : visibleMessages.slice(-1);
 }
 
 function normalizeDevActionName(name) {
@@ -5745,9 +5783,7 @@ async function proxyChatToOpenAI(req, res) {
 
   if (shouldAutoUseUserActionAgent(req.body)) {
     try {
-      const requestMessages = Array.isArray(req.body?.messages) && req.body.messages.length
-        ? req.body.messages
-        : (latestUserMessage ? [{ role: 'user', content: latestUserMessage }] : []);
+      const requestMessages = buildUserSafeAgentMessages(req.body);
       const loopResult = await runA11AgentLoop({
         messages: requestMessages,
         conversationId,
@@ -6359,7 +6395,7 @@ async function runA11AgentLoop({
       return {
         ok: true,
         mode: 'dev',
-        explanation: text && !isThinDevFinalReply(text) && !isUnsafeAgentFinalText(text) ? text : generatedReply,
+        explanation: generatedReply,
         text: null,
         imagePath,
         cerbere: { ok: true, results: aggregatedResults },
@@ -6394,7 +6430,7 @@ async function runA11AgentLoop({
       return {
         ok: true,
         mode: 'dev',
-        explanation: text && !isThinDevFinalReply(text) && !isUnsafeAgentFinalText(text) ? text : generatedReply,
+        explanation: generatedReply,
         text: null,
         imagePath,
         cerbere: { ok: true, results: aggregatedResults },
