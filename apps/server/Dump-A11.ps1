@@ -29,8 +29,11 @@ $paths = @(
     "a11qflushrailway\src\*",
     "a11qflushrailway\docs\*",
     "a11llm\llm\*",
-    "a11backendrailway\start-all-a11.bat",
-    "a11backendrailway\start-prod-a11.bat"
+    "launchers\README.md",
+    "launchers\start-all-a11.bat",
+    "launchers\start-all-a11.ps1",
+    "launchers\start-prod-a11.bat",
+    "launchers\start-prod-a11.ps1"
 ) | Where-Object { Test-Path $_ }
 
 if ($paths.Count -eq 0) {
