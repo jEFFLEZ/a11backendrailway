@@ -2,6 +2,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const axios = require('axios');
+const AdmZip = require('adm-zip');
 const PDFDocument = require('pdfkit');
 const fsSync = require('node:fs');
 const { exec } = require('node:child_process');
@@ -22,6 +23,31 @@ function resolveSafePath(p, label) {
     throw new Error(`${label || "path"}: path outside SAFE_DATA_ROOT is forbidden`);
   }
   return target;
+}
+
+function isPathWithinRoot(targetPath, rootPath) {
+  const target = path.resolve(String(targetPath || ''));
+  const root = path.resolve(String(rootPath || ''));
+  const normalizedTarget = process.platform === 'win32' ? target.toLowerCase() : target;
+  const normalizedRoot = process.platform === 'win32' ? root.toLowerCase() : root;
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(normalizedRoot + path.sep);
+}
+
+function resolveManagedPath(p, label) {
+  const raw = String(p || '').trim();
+  if (!raw) throw new Error(`${label || 'path'}: empty path not allowed`);
+
+  if (!path.isAbsolute(raw)) {
+    return resolveSafePath(raw, label);
+  }
+
+  const absolute = path.resolve(raw);
+  const allowedRoots = [SAFE_DATA_ROOT, ...(Array.isArray(WORKSPACE_ROOTS) ? WORKSPACE_ROOTS : [])];
+  if (allowedRoots.some((root) => isPathWithinRoot(absolute, root))) {
+    return absolute;
+  }
+
+  throw new Error(`${label || 'path'}: path outside allowed roots`);
 }
 
 // ─────────────────────────────
@@ -80,6 +106,134 @@ function guessDownloadExtension(rawExt, contentType = '') {
     default:
       return '.bin';
   }
+}
+
+function getInternalApiBaseUrl() {
+  const configured = String(process.env.A11_INTERNAL_API_BASE_URL || '').trim();
+  if (configured) return configured.replace(/\/+$/, '');
+  const port = String(process.env.PORT || 3000).trim() || '3000';
+  return `http://127.0.0.1:${port}`;
+}
+
+function getAuthTokenFromContext(context = {}) {
+  return String(context.authToken || context.token || '').trim();
+}
+
+function guessContentType(filePath) {
+  const ext = path.extname(String(filePath || '')).toLowerCase();
+  switch (ext) {
+    case '.pdf':
+      return 'application/pdf';
+    case '.txt':
+    case '.md':
+      return 'text/plain; charset=utf-8';
+    case '.json':
+      return 'application/json';
+    case '.csv':
+      return 'text/csv; charset=utf-8';
+    case '.png':
+      return 'image/png';
+    case '.jpg':
+    case '.jpeg':
+      return 'image/jpeg';
+    case '.gif':
+      return 'image/gif';
+    case '.webp':
+      return 'image/webp';
+    case '.docx':
+      return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    case '.xlsx':
+      return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+async function fetchInternalJson(pathname, options = {}, context = {}) {
+  const authToken = getAuthTokenFromContext(context);
+  if (!authToken) {
+    throw new Error(`${pathname}: authenticated user context required`);
+  }
+
+  const url = `${getInternalApiBaseUrl()}${pathname}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-NEZ-TOKEN': authToken,
+    ...(options.headers || {}),
+  };
+
+  const res = await fetch(url, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+
+  const data = await res.json().catch(async () => ({
+    ok: false,
+    error: await res.text().catch(() => 'invalid_response'),
+  }));
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      ...(data && typeof data === 'object' ? data : { error: String(data) }),
+    };
+  }
+
+  return data;
+}
+
+function listAttachmentPaths(args = {}) {
+  const items = [];
+  if (typeof args.path === 'string' && args.path.trim()) items.push(args.path);
+  if (typeof args.attachmentPath === 'string' && args.attachmentPath.trim()) items.push(args.attachmentPath);
+  if (typeof args.filePath === 'string' && args.filePath.trim()) items.push(args.filePath);
+  if (typeof args.outputPath === 'string' && args.outputPath.trim()) items.push(args.outputPath);
+  if (Array.isArray(args.paths)) items.push(...args.paths);
+  if (Array.isArray(args.attachments)) {
+    for (const item of args.attachments) {
+      if (typeof item === 'string' && item.trim()) items.push(item);
+      else if (item && typeof item === 'object' && typeof item.path === 'string' && item.path.trim()) items.push(item.path);
+    }
+  }
+  return Array.from(new Set(items.map((item) => String(item || '').trim()).filter(Boolean)));
+}
+
+function normalizeRecipientsInput(value) {
+  if (Array.isArray(value)) {
+    return Array.from(new Set(
+      value
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+    ));
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  return Array.from(new Set(
+    raw
+      .split(/[;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  ));
+}
+
+function buildAttachmentPayload(fullPath, index = 0, forcedFilename = '') {
+  if (!fsSync.existsSync(fullPath)) {
+    throw new Error(`attachment file not found: ${fullPath}`);
+  }
+  const stats = fsSync.statSync(fullPath);
+  if (!stats.isFile()) {
+    throw new Error(`attachment path is not a file: ${fullPath}`);
+  }
+  const buffer = fsSync.readFileSync(fullPath);
+  return {
+    filename: forcedFilename && index === 0 ? String(forcedFilename).trim() : path.basename(fullPath),
+    contentBase64: buffer.toString('base64'),
+    contentType: guessContentType(fullPath),
+    sizeBytes: stats.size,
+  };
 }
 
 function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path', contentType = '') {
@@ -359,6 +513,396 @@ async function t_download_file(args = {}) {
   };
 }
 
+async function t_share_file(args = {}) {
+  const context = args._context || {};
+  const fullPath = resolveManagedPath(args.path || args.outputPath || args.filePath, 'share_file.path');
+  if (!fsSync.existsSync(fullPath)) {
+    return { ok: false, error: 'File not found', path: fullPath };
+  }
+
+  const stats = fsSync.statSync(fullPath);
+  if (!stats.isFile()) {
+    return { ok: false, error: 'Path is not a file', path: fullPath };
+  }
+
+  const buffer = fsSync.readFileSync(fullPath);
+  const recipients = normalizeRecipientsInput(args.emailTo || args.to || args.email || args.recipient || args.recipients || '');
+  const payload = {
+    filename: args.filename || path.basename(fullPath),
+    contentBase64: buffer.toString('base64'),
+    contentType: args.contentType || guessContentType(fullPath),
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    emailTo: recipients.length ? recipients : '',
+    emailSubject: args.emailSubject || args.subject || '',
+    emailMessage: args.emailMessage || args.message || args.body || args.text || '',
+    attachToEmail: args.attachToEmail === true || args.asAttachment === true,
+  };
+
+  const result = await fetchInternalJson('/api/files/upload', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      path: fullPath,
+      file: result.file || null,
+      mail: result.mail || null,
+      record: result.record || null,
+      conversationResource: result.conversationResource || null,
+    };
+  }
+
+  return {
+    ok: false,
+    path: fullPath,
+    error: result?.error || result?.message || 'share_file_failed',
+    detail: result,
+  };
+}
+
+async function t_list_stored_files(args = {}) {
+  const context = args._context || {};
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  const result = await fetchInternalJson(`/api/files/my?limit=${limit}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_stored_files_failed',
+    detail: result,
+  };
+}
+
+async function t_list_resources(args = {}) {
+  const context = args._context || {};
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  const search = new URLSearchParams();
+  search.set('limit', String(limit));
+  if (String(args.conversationId || args.convId || args.sessionId || '').trim()) {
+    search.set('conversationId', String(args.conversationId || args.convId || args.sessionId).trim());
+  }
+  if (String(args.kind || args.resourceKind || '').trim()) {
+    search.set('kind', String(args.kind || args.resourceKind).trim());
+  }
+
+  const result = await fetchInternalJson(`/api/resources/my?${search.toString()}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_resources_failed',
+    detail: result,
+  };
+}
+
+async function t_email_resource(args = {}) {
+  const context = args._context || {};
+  const resourceId = Number(args.resourceId || args.resource_id || args.id || args.conversationResourceId || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error('email_resource: missing valid "resourceId"');
+  }
+
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('email_resource: missing "to"');
+  }
+
+  const payload = {
+    resourceId,
+    to: recipients,
+    subject: args.subject || args.emailSubject || '',
+    message: args.message || args.emailMessage || args.body || args.text || '',
+    attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+  };
+
+  const result = await fetchInternalJson('/api/resources/email', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      resourceId,
+      to: recipients,
+      mail: result.mail || null,
+      resource: result.resource || null,
+    };
+  }
+
+  return {
+    ok: false,
+    resourceId,
+    to: recipients,
+    error: result?.error || result?.message || 'email_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_get_latest_resource(args = {}) {
+  const context = args._context || {};
+  const search = new URLSearchParams();
+  if (String(args.conversationId || args.convId || args.sessionId || '').trim()) {
+    search.set('conversationId', String(args.conversationId || args.convId || args.sessionId).trim());
+  }
+  if (String(args.kind || args.resourceKind || '').trim()) {
+    search.set('kind', String(args.kind || args.resourceKind).trim());
+  }
+
+  const suffix = search.toString() ? `?${search.toString()}` : '';
+  const result = await fetchInternalJson(`/api/resources/latest${suffix}`, {
+    method: 'GET',
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'get_latest_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_email_latest_resource(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('email_latest_resource: missing "to"');
+  }
+
+  const payload = {
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    kind: args.kind || args.resourceKind || '',
+    to: recipients,
+    subject: args.subject || args.emailSubject || '',
+    message: args.message || args.emailMessage || args.body || args.text || '',
+    attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+  };
+
+  const result = await fetchInternalJson('/api/resources/latest/email', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      to: recipients,
+      mail: result.mail || null,
+      resource: result.resource || null,
+      latest: true,
+    };
+  }
+
+  return {
+    ok: false,
+    to: recipients,
+    error: result?.error || result?.message || 'email_latest_resource_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_email: missing "to"');
+  }
+
+  const attachmentPaths = args.attachToEmail !== false ? listAttachmentPaths(args) : [];
+  const attachments = attachmentPaths.map((candidate, index) => {
+    const fullPath = resolveManagedPath(candidate, `schedule_email.path[${index}]`);
+    return buildAttachmentPayload(fullPath, index, args.filename || '');
+  });
+
+  const payload = {
+    kind: 'email',
+    to: recipients,
+    subject: args.subject || args.emailSubject || 'A11',
+    message: args.message || args.emailMessage || args.body || args.text || args.content || '',
+    html: args.html || '',
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    sendAt: args.sendAt || args.when || '',
+    delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+    delayMinutes: args.delayMinutes || args.inMinutes || null,
+    attachments,
+  };
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_email_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_resource_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_resource_email: missing "to"');
+  }
+
+  const resourceId = Number(args.resourceId || args.resource_id || args.id || args.conversationResourceId || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) {
+    throw new Error('schedule_resource_email: missing valid "resourceId"');
+  }
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: {
+      kind: 'resource_email',
+      resourceId,
+      to: recipients,
+      subject: args.subject || args.emailSubject || '',
+      message: args.message || args.emailMessage || args.body || args.text || '',
+      conversationId: args.conversationId || args.convId || args.sessionId || null,
+      sendAt: args.sendAt || args.when || '',
+      delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+      delayMinutes: args.delayMinutes || args.inMinutes || null,
+      attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+    },
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_resource_email_failed',
+    detail: result,
+  };
+}
+
+async function t_schedule_latest_resource_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('schedule_latest_resource_email: missing "to"');
+  }
+
+  const result = await fetchInternalJson('/api/mail/schedule', {
+    method: 'POST',
+    body: {
+      kind: 'latest_resource_email',
+      to: recipients,
+      subject: args.subject || args.emailSubject || '',
+      message: args.message || args.emailMessage || args.body || args.text || '',
+      conversationId: args.conversationId || args.convId || args.sessionId || null,
+      kindFilter: args.kind || args.resourceKind || '',
+      sendAt: args.sendAt || args.when || '',
+      delaySeconds: args.delaySeconds || args.delay || args.inSeconds || null,
+      delayMinutes: args.delayMinutes || args.inMinutes || null,
+      attachToEmail: args.attachToEmail === true || args.asAttachment === true || args.attach === true,
+    },
+  }, context);
+
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'schedule_latest_resource_email_failed',
+    detail: result,
+  };
+}
+
+async function t_list_scheduled_emails(args = {}) {
+  const context = args._context || {};
+  const search = new URLSearchParams();
+  const limit = Number.isFinite(Number(args.limit))
+    ? Math.max(1, Math.min(100, Number(args.limit)))
+    : 20;
+  search.set('limit', String(limit));
+  if (String(args.status || '').trim()) {
+    search.set('status', String(args.status).trim());
+  }
+
+  const result = await fetchInternalJson(`/api/mail/scheduled?${search.toString()}`, {
+    method: 'GET',
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'list_scheduled_emails_failed',
+    detail: result,
+  };
+}
+
+async function t_cancel_scheduled_email(args = {}) {
+  const context = args._context || {};
+  const jobId = String(args.jobId || args.id || args.scheduledId || '').trim();
+  if (!jobId) {
+    throw new Error('cancel_scheduled_email: missing "jobId"');
+  }
+
+  const result = await fetchInternalJson(`/api/mail/scheduled/${encodeURIComponent(jobId)}/cancel`, {
+    method: 'POST',
+    body: {},
+  }, context);
+  if (result?.ok) return result;
+  return {
+    ok: false,
+    error: result?.error || result?.message || 'cancel_scheduled_email_failed',
+    detail: result,
+  };
+}
+
+async function t_send_email(args = {}) {
+  const context = args._context || {};
+  const recipients = normalizeRecipientsInput(args.to || args.emailTo || args.email || args.recipient || args.recipients || '');
+  if (!recipients.length) {
+    throw new Error('send_email: missing "to"');
+  }
+
+  const includeAttachments = args.attachToEmail !== false;
+  const attachmentPaths = includeAttachments ? listAttachmentPaths(args) : [];
+  const attachments = attachmentPaths.map((candidate, index) => {
+    const fullPath = resolveManagedPath(candidate, `send_email.path[${index}]`);
+    return buildAttachmentPayload(fullPath, index, args.filename || '');
+  });
+
+  const payload = {
+    to: recipients,
+    subject: args.subject || args.emailSubject || 'A11',
+    message: args.message || args.emailMessage || args.body || args.text || args.content || '',
+    html: args.html || '',
+    conversationId: args.conversationId || args.convId || args.sessionId || null,
+    attachments,
+  };
+
+  const result = await fetchInternalJson('/api/mail/send', {
+    method: 'POST',
+    body: payload,
+  }, context);
+
+  if (result?.ok) {
+    return {
+      ok: true,
+      to: recipients,
+      subject: payload.subject,
+      attachmentCount: attachments.length,
+      mail: result.mail || null,
+    };
+  }
+
+  return {
+    ok: false,
+    to: recipients,
+    subject: payload.subject,
+    error: result?.error || result?.message || 'send_email_failed',
+    detail: result,
+  };
+}
+
 function isPathInRoots(p) {
   const resolved = path.resolve(p);
   return WORKSPACE_ROOTS.some(root => {
@@ -531,22 +1075,95 @@ async function t_fs_move(args = {}) {
   return { ok: true, from, to };
 }
 
-// ZIP (stub)
-async function t_zip_create(args = {}) {
-  const { inputPaths, outputPath } = args;
-  assertPathAllowed(outputPath, 'zip_create.outputPath');
-  if (!Array.isArray(inputPaths) || inputPaths.length === 0) {
+function buildZipEntryName(candidatePath, usedEntries) {
+  const rawBase = path.basename(candidatePath) || `entry-${usedEntries.size + 1}`;
+  const ext = path.extname(rawBase);
+  const name = path.basename(rawBase, ext);
+  let entryName = rawBase;
+  let suffix = 2;
+  while (usedEntries.has(entryName.toLowerCase())) {
+    entryName = `${name}-${suffix}${ext}`;
+    suffix += 1;
+  }
+  usedEntries.add(entryName.toLowerCase());
+  return entryName;
+}
+
+async function createZipBundle(args = {}) {
+  const rawInputPaths = Array.isArray(args.inputPaths)
+    ? args.inputPaths
+    : Array.isArray(args.paths)
+      ? args.paths
+      : [];
+  if (!rawInputPaths.length) {
     throw new Error('zip_create: inputPaths must be a non-empty array');
   }
-  inputPaths.forEach(p => assertPathAllowed(p, 'zip_create.inputPaths'));
-  return { ok: true, outputPath, stub: true };
+
+  const outputPath = args.outputPath
+    ? resolveManagedPath(args.outputPath, 'zip_create.outputPath')
+    : buildGeneratedAssetPath(`bundle-${Date.now()}.zip`, 'zip_create.outputPath');
+  const inputPaths = rawInputPaths.map((candidate, index) => resolveManagedPath(candidate, `zip_create.inputPaths[${index}]`));
+  const zip = new AdmZip();
+  const usedEntries = new Set();
+
+  for (const inputPath of inputPaths) {
+    const stats = fsSync.statSync(inputPath);
+    if (stats.isDirectory()) {
+      zip.addLocalFolder(inputPath, buildZipEntryName(inputPath, usedEntries));
+    } else {
+      zip.addLocalFile(inputPath, '', buildZipEntryName(inputPath, usedEntries));
+    }
+  }
+
+  await fsp.mkdir(path.dirname(outputPath), { recursive: true });
+  zip.writeZip(outputPath);
+  const written = fsSync.statSync(outputPath);
+
+  return {
+    ok: true,
+    outputPath,
+    inputPaths,
+    inputCount: inputPaths.length,
+    sizeBytes: written.size,
+  };
+}
+
+async function t_zip_create(args = {}) {
+  return createZipBundle(args);
 }
 
 async function t_unzip_extract(args = {}) {
-  const { zipPath, outputDir } = args;
-  assertPathAllowed(zipPath, 'unzip_extract.zipPath');
-  assertPathAllowed(outputDir, 'unzip_extract.outputDir');
-  return { ok: true, zipPath, outputDir, stub: true };
+  const zipPath = resolveManagedPath(args.zipPath, 'unzip_extract.zipPath');
+  const outputDir = args.outputDir
+    ? resolveManagedPath(args.outputDir, 'unzip_extract.outputDir')
+    : buildGeneratedAssetPath(`unzip-${Date.now()}`, 'unzip_extract.outputDir');
+  const zip = new AdmZip(zipPath);
+  await fsp.mkdir(outputDir, { recursive: true });
+  zip.extractAllTo(outputDir, true);
+  return { ok: true, zipPath, outputDir };
+}
+
+async function t_zip_and_email(args = {}) {
+  const zipResult = await createZipBundle({
+    inputPaths: Array.isArray(args.inputPaths) ? args.inputPaths : args.paths,
+    outputPath: args.outputPath || args.zipPath || args.path || null,
+  });
+
+  const emailResult = await t_send_email({
+    ...args,
+    path: zipResult.outputPath,
+    paths: null,
+    attachments: null,
+    filename: args.filename || path.basename(zipResult.outputPath),
+    subject: args.subject || args.emailSubject || 'A11 — archive ZIP',
+    message: args.message || args.emailMessage || args.body || 'Archive ZIP prête.',
+  });
+
+  return {
+    ok: emailResult?.ok === true,
+    zip: zipResult,
+    mail: emailResult,
+  };
 }
 
 // SHELL
@@ -1335,6 +1952,224 @@ async function t_tts_advanced(args = {}) {
   };
 }
 
+function normalizeDispatchActionName(name) {
+  const normalized = String(name || '').trim();
+  const lowered = normalized.toLowerCase();
+  if (!lowered) return normalized;
+
+  if (lowered === 'generate_image') return 'generate_png';
+  if (lowered === 'websearch') return 'web_search';
+  if (lowered === 'share-file' || lowered === 'sharefile' || lowered === 'upload_file' || lowered === 'publish_file') {
+    return 'share_file';
+  }
+  if (lowered === 'list-stored-files' || lowered === 'list_files' || lowered === 'stored_files' || lowered === 'listfiles') {
+    return 'list_stored_files';
+  }
+  if (lowered === 'list_resources' || lowered === 'list-resource' || lowered === 'list_resource' || lowered === 'list_conversation_resources') {
+    return 'list_resources';
+  }
+  if (lowered === 'get_latest_resource' || lowered === 'latest_resource' || lowered === 'get-latest-resource') {
+    return 'get_latest_resource';
+  }
+  if (lowered === 'send-email' || lowered === 'send_mail' || lowered === 'mail_user' || lowered === 'email_user') {
+    return 'send_email';
+  }
+  if (lowered === 'email_latest_resource' || lowered === 'send_latest_resource_email' || lowered === 'latest_resource_email') {
+    return 'email_latest_resource';
+  }
+  if (lowered === 'email-resource' || lowered === 'emailresource' || lowered === 'send_resource_email' || lowered === 'resource_email') {
+    return 'email_resource';
+  }
+  if (lowered === 'schedule-email' || lowered === 'schedule_mail' || lowered === 'mail_later' || lowered === 'delayed_email') {
+    return 'schedule_email';
+  }
+  if (lowered === 'schedule_resource_email' || lowered === 'schedule-resource-email' || lowered === 'resource_email_later') {
+    return 'schedule_resource_email';
+  }
+  if (lowered === 'schedule_latest_resource_email' || lowered === 'latest_resource_email_later') {
+    return 'schedule_latest_resource_email';
+  }
+  if (lowered === 'list_scheduled_emails' || lowered === 'scheduled_emails' || lowered === 'list-mail-jobs') {
+    return 'list_scheduled_emails';
+  }
+  if (lowered === 'cancel_scheduled_email' || lowered === 'cancel-mail-job' || lowered === 'cancel_scheduled_mail') {
+    return 'cancel_scheduled_email';
+  }
+  if (lowered === 'zip_and_email' || lowered === 'zip-email' || lowered === 'bundle_and_email') {
+    return 'zip_and_email';
+  }
+  if (lowered === 'email_file' || lowered === 'mail_file' || lowered === 'share_and_email_file') {
+    return 'share_file';
+  }
+
+  return normalized;
+}
+
+function normalizeDispatchActionArgs(actionName, rawArgs = {}) {
+  const args = rawArgs && typeof rawArgs === 'object' ? { ...rawArgs } : {};
+
+  if (actionName === 'share_file') {
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!args.emailTo) {
+      args.emailTo = args.to || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.emailSubject) {
+      args.emailSubject = args.subject || '';
+    }
+    if (!args.emailMessage) {
+      args.emailMessage = args.message || args.body || args.text || '';
+    }
+    if (args.attachToEmail == null && args.asAttachment != null) {
+      args.attachToEmail = args.asAttachment;
+    }
+  }
+
+  if (actionName === 'send_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+    if (!Array.isArray(args.paths) && Array.isArray(args.attachments)) {
+      const attachmentPaths = args.attachments
+        .map((item) => {
+          if (typeof item === 'string') return item;
+          if (item && typeof item === 'object') return item.path || '';
+          return '';
+        })
+        .filter(Boolean);
+      if (attachmentPaths.length) {
+        args.paths = attachmentPaths;
+      }
+    }
+  }
+
+  if (actionName === 'email_resource') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (args.attachToEmail == null && args.asAttachment != null) {
+      args.attachToEmail = args.asAttachment;
+    }
+  }
+
+  if (actionName === 'email_latest_resource') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'list_resources') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'get_latest_resource') {
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+  }
+
+  if (actionName === 'schedule_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.path) {
+      args.path = args.outputPath || args.filePath || args.attachmentPath || null;
+    }
+  }
+
+  if (actionName === 'schedule_resource_email') {
+    if (!args.resourceId) {
+      args.resourceId = args.resource_id || args.id || args.conversationResourceId || null;
+    }
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+  }
+
+  if (actionName === 'schedule_latest_resource_email') {
+    if (!args.to) {
+      args.to = args.emailTo || args.email || args.recipient || args.recipients || '';
+    }
+    if (!args.subject) {
+      args.subject = args.emailSubject || '';
+    }
+    if (!args.message) {
+      args.message = args.emailMessage || args.body || args.text || args.content || '';
+    }
+    if (!args.kind) {
+      args.kind = args.resourceKind || args.type || '';
+    }
+    if (!args.conversationId) {
+      args.conversationId = args.convId || args.sessionId || null;
+    }
+  }
+
+  if (actionName === 'cancel_scheduled_email' && !args.jobId) {
+    args.jobId = args.id || args.scheduledId || args.job || null;
+  }
+
+  if (actionName === 'zip_and_email' && !args.inputPaths) {
+    args.inputPaths = Array.isArray(args.paths) ? args.paths : [];
+  }
+
+  if (actionName === 'list_stored_files' && !args.limit) {
+    args.limit = args.max || args.count || args.top || args.n || undefined;
+  }
+
+  return args;
+}
+
 const TOOL_IMPL = {
   // QFlush
   qflush_flow: t_qflush_flow,
@@ -1386,6 +2221,21 @@ const TOOL_IMPL = {
   // Download direct d’image/fichier
   download_file: t_download_file,
 
+  // Stockage / mail
+  share_file: t_share_file,
+  list_stored_files: t_list_stored_files,
+  list_resources: t_list_resources,
+  get_latest_resource: t_get_latest_resource,
+  email_resource: t_email_resource,
+  email_latest_resource: t_email_latest_resource,
+  send_email: t_send_email,
+  schedule_email: t_schedule_email,
+  schedule_resource_email: t_schedule_resource_email,
+  schedule_latest_resource_email: t_schedule_latest_resource_email,
+  list_scheduled_emails: t_list_scheduled_emails,
+  cancel_scheduled_email: t_cancel_scheduled_email,
+  zip_and_email: t_zip_and_email,
+
   // TTS (stubs pour l’instant)
   tts_basic: t_tts_basic,
   tts_advanced: t_tts_advanced,
@@ -1405,23 +2255,29 @@ function validateActionName(name) {
   return { ok: true };
 }
 
+function getAllowedActionNames() {
+  return Object.keys(TOOL_IMPL).sort();
+}
+
 async function runAction(name, args = {}) {
-  if (!TOOL_IMPL[name]) {
+  const normalizedName = normalizeDispatchActionName(name);
+  const normalizedArgs = normalizeDispatchActionArgs(normalizedName, args);
+  if (!TOOL_IMPL[normalizedName]) {
     return {
       ok: false,
-      error: `Unknown tool: ${name}`,
+      error: `Unknown tool: ${normalizedName}`,
       available: Object.keys(TOOL_IMPL)
     };
   }
-  const spec = ensureToolAvailable(name);
-  const impl = TOOL_IMPL[name];
-  console.log(`[Cerbère][tool] ${name} (danger=${spec.dangerLevel || 'unknown'})`, args);
+  const spec = ensureToolAvailable(normalizedName);
+  const impl = TOOL_IMPL[normalizedName];
+  console.log(`[Cerbère][tool] ${normalizedName} (danger=${spec.dangerLevel || 'unknown'})`, normalizedArgs);
   try {
-    const result = await impl(args);
-    return { tool: name, ok: true, result };
+    const result = await impl(normalizedArgs);
+    return { tool: normalizedName, ok: true, result };
   } catch (err) {
     return {
-      tool: name,
+      tool: normalizedName,
       ok: false,
       error: err?.message || String(err),
       stack: err?.stack || null
@@ -1448,7 +2304,7 @@ function isIgnoredMemoryKey(actionName, args) {
 }
 
 // --- PATCH: Normalize envelope (result -> actions) and sequential execution with validation ---
-async function runActionsEnvelope(envelope) {
+async function runActionsEnvelope(envelope, context = {}) {
   // Normalize: accept legacy {result: {...}} as {actions: [result]}
   if (!envelope.actions && envelope.result) {
     envelope.actions = [envelope.result];
@@ -1458,13 +2314,18 @@ async function runActionsEnvelope(envelope) {
   }
   const results = [];
   for (const a of envelope.actions) {
-    const name = a.action || a.name;
-    const args = a.arguments || a.input || {};
+    const rawName = a.action || a.name;
+    const name = normalizeDispatchActionName(rawName);
+    const args = normalizeDispatchActionArgs(name, {
+      ...(a.arguments || a.input || {}),
+      _context: context,
+    });
     // Validation stricte du nom d'action
     const valid = validateActionName(name);
     if (!valid.ok) {
       results.push({
-        action: name,
+        action: rawName,
+        normalizedAction: name,
         ok: false,
         error: valid.error,
         available: valid.available
@@ -1558,6 +2419,19 @@ module.exports = {
   t_llm_analyze_text,
   t_generate_pdf,
   t_generate_png,
+  t_share_file,
+  t_list_stored_files,
+  t_list_resources,
+  t_get_latest_resource,
+  t_email_resource,
+  t_email_latest_resource,
+  t_send_email,
+  t_schedule_email,
+  t_schedule_resource_email,
+  t_schedule_latest_resource_email,
+  t_list_scheduled_emails,
+  t_cancel_scheduled_email,
+  t_zip_and_email,
   t_vs_status,
   t_vs_workspace_root,
   t_vs_compilation_errors,
@@ -1574,5 +2448,6 @@ module.exports = {
   t_a11_debug_echo,
   runAction,
   runActionsEnvelope,
-  isIgnoredMemoryKey
+  isIgnoredMemoryKey,
+  getAllowedActionNames
 };
