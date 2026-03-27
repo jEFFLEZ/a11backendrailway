@@ -1,19 +1,21 @@
 # Copilot Instructions for A11 System (updated)
 
 ## Overview
-- A11 is a local AI system: Node.js/Express backend (`apps/server`), Vite frontend (`apps/web`), Cloudflare Tunnel for remote access and a local supervisor `qflush` (repo: `D:\qflush`).
+- A11 backend lives in this repo as a Node.js/Express service under `apps/server`.
+- The canonical frontend is in the sibling repo `..\a11frontendnetlify\apps\web`.
+- Global A11 launchers live in the sibling workspace folder `..\launchers`.
 
 ## Key locations
 - Backend: `apps/server/server.cjs`
-- Frontend: `apps/web/`
+- Frontend: `..\a11frontendnetlify\apps\web`
 - Tunnel config: user `.cloudflared/config.yml` or repo `.cloudflared/config.yml`
-- Startup: `start-a11-system.ps1`
+- Startup: `..\launchers\start-all-a11.ps1` or `..\launchers\start-prod-a11.ps1`
 - Supervisor integration: `apps/server/src/qflush-integration.cjs`
 
 ## Start / dev
-- Start everything: `pwsh -File start-a11-system.ps1`
+- Start everything: `pwsh -File ..\launchers\start-all-a11.ps1`
 - Backend dev: `cd apps/server && npm run dev`
-- Frontend dev: `cd apps/web && npm run dev`
+- Frontend dev: `cd ..\a11frontendnetlify\apps\web && npm run dev`
 
 ## Tunnel & Cloudflare
 - Ensure `config.yml` maps `api.funesterie.me` -> `http://127.0.0.1:3000` and points to the tunnel credentials JSON.

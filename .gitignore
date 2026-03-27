@@ -8,6 +8,8 @@ dist/
 Thumbs.db
 .a11-launcher/
 apps/logs/
+apps/web/
 apps/server/tmp-restart-*.log
 a11_memory/conversations/
 a11_memory/memos/memo_env_snapshot_*.json
+public/tts/

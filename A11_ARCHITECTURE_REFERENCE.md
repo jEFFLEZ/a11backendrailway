@@ -9,11 +9,16 @@ Build a modular AI system with:
 
 ## Project Structure
 
-D:/A11
-- llm/: text generation stack (GGUF / llama.cpp)
-- tts/: speech synthesis stack
-- backend/: A11 API (Railway)
-- frontend/: UI app (Netlify)
+D:/funesterie/a11
+- a11llm/: text generation stack (GGUF / llama.cpp)
+- a11backendrailway/: A11 API (Railway)
+- a11frontendnetlify/: UI app (Netlify)
+- launchers/: orchestration locale transverse
+
+Important:
+
+- `a11backendrailway` ne doit pas embarquer le frontend source
+- le frontend canonique vit dans `a11frontendnetlify/apps/web`
 
 ## 1) LLM Layer (llm)
 
@@ -77,6 +82,9 @@ Key variable:
 
 Compatibility:
 - frontend also supports VITE_API_BASE_URL for backward compatibility.
+
+Canonical location:
+- `D:/funesterie/a11/a11frontendnetlify/apps/web`
 
 ## End-to-End Flow
 
