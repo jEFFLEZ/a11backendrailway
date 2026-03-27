@@ -14,7 +14,13 @@ function toBoolean(value) {
 }
 
 function buildRuntimeConfig(env = process.env) {
-  const qflushRemoteUrl = String(env.QFLUSH_URL || env.QFLUSH_REMOTE_URL || 'https://qflush-production.up.railway.app').trim();
+  const runtimeProfile = String(env.A11_RUNTIME_PROFILE || '').trim().toLowerCase();
+  const localOnly = toBoolean(env.A11_LOCAL_MODE) || runtimeProfile === 'local';
+  const qflushRemoteUrl = String(
+    env.QFLUSH_URL
+      || env.QFLUSH_REMOTE_URL
+      || (localOnly ? '' : 'https://qflush-production.up.railway.app')
+  ).trim();
   const frontendUrl = normalizeUrl(env.APP_URL || env.FRONT_URL || 'https://a11.funesterie.pro');
   const ttsInternalUrl = String(env.TTS_URL || env.TTS_HOST || '').trim();
   const ttsPublicBaseUrl = normalizeUrl(env.TTS_PUBLIC_BASE_URL || env.TTS_BASE_URL || '');
