@@ -518,6 +518,68 @@ function loadAllMemos() {
     return [];
   }
 }
+
+function summarizeMemoEntries(entries = []) {
+  const list = Array.isArray(entries) ? entries : [];
+  const byType = {};
+  let latestTs = '';
+  let oldestTs = '';
+
+  for (const entry of list) {
+    const type = String(entry?.type || 'memo').trim() || 'memo';
+    byType[type] = Number(byType[type] || 0) + 1;
+    const ts = String(entry?.ts || '').trim();
+    if (ts) {
+      if (!latestTs || ts > latestTs) latestTs = ts;
+      if (!oldestTs || ts < oldestTs) oldestTs = ts;
+    }
+  }
+
+  return {
+    total: list.length,
+    byType,
+    latestTs: latestTs || null,
+    oldestTs: oldestTs || null,
+  };
+}
+
+function purgeTechnicalMemos() {
+  ensureMemoDir();
+  const entries = loadAllMemos();
+  const summary = summarizeMemoEntries(entries);
+  let removedFiles = 0;
+  let removedIndex = false;
+
+  try {
+    if (fsMem.existsSync(A11_MEMO_DIR)) {
+      const files = fsMem.readdirSync(A11_MEMO_DIR, { withFileTypes: true });
+      for (const file of files) {
+        if (!file?.isFile?.()) continue;
+        if (!/\.json(?:l)?$/i.test(String(file.name || ''))) continue;
+        const fullPath = pathMem.join(A11_MEMO_DIR, file.name);
+        fsMem.unlinkSync(fullPath);
+        removedFiles += 1;
+        if (fullPath === A11_MEMO_INDEX || file.name === 'memo_index.jsonl') {
+          removedIndex = true;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[A11][memo] purge failed:', e?.message);
+    throw e;
+  }
+
+  ensureMemoDir();
+  return {
+    ok: true,
+    removedEntries: Number(summary.total || 0),
+    removedFiles,
+    removedIndex,
+    byType: summary.byType,
+    latestTs: summary.latestTs,
+    oldestTs: summary.oldestTs,
+  };
+}
 // --- FIN MEMOS JSON ---
 
 // === Upload (OCR) - use memory storage to avoid disk writes ===
@@ -6187,6 +6249,19 @@ app.get('/api/a11/memo/all', (req, res) => {
   return res.json({ ok: true, entries });
 });
 
+app.get('/api/a11/memo/summary', verifyJWT, (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required' });
+    }
+    const entries = loadAllMemos();
+    return res.json({ ok: true, summary: summarizeMemoEntries(entries) });
+  } catch (e) {
+    console.error('[A11][memo] summary failed:', e?.message);
+    return res.status(500).json({ ok: false, error: e?.message || 'memo_summary_failed' });
+  }
+});
+
 // --- MEMO API: récupérer un mémo complet par ID ---
 app.get('/api/a11/memo/:id', (req, res) => {
   const id = req.params.id;
@@ -6203,6 +6278,19 @@ app.get('/api/a11/memo/:id', (req, res) => {
   } catch (e) {
     console.error('[A11][memo] read memo failed:', e?.message);
     return res.status(500).json({ ok: false, error: e?.message });
+  }
+});
+
+app.delete('/api/a11/memo', verifyJWT, (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required' });
+    }
+    const result = purgeTechnicalMemos();
+    return res.json(result);
+  } catch (e) {
+    console.error('[A11][memo] purge failed:', e?.message);
+    return res.status(500).json({ ok: false, error: e?.message || 'memo_purge_failed' });
   }
 });
 
