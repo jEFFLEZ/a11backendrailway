@@ -307,6 +307,87 @@ function readConversationLogEntries({ userId, conversationId, limit = 20 } = {})
   }
 }
 
+function purgeConversationLogEntries({ userId, conversationId } = {}) {
+  try {
+    ensureConvDir();
+    if (!fsMem.existsSync(A11_CONV_DIR)) {
+      return { removedEntries: 0, touchedFiles: 0 };
+    }
+
+    const normalizedUserId = String(userId || '').trim();
+    const hasConversationFilter = String(conversationId || '').trim().length > 0;
+    const normalizedConversationId = hasConversationFilter ? normalizeConversationId(conversationId) : '';
+    if (!normalizedUserId) {
+      return { removedEntries: 0, touchedFiles: 0 };
+    }
+
+    const files = fsMem
+      .readdirSync(A11_CONV_DIR, { withFileTypes: true })
+      .filter((dirent) => dirent.isFile() && dirent.name.endsWith('.jsonl'))
+      .map((dirent) => dirent.name);
+
+    let removedEntries = 0;
+    let touchedFiles = 0;
+
+    for (const filename of files) {
+      const fullPath = pathMem.join(A11_CONV_DIR, filename);
+      let raw;
+      try {
+        raw = fsMem.readFileSync(fullPath, 'utf8');
+      } catch (error_) {
+        console.warn('[A11][memory] purge read failed:', fullPath, error_?.message);
+        continue;
+      }
+
+      const nextLines = [];
+      let fileTouched = false;
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let shouldRemove = false;
+        try {
+          const entry = JSON.parse(trimmed);
+          const entryUserId = String(entry?.userId || '').trim();
+          const entryConversationId = normalizeConversationId(entry?.conversationId);
+          if (entryUserId === normalizedUserId) {
+            shouldRemove = !hasConversationFilter || entryConversationId === normalizedConversationId;
+          }
+        } catch {
+          nextLines.push(trimmed);
+          continue;
+        }
+
+        if (shouldRemove) {
+          removedEntries += 1;
+          fileTouched = true;
+          continue;
+        }
+
+        nextLines.push(trimmed);
+      }
+
+      if (!fileTouched) continue;
+      touchedFiles += 1;
+
+      try {
+        if (nextLines.length) {
+          fsMem.writeFileSync(fullPath, `${nextLines.join('\n')}\n`, 'utf8');
+        } else {
+          fsMem.unlinkSync(fullPath);
+        }
+      } catch (error_) {
+        console.warn('[A11][memory] purge write failed:', fullPath, error_?.message);
+      }
+    }
+
+    return { removedEntries, touchedFiles };
+  } catch (error_) {
+    console.warn('[A11][memory] purge activity failed:', error_?.message);
+    return { removedEntries: 0, touchedFiles: 0 };
+  }
+}
+
 function truncateConversationActivityText(value, maxLength = 180) {
   const normalized = normalizeMemoryText(value);
   if (!normalized) return '';
@@ -938,7 +1019,7 @@ if (db) {
             'INSERT INTO users (username, email, password_hash) VALUES ($1,$2,$3)',
             [DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_EMAIL, adminHash]
           );
-          console.log('[AUTH] ✅ Admin bootstrap account created:', DEFAULT_ADMIN_USERNAME);
+          console.log('[AUTH] ✅ Admin bootstrap account created');
         }
         console.log('[DB] ✅ users.reset_token columns vérifiées');
         console.log('[DB] ✅ chat memory tables vérifiées');
@@ -2346,7 +2427,7 @@ function verifyJWT(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
-    console.log('[JWT] ✅ Token vérifié pour user:', decoded.username);
+    console.log('[JWT] ✅ Token vérifié');
     next();
   } catch (err) {
     console.warn('[JWT] Verification failed:', err.message);
@@ -2813,7 +2894,7 @@ app.post('/api/auth/login', express.json(), async (req, res) => {
   const { email, username, password } = req.body || {};
   const identifier = String(email || username || '').trim();
   const normalizedEmail = String(email || '').trim().toLowerCase();
-  console.log('[AUTH] Login attempt:', identifier || '(empty)');
+  console.log('[AUTH] Login attempt received');
 
   if (!identifier || !password) {
     return res.status(400).json({ success: false, error: 'Missing credentials' });
@@ -2844,7 +2925,7 @@ app.post('/api/auth/login', express.json(), async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ success: false, error: 'Invalid credentials' });
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: JWT_EXPIRY });
-    console.log('[AUTH] ✅ Login réussi:', user.username);
+    console.log('[AUTH] ✅ Login réussi');
     res.json({ success: true, token, user: { id: user.id, username: user.username } });
   } catch (e) {
     console.error('[AUTH] Login error:', e.message);
@@ -2885,7 +2966,7 @@ const forgotPasswordHandler = async (req, res) => {
       link,
     });
     if (!mailResult?.ok) throw new Error(mailResult?.reason || 'mail_send_failed');
-    console.log('[AUTH] ✅ Reset email envoyé à:', user.email);
+    console.log('[AUTH] ✅ Reset email envoyé');
     res.json({ ok: true, mailEnabled: true });
   } catch (e) {
     console.error('[AUTH] Forgot error:', e.message);
@@ -2917,7 +2998,7 @@ const resetPasswordHandler = async (req, res) => {
         'UPDATE users SET password_hash=$1, reset_token=NULL, reset_token_expires_at=NULL WHERE id=$2',
         [hash, userId]
       );
-      console.log('[AUTH] ✅ Password reset via DB token for user id:', userId);
+      console.log('[AUTH] ✅ Password reset via DB token');
       return res.json({ ok: true });
     }
 
@@ -2927,7 +3008,7 @@ const resetPasswordHandler = async (req, res) => {
       'UPDATE users SET password_hash=$1, reset_token=NULL, reset_token_expires_at=NULL WHERE id=$2',
       [hash, decoded.id]
     );
-    console.log('[AUTH] ✅ Password reset via JWT token for user id:', decoded.id);
+    console.log('[AUTH] ✅ Password reset via JWT token');
     res.json({ ok: true });
   } catch (e) {
     console.error('[AUTH] Reset error:', e.message);
@@ -3032,6 +3113,143 @@ app.get('/api/a11/history/:id', verifyJWT, async (req, res) => {
   } catch (e) {
     console.error('[A11][History] Conversation error:', e?.message);
     return res.status(500).json({ error: 'history_conversation_failed' });
+  }
+});
+
+app.delete('/api/a11/history', verifyJWT, async (req, res) => {
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: 'missing_user' });
+  }
+
+  let transactionStarted = false;
+  try {
+    let removedConversations = 0;
+    let removedMessages = 0;
+    let removedResources = 0;
+
+    if (db) {
+      const countResult = await db.query(
+        `SELECT COUNT(*)::int AS count
+         FROM (
+           SELECT COALESCE(conversation_id, 'default') AS conversation_id
+           FROM messages
+           WHERE user_id = $1
+           UNION
+           SELECT COALESCE(conversation_id, 'default') AS conversation_id
+           FROM conversation_resources
+           WHERE user_id = $1
+         ) conversations`,
+        [userId]
+      );
+      removedConversations = Number(countResult.rows[0]?.count || 0);
+
+      await db.query('BEGIN');
+      transactionStarted = true;
+
+      const deletedMessages = await db.query('DELETE FROM messages WHERE user_id=$1', [userId]);
+      const deletedResources = await db.query('DELETE FROM conversation_resources WHERE user_id=$1', [userId]);
+
+      removedMessages = Number(deletedMessages.rowCount || 0);
+      removedResources = Number(deletedResources.rowCount || 0);
+
+      await db.query('COMMIT');
+      transactionStarted = false;
+    }
+
+    const activityPurge = purgeConversationLogEntries({ userId });
+
+    return res.json({
+      ok: true,
+      removedConversations,
+      removedMessages,
+      removedResources,
+      removedActivityEntries: Number(activityPurge.removedEntries || 0),
+    });
+  } catch (e) {
+    if (db && transactionStarted) {
+      try { await db.query('ROLLBACK'); } catch {}
+    }
+    console.error('[A11][History] Clear error:', e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'history_clear_failed',
+      message: String(e?.message || e),
+    });
+  }
+});
+
+app.delete('/api/a11/history/:id', verifyJWT, async (req, res) => {
+  const userId = String(req.user?.id || '').trim();
+  if (!userId) {
+    return res.status(401).json({ ok: false, error: 'missing_user' });
+  }
+
+  const requestedId = String(req.params.id || '').trim();
+  if (!requestedId) {
+    return res.status(400).json({ ok: false, error: 'missing_conversation_id' });
+  }
+
+  const legacyHistoryId = `user-${userId}`;
+  const targetConversationId = requestedId === legacyHistoryId
+    ? 'default'
+    : normalizeConversationId(requestedId);
+
+  let transactionStarted = false;
+  try {
+    let removedMessages = 0;
+    let removedResources = 0;
+
+    if (db) {
+      await db.query('BEGIN');
+      transactionStarted = true;
+
+      const deletedMessages = await db.query(
+        `DELETE FROM messages
+         WHERE user_id = $1
+           AND COALESCE(conversation_id, 'default') = $2`,
+        [userId, targetConversationId]
+      );
+      const deletedResources = await db.query(
+        `DELETE FROM conversation_resources
+         WHERE user_id = $1
+           AND COALESCE(conversation_id, 'default') = $2`,
+        [userId, targetConversationId]
+      );
+
+      removedMessages = Number(deletedMessages.rowCount || 0);
+      removedResources = Number(deletedResources.rowCount || 0);
+
+      await db.query('COMMIT');
+      transactionStarted = false;
+    }
+
+    const activityPurge = purgeConversationLogEntries({
+      userId,
+      conversationId: targetConversationId,
+    });
+    const removed = removedMessages > 0
+      || removedResources > 0
+      || Number(activityPurge.removedEntries || 0) > 0;
+
+    return res.json({
+      ok: true,
+      removed,
+      id: targetConversationId,
+      removedMessages,
+      removedResources,
+      removedActivityEntries: Number(activityPurge.removedEntries || 0),
+    });
+  } catch (e) {
+    if (db && transactionStarted) {
+      try { await db.query('ROLLBACK'); } catch {}
+    }
+    console.error('[A11][History] Delete error:', e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'history_delete_failed',
+      message: String(e?.message || e),
+    });
   }
 });
 
