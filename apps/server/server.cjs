@@ -5311,6 +5311,8 @@ function buildDevActionReplyContext(cerbere, imagePath = null, userRequest = '')
       to: extractPrimaryRecipient(entry) || undefined,
       link: extractPrimarySharedLink(entry) || undefined,
       expiresAt: extractPrimaryExpiry(entry) || undefined,
+      mailOnly: result?.mailOnly === true || undefined,
+      storageFallbackReason: String(result?.storageFallbackReason || '').trim() || undefined,
       count: Number(
         result?.count
         || (Array.isArray(result?.jobs) ? result.jobs.length : 0)
@@ -5356,11 +5358,21 @@ function buildDeterministicDevActionReply(context) {
     const mailedLatestResult = results.find((entry) => entry.ok && entry.action === 'email_latest_resource');
 
     if (okActions.has('generate_pdf') && okActions.has('share_file')) {
+      if (sharedResult?.mailOnly) {
+        return sharedResult?.to
+          ? `C'est fait. Le PDF a bien ete cree et envoye a ${sharedResult.to}, mais le stockage temporaire a echoue.`
+          : "C'est fait. Le PDF a bien ete cree, mais le stockage temporaire a echoue.";
+      }
       return sharedResult?.to
         ? `C'est fait. Le PDF a bien ete cree, stocke et envoye a ${sharedResult.to}.${buildTemporaryLinkSuffix(sharedResult)}`
         : `C'est fait. Le PDF a bien ete cree, stocke dans le bucket et pret au telechargement.${buildTemporaryLinkSuffix(sharedResult)}`;
     }
     if (okActions.has('generate_png') && okActions.has('share_file')) {
+      if (sharedResult?.mailOnly) {
+        return sharedResult?.to
+          ? `C'est fait. L'image a bien ete creee et envoyee a ${sharedResult.to}, mais le stockage temporaire a echoue.`
+          : "C'est fait. L'image a bien ete creee, mais le stockage temporaire a echoue.";
+      }
       return sharedResult?.to
         ? `C'est fait. L'image a bien ete creee, stockee et envoyee a ${sharedResult.to}.${buildTemporaryLinkSuffix(sharedResult)}`
         : `C'est fait. L'image a bien ete creee, stockee dans le bucket et prete au telechargement.${buildTemporaryLinkSuffix(sharedResult)}`;
@@ -5383,6 +5395,11 @@ function buildDeterministicDevActionReply(context) {
         : "C'est fait. Le mail a bien ete envoye.";
     }
     if (firstResult?.action === 'share_file') {
+      if (firstResult?.mailOnly) {
+        return firstResult?.to
+          ? `C'est fait. Le fichier a bien ete envoye a ${firstResult.to}, mais le stockage temporaire a echoue.`
+          : "C'est fait. Le fichier a bien ete prepare, mais le stockage temporaire a echoue.";
+      }
       return firstResult?.to
         ? `C'est fait. Le fichier a bien ete partage et envoye a ${firstResult.to}.${buildTemporaryLinkSuffix(firstResult)}`
         : `C'est fait. Le fichier a bien ete partage.${buildTemporaryLinkSuffix(firstResult)}`;
@@ -6529,7 +6546,11 @@ const { A11_AGENT_SYSTEM_PROMPT, A11_AGENT_DEV_PROMPT } = require('./lib/a11Agen
 const { runAction, runActionsEnvelope, getAllowedActionNames } = require('./src/a11/tools-dispatcher.cjs');
 
 function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) {
-  const userPrompt = buildPromptFromMessages(Array.isArray(messages) ? messages : []);
+  const compactMode = options.compact === true;
+  const maxMessages = compactMode ? 6 : 10;
+  const maxCharsPerMessage = compactMode ? 420 : 700;
+  const maxTotalChars = compactMode ? 2200 : 4200;
+  const maxToolResults = compactMode ? 3 : 6;
   const workspaceRoot = String(
     process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || path.resolve(__dirname, '..', '..')
   ).trim();
@@ -6540,6 +6561,13 @@ function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) 
   const allowedActions = restrictedActions.length
     ? [...new Set(restrictedActions)]
     : getAllowedActionNames();
+  const userPrompt = buildA11AgentConversationExcerpt(messages, {
+    maxMessages,
+    maxCharsPerMessage,
+    maxTotalChars,
+  });
+  const latestUserRequest = getLatestUserMessageFromMessages(messages) || buildPromptFromMessages(Array.isArray(messages) ? messages : []);
+  const compactToolResults = buildA11AgentToolResultsSnapshot(toolResults, maxToolResults);
   return [
     '[TOOLS]',
     `AllowedActions=${JSON.stringify(allowedActions)}`,
@@ -6551,17 +6579,92 @@ function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) 
     '[CONTEXT]',
     `workspaceRoot=${workspaceRoot}`,
     '',
-    '[TOOL_RESULTS]',
-    JSON.stringify(Array.isArray(toolResults) ? toolResults : [], null, 2),
+    '[LATEST_USER_REQUEST]',
+    truncateA11AgentText(latestUserRequest, compactMode ? 900 : 1400),
     '',
-    '[USER_PROMPT]',
+    '[RECENT_CHAT]',
     userPrompt,
+    '',
+    '[TOOL_RESULTS]',
+    JSON.stringify(compactToolResults, null, 2),
   ].join('\n');
 }
 
-async function callA11LLM(messages, options = {}) {
+function truncateA11AgentText(value, maxChars = 800) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function compactA11AgentValue(value, depth = 0) {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    return truncateA11AgentText(value, depth === 0 ? 500 : 220);
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, depth === 0 ? 5 : 3).map((entry) => compactA11AgentValue(entry, depth + 1));
+  }
+  if (typeof value === 'object') {
+    const compact = {};
+    const blockedKeys = new Set(['stack', 'raw', 'buffer', 'contentBase64', 'html', 'content', 'markdown', 'text']);
+    for (const [key, nested] of Object.entries(value).slice(0, 12)) {
+      if (blockedKeys.has(key)) continue;
+      compact[key] = compactA11AgentValue(nested, depth + 1);
+    }
+    return compact;
+  }
+  return String(value);
+}
+
+function buildA11AgentToolResultsSnapshot(toolResults = [], maxResults = 6) {
+  const list = Array.isArray(toolResults) ? toolResults : [];
+  return list.slice(-maxResults).map((entry) => ({
+    action: String(entry?.action || entry?.tool || entry?.name || '').trim() || undefined,
+    ok: entry?.ok === true,
+    error: entry?.ok === false ? truncateA11AgentText(entry?.error || entry?.result?.error || '', 220) || undefined : undefined,
+    result: compactA11AgentValue(entry?.result && typeof entry.result === 'object' ? entry.result : {}),
+  }));
+}
+
+function buildA11AgentConversationExcerpt(messages = [], options = {}) {
+  const maxMessages = Math.max(1, Number(options.maxMessages || 8));
+  const maxCharsPerMessage = Math.max(80, Number(options.maxCharsPerMessage || 600));
+  const maxTotalChars = Math.max(400, Number(options.maxTotalChars || 3600));
+  const list = Array.isArray(messages) ? messages : [];
+  const excerptLines = [];
+  let totalChars = 0;
+
+  for (const message of list.slice(-maxMessages)) {
+    const role = normalizeChatRole(message?.role);
+    if (!role) continue;
+    const content = truncateA11AgentText(message?.content || '', maxCharsPerMessage);
+    if (!content) continue;
+    const ts = normalizeChatTimestamp(message?.ts);
+    const prefix = ts ? `${role}@${ts}: ` : `${role}: `;
+    const line = `${prefix}${content}`;
+    if (totalChars + line.length > maxTotalChars) break;
+    excerptLines.push(line);
+    totalChars += line.length + 1;
+  }
+
+  return excerptLines.join('\n') || '(chat vide)';
+}
+
+function isA11ContextSizeErrorMessage(message = '') {
+  const normalized = String(message || '').toLowerCase();
+  return normalized.includes('exceed_context_size_error')
+    || normalized.includes('exceeds the available context size')
+    || (normalized.includes('context size') && normalized.includes('n_ctx'));
+}
+
+async function callA11LLMAttempt(messages, options = {}) {
   const injectedContext = buildA11AgentInjectedContext(messages, options.toolResults, {
     allowedActions: options.allowedActions,
+    compact: options.compact,
   });
   const promptMessages = [
     { role: 'system', content: A11_AGENT_SYSTEM_PROMPT },
@@ -6611,6 +6714,78 @@ async function callA11LLM(messages, options = {}) {
     provider: getMemorySummaryProvider(),
     model: process.env.A11_AGENT_MODEL || process.env.MEMORY_SUMMARY_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
   }));
+}
+
+async function callA11LLM(messages, options = {}) {
+  try {
+    return await callA11LLMAttempt(messages, { ...options, compact: false });
+  } catch (error) {
+    if (!isA11ContextSizeErrorMessage(error?.message || error)) {
+      throw error;
+    }
+    return callA11LLMAttempt(messages, { ...options, compact: true });
+  }
+}
+
+function buildInternetFallbackEnvelope(messages, { conversationId, userId, allowedActions = [], latestOutput = '' } = {}) {
+  const allowedSet = new Set(
+    (Array.isArray(allowedActions) ? allowedActions : [])
+      .map((entry) => String(entry || '').trim())
+      .filter(Boolean)
+  );
+  const canSearch = !allowedSet.size || allowedSet.has('web_search');
+  const canFetch = !allowedSet.size || allowedSet.has('web_fetch');
+  if (!canSearch && !canFetch) return null;
+
+  const latestUserMessage = stripDevEnginePrefix(getLatestUserMessageFromMessages(messages));
+  if (!latestUserMessage) return null;
+
+  const researchReason = detectInternetResearchReason({
+    messages: [{ role: 'user', content: latestUserMessage }],
+    prompt: latestUserMessage,
+  });
+  const normalizedOutput = String(latestOutput || '').toLowerCase();
+  const modelRefusedInternet = /(pas acces|pas d'acces|pas d’accès|ne peux pas acceder|ne peux pas consulter|no internet access|can't access|cannot access).*(internet|web|site|page)/i.test(normalizedOutput);
+  if (!researchReason && !modelRefusedInternet) {
+    return null;
+  }
+
+  const urlMatch = latestUserMessage.match(/https?:\/\/\S+/i);
+  if (urlMatch && canFetch) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        {
+          name: 'web_fetch',
+          id: 'wf-1',
+          arguments: {
+            url: urlMatch[0],
+          },
+        },
+      ],
+    };
+  }
+
+  if (!canSearch) return null;
+  return {
+    version: 'a11-envelope-1',
+    mode: 'actions',
+    conversationId,
+    userId,
+    actions: [
+      {
+        name: 'web_search',
+        id: 'ws-1',
+        arguments: {
+          query: latestUserMessage,
+          limit: 5,
+        },
+      },
+    ],
+  };
 }
 
 // --- Helpers Cerbère -> A-11 ---
@@ -6781,12 +6956,21 @@ async function runA11AgentLoop({
   let latestOutput = '';
   let imagePath = null;
   const actionExecutionContext = allowedActions?.length
-    ? { ...(executionContext || {}), allowedActions }
-    : (executionContext || {});
+    ? { ...(executionContext || {}), allowedActions, conversationId, userId }
+    : { ...(executionContext || {}), conversationId, userId };
 
   for (let loopIndex = 0; loopIndex < maxLoops; loopIndex += 1) {
     latestOutput = await callA11LLM(messages, { toolResults, allowedActions });
-    const envelope = parseAssistantEnvelope(latestOutput, { conversationId, userId });
+    let envelope = parseAssistantEnvelope(latestOutput, { conversationId, userId });
+
+    if (!envelope && !aggregatedResults.length) {
+      envelope = buildInternetFallbackEnvelope(messages, {
+        conversationId,
+        userId,
+        allowedActions,
+        latestOutput,
+      });
+    }
 
     if (!envelope) {
       const text = normalizeAssistantOutput(latestOutput);
@@ -6821,6 +7005,21 @@ async function runA11AgentLoop({
           actions: aggregatedActions,
         },
       };
+    }
+
+    if (envelope.mode === 'final') {
+      const text = normalizeAssistantOutput(envelope.answer || 'Termine.');
+      if (!aggregatedResults.length) {
+        const fallbackEnvelope = buildInternetFallbackEnvelope(messages, {
+          conversationId,
+          userId,
+          allowedActions,
+          latestOutput: text,
+        });
+        if (fallbackEnvelope) {
+          envelope = fallbackEnvelope;
+        }
+      }
     }
 
     if (envelope.mode === 'final') {
