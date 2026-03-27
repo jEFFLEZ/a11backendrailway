@@ -2313,6 +2313,9 @@ async function runActionsEnvelope(envelope, context = {}) {
     throw new Error("runActionsEnvelope: envelope must have actions[] array");
   }
   const results = [];
+  const contextualAllowedActions = Array.isArray(context.allowedActions)
+    ? new Set(context.allowedActions.map((entry) => String(entry || '').trim()).filter(Boolean))
+    : null;
   for (const a of envelope.actions) {
     const rawName = a.action || a.name;
     const name = normalizeDispatchActionName(rawName);
@@ -2331,6 +2334,16 @@ async function runActionsEnvelope(envelope, context = {}) {
         available: valid.available
       });
       break; // Stop batch on invalid action
+    }
+    if (contextualAllowedActions && contextualAllowedActions.size && !contextualAllowedActions.has(name)) {
+      results.push({
+        action: rawName,
+        normalizedAction: name,
+        ok: false,
+        error: `ACTION_NOT_ALLOWED:${name}`,
+        allowed: [...contextualAllowedActions]
+      });
+      break;
     }
     if (isIgnoredMemoryKey(name, args)) {
       console.log("[A11][memory] Ignoring", name, "for reserved key:", args.key || args.input?.key);

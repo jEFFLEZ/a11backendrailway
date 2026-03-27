@@ -4994,6 +4994,24 @@ function buildDeterministicDevActionReply(context) {
   const errorReason = sanitizeDevActionError(firstError?.error || '');
 
   if (failureCount === 0) {
+    const okActions = new Set(results.filter((entry) => entry.ok).map((entry) => entry.action));
+    const sharedResult = results.find((entry) => entry.ok && entry.action === 'share_file');
+    const mailedLatestResult = results.find((entry) => entry.ok && entry.action === 'email_latest_resource');
+
+    if (okActions.has('generate_pdf') && okActions.has('share_file')) {
+      return sharedResult?.to
+        ? `C'est fait. Le PDF a bien ete cree, stocke et envoye a ${sharedResult.to}.`
+        : "C'est fait. Le PDF a bien ete cree et stocke dans tes donnees.";
+    }
+    if (okActions.has('generate_png') && okActions.has('share_file')) {
+      return sharedResult?.to
+        ? `C'est fait. L'image a bien ete creee, stockee et envoyee a ${sharedResult.to}.`
+        : "C'est fait. L'image a bien ete creee et stockee dans tes donnees.";
+    }
+    if (mailedLatestResult?.to) {
+      return `C'est fait. Le dernier fichier stocke a bien ete envoye a ${mailedLatestResult.to}.`;
+    }
+
     if (results.length > 1) {
       return context?.imageReady
         ? "C'est fait. La demande a bien ete executee et le resultat est pret."
@@ -5463,6 +5481,52 @@ function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemo
   return [...messages, ...nonSystemMessages];
 }
 
+const USER_SAFE_AGENT_ACTIONS = Object.freeze([
+  'download_file',
+  'generate_pdf',
+  'generate_png',
+  'share_file',
+  'list_stored_files',
+  'list_resources',
+  'get_latest_resource',
+  'email_resource',
+  'email_latest_resource',
+  'send_email',
+  'schedule_email',
+  'schedule_resource_email',
+  'schedule_latest_resource_email',
+  'list_scheduled_emails',
+  'cancel_scheduled_email',
+  'zip_create',
+  'zip_and_email',
+]);
+
+function shouldAutoUseUserActionAgent(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return false;
+  if (body?.a11Dev === true) return false;
+
+  const hasEmailAddress = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(text);
+  const asksEmail = /(envoi(?:e|s|er)?|mail|email|e-mail|expedie|expédie|transmets?|partage)/i.test(text);
+  const asksPdfOrImage = /(pdf|png|image|illustration|photo|document|dossier|fiche|rapport|archive|zip)/i.test(text);
+  const asksCreate = /(cree|crée|genere|génère|fabrique|produis|prepare|prépare|fais|fait|construis|realise|réalise)/i.test(text);
+  const asksStore = /(stocke|garde|sauvegarde|enregistre|conserve|ajoute).*(donnees|données|ressources|fichiers|mes donnees|mes données|tes donnees|tes données|memoire|mémoire)/i.test(text);
+  const asksLatestResource = /(dernier|derniere|dernière|le|la).*(pdf|fichier|document|image|ressource|archive)/i.test(text)
+    && /(envoi(?:e|s|er)?|mail|email|e-mail|partage|renvoie|renvoyer)/i.test(text);
+  const asksSchedule = /(planifie|programme|plus tard|demain|ce soir|a \d{1,2}h|à \d{1,2}h)/i.test(text)
+    && /(mail|email|e-mail|envoi(?:e|s|er)?)/i.test(text);
+
+  if (hasEmailAddress && asksEmail) return true;
+  if (asksStore) return true;
+  if (asksLatestResource) return true;
+  if (asksSchedule) return true;
+  if (asksCreate && asksPdfOrImage) return true;
+  if (asksEmail && /(pdf|fichier|document|image|piece jointe|pièce jointe|ressource|archive|zip|joint)/i.test(text)) return true;
+
+  return false;
+}
+
 function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
   return buildChatMessagesWithMemory(
     Array.isArray(storedMessages) ? storedMessages : [],
@@ -5675,6 +5739,47 @@ async function proxyChatToOpenAI(req, res) {
     } catch {
       const fallback = toSimpleAssistantCompletion('Je ne peux pas verifier SIWIS pour le moment (health timeout).');
       appendChatTurnLogSafe(req.body, fallback, 'a11-runtime-tts-health', userId);
+      return res.status(200).json(fallback);
+    }
+  }
+
+  if (shouldAutoUseUserActionAgent(req.body)) {
+    try {
+      const requestMessages = Array.isArray(req.body?.messages) && req.body.messages.length
+        ? req.body.messages
+        : (latestUserMessage ? [{ role: 'user', content: latestUserMessage }] : []);
+      const loopResult = await runA11AgentLoop({
+        messages: requestMessages,
+        conversationId,
+        userId,
+        requestOrigin: getRequestOrigin(req),
+        executionContext: {
+          authToken: getAuthTokenFromRequest(req),
+        },
+        allowedActions: USER_SAFE_AGENT_ACTIONS,
+      });
+
+      const content = normalizeAssistantOutput(loopResult.explanation || loopResult.text || "Je n'ai pas pu terminer la demande.");
+      const data = toSimpleAssistantCompletion(content, 'a11-user-actions');
+      if (loopResult.imagePath || loopResult.cerbere) {
+        data.a11Agent = {
+          actionMode: 'user',
+          imagePath: loopResult.imagePath || null,
+          cerbere: loopResult.cerbere || null,
+        };
+      }
+      if (userId && content) {
+        await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
+      }
+      appendChatTurnLogSafe(req.body, data, 'a11-user-actions', userId);
+      return res.status(200).json(data);
+    } catch (error_) {
+      const fallbackMessage = sanitizeDevActionError(error_?.message || error_) || "erreur interne";
+      const fallback = toSimpleAssistantCompletion(
+        `Je n'ai pas pu terminer l'action demandee : ${fallbackMessage}.`,
+        'a11-user-actions'
+      );
+      appendChatTurnLogSafe(req.body, fallback, 'a11-user-actions', userId);
       return res.status(200).json(fallback);
     }
   }
@@ -5977,15 +6082,21 @@ app.post('/ai', async (req, res) => {
 const { A11_AGENT_SYSTEM_PROMPT, A11_AGENT_DEV_PROMPT } = require('./lib/a11Agent.js');
 const { runAction, runActionsEnvelope, getAllowedActionNames } = require('./src/a11/tools-dispatcher.cjs');
 
-function buildA11AgentInjectedContext(messages, toolResults = []) {
+function buildA11AgentInjectedContext(messages, toolResults = [], options = {}) {
   const userPrompt = buildPromptFromMessages(Array.isArray(messages) ? messages : []);
   const workspaceRoot = String(
     process.env.A11_WORKSPACE_ROOT || process.env.WORKSPACE_ROOT || path.resolve(__dirname, '..', '..')
   ).trim();
-  const allowedActions = getAllowedActionNames();
+  const restrictedActions = Array.isArray(options.allowedActions)
+    ? options.allowedActions.map((entry) => String(entry || '').trim()).filter(Boolean)
+    : [];
+  const allowedActions = restrictedActions.length
+    ? [...new Set(restrictedActions)]
+    : getAllowedActionNames();
   return [
     '[TOOLS]',
     `AllowedActions=${JSON.stringify(allowedActions)}`,
+    `ActionPolicy=${restrictedActions.length ? 'user-safe-only' : 'full'}`,
     '',
     '[CONTEXT]',
     `workspaceRoot=${workspaceRoot}`,
@@ -5999,7 +6110,9 @@ function buildA11AgentInjectedContext(messages, toolResults = []) {
 }
 
 async function callA11LLM(messages, options = {}) {
-  const injectedContext = buildA11AgentInjectedContext(messages, options.toolResults);
+  const injectedContext = buildA11AgentInjectedContext(messages, options.toolResults, {
+    allowedActions: options.allowedActions,
+  });
   const promptMessages = [
     { role: 'system', content: A11_AGENT_SYSTEM_PROMPT },
     { role: 'system', content: A11_AGENT_DEV_PROMPT },
@@ -6209,6 +6322,7 @@ async function runA11AgentLoop({
   userId,
   requestOrigin = '',
   executionContext = null,
+  allowedActions = null,
   maxLoops = 5,
 }) {
   const aggregatedActions = [];
@@ -6216,9 +6330,12 @@ async function runA11AgentLoop({
   let toolResults = [];
   let latestOutput = '';
   let imagePath = null;
+  const actionExecutionContext = allowedActions?.length
+    ? { ...(executionContext || {}), allowedActions }
+    : (executionContext || {});
 
   for (let loopIndex = 0; loopIndex < maxLoops; loopIndex += 1) {
-    latestOutput = await callA11LLM(messages, { toolResults });
+    latestOutput = await callA11LLM(messages, { toolResults, allowedActions });
     const envelope = parseAssistantEnvelope(latestOutput, { conversationId, userId });
 
     if (!envelope) {
@@ -6322,7 +6439,7 @@ async function runA11AgentLoop({
     }
 
     aggregatedActions.push(...(Array.isArray(envelope.actions) ? envelope.actions : []));
-    const cerbere = await runActionsEnvelope(envelope, executionContext || {});
+    const cerbere = await runActionsEnvelope(envelope, actionExecutionContext);
     const batchResults = Array.isArray(cerbere?.results) ? cerbere.results : [];
     aggregatedResults.push(...batchResults);
     toolResults = batchResults;
