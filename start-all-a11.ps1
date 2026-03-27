@@ -60,6 +60,19 @@ function Get-CommandPath {
   }
 }
 
+function Get-CloudflaredTunnelId {
+  param([string]$ConfigPath)
+
+  if (-not (Test-Path $ConfigPath)) { return $null }
+  foreach ($line in Get-Content -Path $ConfigPath -ErrorAction SilentlyContinue) {
+    $match = [regex]::Match([string]$line, '^\s*tunnel\s*:\s*([a-f0-9-]+)\s*$', 'IgnoreCase')
+    if ($match.Success) {
+      return $match.Groups[1].Value
+    }
+  }
+  return $null
+}
+
 function Mark-Error {
   param([string]$Message)
   $script:HadErrors = $true
@@ -181,6 +194,7 @@ $cloudflaredExe = Resolve-FirstExistingPath @(
   (Get-CommandPath 'cloudflared')
 )
 $cloudflaredConfig = Join-Path $env:USERPROFILE '.cloudflared\config.yml'
+$cloudflaredTunnelId = Get-CloudflaredTunnelId -ConfigPath $cloudflaredConfig
 
 $ttsModelPath = Resolve-FirstExistingPath @(
   (Join-Path $ttsDir 'fr_FR-siwis-medium.onnx'),
@@ -345,11 +359,29 @@ if ($startTunnel) {
   } elseif ($checkOnly) {
     Write-Host "[CHECK] Tunnel backend pret : $cloudflaredExe"
   } else {
+    $cloudflaredArgs = @('tunnel', '--protocol', 'http2')
+    if ($cloudflaredTunnelId) {
+      try {
+        $tunnelToken = (& $cloudflaredExe tunnel token $cloudflaredTunnelId | Select-Object -First 1).Trim()
+      } catch {
+        $tunnelToken = ''
+      }
+
+      if ($tunnelToken) {
+        $cloudflaredArgs += @('run', '--token', $tunnelToken)
+      } else {
+        Write-Host '[WARN] Token tunnel Cloudflare indisponible, fallback sur credentials-file.'
+        $cloudflaredArgs += @('--config', $cloudflaredConfig, 'run')
+      }
+    } else {
+      $cloudflaredArgs += @('--config', $cloudflaredConfig, 'run')
+    }
+
     Start-ManagedProcess `
       -Name 'A11 Tunnel API' `
       -WorkingDirectory (Split-Path -Parent $cloudflaredExe) `
       -FilePath $cloudflaredExe `
-      -ArgumentList @('tunnel', '--config', $cloudflaredConfig, 'run') `
+      -ArgumentList $cloudflaredArgs `
       -Environment @{} `
       -LogName 'cloudflared' `
       -ShowWindow $showWindows | Out-Null
