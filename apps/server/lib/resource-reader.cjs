@@ -492,7 +492,12 @@ function buildConversationResourceContext(resources, options = {}) {
     const analysis = metadata.analysis && typeof metadata.analysis === 'object' ? metadata.analysis : {};
     const kindLabel = String(resource.resourceKind || 'file');
     const mime = String(resource.contentType || analysis.mime || 'application/octet-stream');
-    lines.push(`- ${String(resource.filename || 'fichier')} [${kindLabel}, ${mime}]`);
+    const identifier = Number(resource?.id || 0);
+    lines.push(`- #${identifier > 0 ? identifier : '?'} ${String(resource.filename || 'fichier')} [${kindLabel}, ${mime}]`);
+
+    if (resource?.url) {
+      lines.push(`  URL: ${String(resource.url)}`);
+    }
 
     if (analysis.readableInChatContext && analysis.preview) {
       const preview = truncateText(String(analysis.preview || ''), 500).text;
