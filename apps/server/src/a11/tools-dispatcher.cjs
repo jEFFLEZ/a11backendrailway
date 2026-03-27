@@ -50,8 +50,40 @@ function buildGeneratedAssetPath(filename, label = 'generated.outputPath') {
   return resolveSafePath(path.join('generated', filename), label);
 }
 
-function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path') {
-  const fallbackName = `download-${Date.now()}.png`;
+function guessDownloadExtension(rawExt, contentType = '') {
+  const normalizedExt = String(rawExt || '').trim().toLowerCase();
+  if (/^\.[a-z0-9]{1,10}$/i.test(normalizedExt)) {
+    return normalizedExt;
+  }
+  const normalizedType = String(contentType || '').trim().toLowerCase().split(';')[0];
+  switch (normalizedType) {
+    case 'image/png':
+      return '.png';
+    case 'image/jpeg':
+      return '.jpg';
+    case 'image/gif':
+      return '.gif';
+    case 'image/webp':
+      return '.webp';
+    case 'application/pdf':
+      return '.pdf';
+    case 'text/plain':
+      return '.txt';
+    case 'text/markdown':
+      return '.md';
+    case 'application/json':
+    case 'text/json':
+      return '.json';
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return '.wav';
+    default:
+      return '.bin';
+  }
+}
+
+function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path', contentType = '') {
+  const fallbackName = `download-${Date.now()}.bin`;
   let filename = fallbackName;
   try {
     const parsed = new URL(String(sourceUrl || ''));
@@ -59,12 +91,69 @@ function buildDownloadedAssetPath(sourceUrl, label = 'download_file.path') {
     const ext = path.extname(rawName).toLowerCase();
     const baseName = path.basename(rawName, ext);
     const safeBase = slugifyAssetSegment(baseName || 'download', 'download');
-    const safeExt = /\.(png|jpe?g|gif|webp)$/i.test(ext) ? ext : '.png';
+    const safeExt = guessDownloadExtension(ext, contentType);
     filename = `${safeBase}-${Date.now()}${safeExt}`;
   } catch {
     filename = fallbackName;
   }
   return resolveSafePath(path.join('downloads', filename), label);
+}
+
+async function resolveWriteTarget(filePath, options = {}) {
+  const {
+    overwrite = false,
+    content = '',
+    encoding = 'utf8',
+  } = options;
+
+  if (overwrite || !fsSync.existsSync(filePath)) {
+    return {
+      path: filePath,
+      requestedPath: filePath,
+      collisionResolved: false,
+      reusedExisting: false,
+    };
+  }
+
+  try {
+    const existingBuffer = await fsp.readFile(filePath);
+    const incomingBuffer = Buffer.isBuffer(content)
+      ? content
+      : Buffer.from(String(content ?? ''), encoding);
+    if (Buffer.compare(existingBuffer, incomingBuffer) === 0) {
+      return {
+        path: filePath,
+        requestedPath: filePath,
+        collisionResolved: false,
+        reusedExisting: true,
+      };
+    }
+  } catch {
+    // ignore comparison issues and fall through to path suffixing
+  }
+
+  const dir = path.dirname(filePath);
+  const ext = path.extname(filePath);
+  const baseName = path.basename(filePath, ext);
+  for (let index = 2; index <= 9999; index += 1) {
+    const candidate = path.join(dir, `${baseName}-${index}${ext}`);
+    if (!fsSync.existsSync(candidate)) {
+      return {
+        path: candidate,
+        requestedPath: filePath,
+        collisionResolved: true,
+        reusedExisting: false,
+      };
+    }
+  }
+
+  const fallback = path.join(dir, `${baseName}-${Date.now()}${ext}`);
+  return {
+    path: fallback,
+    requestedPath: filePath,
+    collisionResolved: true,
+    reusedExisting: false,
+  };
 }
 
 function parseImageSize(value, fallbackWidth = 1024, fallbackHeight = 1024) {
@@ -170,24 +259,9 @@ async function t_download_file(args = {}) {
     };
   }
 
-  const filePath = args.path || args.outputPath
+  const explicitOutputPath = args.path || args.outputPath
     ? resolveSafePath(args.path || args.outputPath, 'download_file.path')
-    : buildDownloadedAssetPath(url, 'download_file.path');
-
-  // 🔒 N'accepte que des extensions d'image directes
-  function looksLikeImageUrl(url) {
-    return /\.(png|jpe?g|gif|webp)(\?.*)?$/i.test(url.split('?')[0]);
-  }
-  if (!looksLikeImageUrl(url)) {
-    return {
-      ok: false,
-      url,
-      outputPath: filePath || null,
-      error: 'invalid_extension',
-      message:
-        'download_file: URL must point to a direct image file (.png, .jpg, .jpeg, .gif, .webp).'
-    };
-  }
+    : null;
 
   let response;
   try {
@@ -202,7 +276,7 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
+      outputPath: explicitOutputPath,
       error: String(e && e.message)
     };
   }
@@ -211,47 +285,78 @@ async function t_download_file(args = {}) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
+      outputPath: explicitOutputPath,
       status: response.status,
       error: `HTTP ${response.status}`
     };
   }
 
   // 🔒 Vérifie le content-type
-  const contentType = response.headers['content-type'] || '';
-  if (!contentType.startsWith('image/')) {
+  const contentType = String(response.headers['content-type'] || '').toLowerCase();
+  if (contentType.includes('text/html') || contentType.includes('application/xhtml+xml')) {
     return {
       ok: false,
       url,
-      outputPath: filePath,
-      error: 'not_image_content_type',
-      message: `download_file: Content-Type is not image/* (${contentType})`
+      outputPath: explicitOutputPath,
+      error: 'html_content_type_not_supported',
+      message: `download_file: HTML page responses are not supported (${contentType})`
     };
   }
 
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, response.data);
+  const requestedPath = explicitOutputPath || buildDownloadedAssetPath(url, 'download_file.path', contentType);
+  const writeTarget = await resolveWriteTarget(requestedPath, {
+    overwrite: args.overwrite === true,
+    content: Buffer.from(response.data),
+  });
 
-  // --- Validation post-download (anti-placeholder/erreur) ---
-  let sharp, stat, meta;
-  try {
-    sharp = require('sharp');
-    stat = await fsp.stat(filePath);
-    if (stat.size < 8000) {
-      return { ok: false, error: "BAD_IMAGE_TOO_SMALL", path: filePath };
-    }
-    meta = await sharp(filePath).metadata();
-    if (!meta.width || !meta.height) {
-      return { ok: false, error: "BAD_IMAGE_NO_METADATA", path: filePath };
-    }
-    if (meta.width < 350 && meta.height < 350) {
-      return { ok: false, error: "BAD_IMAGE_PLACEHOLDER_DIMENSIONS", path: filePath, meta };
-    }
-  } catch (e) {
-    return { ok: false, error: "BAD_IMAGE_VALIDATION_FAILED", details: e?.message, path: filePath };
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, response.data);
   }
 
-  return { ok: true, url, outputPath: filePath, meta };
+  let stat;
+  try {
+    stat = await fsp.stat(writeTarget.path);
+  } catch (e) {
+    return {
+      ok: false,
+      error: 'download_stat_failed',
+      details: e?.message,
+      path: writeTarget.path,
+      requestedPath: writeTarget.requestedPath,
+    };
+  }
+
+  let meta = null;
+  if (contentType.startsWith('image/')) {
+    try {
+      const sharp = require('sharp');
+      if (stat.size < 8000) {
+        return { ok: false, error: "BAD_IMAGE_TOO_SMALL", path: writeTarget.path };
+      }
+      meta = await sharp(writeTarget.path).metadata();
+      if (!meta.width || !meta.height) {
+        return { ok: false, error: "BAD_IMAGE_NO_METADATA", path: writeTarget.path };
+      }
+      if (meta.width < 350 && meta.height < 350) {
+        return { ok: false, error: "BAD_IMAGE_PLACEHOLDER_DIMENSIONS", path: writeTarget.path, meta };
+      }
+    } catch (e) {
+      return { ok: false, error: "BAD_IMAGE_VALIDATION_FAILED", details: e?.message, path: writeTarget.path };
+    }
+  }
+
+  return {
+    ok: true,
+    url,
+    outputPath: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+    contentType,
+    size: stat.size,
+    meta,
+  };
 }
 
 function isPathInRoots(p) {
@@ -341,23 +446,41 @@ async function t_fs_read(args = {}) {
 async function t_fs_write(args = {}) {
   const { path: filePath, content, overwrite } = args;
   assertPathAllowed(filePath, 'fs_write.path');
-  if (!overwrite && fsSync.existsSync(filePath)) {
-    throw new Error(`fs_write: file already exists and overwrite=false: ${filePath}`);
+  const writeTarget = await resolveWriteTarget(filePath, {
+    overwrite: overwrite === true,
+    content: String(content || ''),
+  });
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, String(content || ''), 'utf8');
   }
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, String(content || ''), 'utf8');
-  return { ok: true, path: filePath };
+  return {
+    ok: true,
+    path: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+  };
 }
 
 async function t_write_file(args = {}) {
   const rawPath = args.path;
   const filePath = resolveSafePath(rawPath, "write_file.path");
-  if (!args.overwrite && fsSync.existsSync(filePath)) {
-    throw new Error(`write_file: file already exists and overwrite=false: ${filePath}`);
+  const writeTarget = await resolveWriteTarget(filePath, {
+    overwrite: args.overwrite === true,
+    content: String(args.content || ''),
+  });
+  await fsp.mkdir(path.dirname(writeTarget.path), { recursive: true });
+  if (!writeTarget.reusedExisting) {
+    await fsp.writeFile(writeTarget.path, String(args.content || ''), 'utf8');
   }
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, String(args.content || ''), 'utf8');
-  return { ok: true, path: filePath };
+  return {
+    ok: true,
+    path: writeTarget.path,
+    requestedPath: writeTarget.requestedPath,
+    collisionResolved: writeTarget.collisionResolved,
+    reusedExisting: writeTarget.reusedExisting,
+  };
 }
 
 async function t_fs_list(args = {}) {

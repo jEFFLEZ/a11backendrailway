@@ -84,6 +84,17 @@ function getLocalTtsConfig() {
   };
 }
 
+function getRemoteTtsBaseUrls(ttsConfig = getLocalTtsConfig()) {
+  const candidates = [
+    String(ttsConfig?.requestBaseUrl || ttsConfig?.baseUrl || '').trim(),
+    String(ttsConfig?.publicBaseUrl || '').trim(),
+  ]
+    .map((value) => value.replace(/\/$/, ''))
+    .filter(Boolean);
+
+  return Array.from(new Set(candidates));
+}
+
 function getWorkspaceRoot() {
   return path.resolve(__dirname, '..', '..', '..');
 }
@@ -289,35 +300,58 @@ function normalizeRemoteAssetUrl(baseUrl, value) {
 
 async function requestRemoteTts(payload) {
   const ttsConfig = getLocalTtsConfig();
-  const requestBaseUrl = String(ttsConfig.requestBaseUrl || ttsConfig.baseUrl).replace(/\/$/, '');
-  const publicBaseUrl = String(ttsConfig.publicBaseUrl || requestBaseUrl).replace(/\/$/, '');
-  const response = await fetch(`${requestBaseUrl}/api/tts`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
+  const preferredPublicBaseUrl = String(ttsConfig.publicBaseUrl || ttsConfig.requestBaseUrl || ttsConfig.baseUrl || '').replace(/\/$/, '');
+  const candidateBaseUrls = getRemoteTtsBaseUrls(ttsConfig);
+  let lastError = new Error('remote_tts_unreachable');
 
-  const textBody = await response.text();
-  const parsed = parseJsonMaybe(textBody);
+  for (const candidateBaseUrl of candidateBaseUrls) {
+    try {
+      const response = await fetch(`${candidateBaseUrl}/api/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10000),
+      });
 
-  if (typeof parsed === 'string' && parsed.endsWith('.wav')) {
-    return { audio_url: normalizeRemoteAssetUrl(publicBaseUrl, parsed), via: 'http-string' };
+      const textBody = await response.text();
+      const parsed = parseJsonMaybe(textBody);
+
+      if (!response.ok) {
+        throw new Error(`http_${response.status}: ${String(textBody).slice(0, 300)}`);
+      }
+
+      const assetBaseUrl = preferredPublicBaseUrl || candidateBaseUrl;
+      if (typeof parsed === 'string' && parsed.endsWith('.wav')) {
+        return {
+          audio_url: normalizeRemoteAssetUrl(assetBaseUrl, parsed),
+          via: 'http-string',
+          requestBaseUrl: candidateBaseUrl,
+          publicBaseUrl: assetBaseUrl,
+        };
+      }
+
+      const audioUrl = parsed?.audio_url || parsed?.audioUrl || parsed?.url || parsed?.path || parsed?.file || parsed?.wav || null;
+      if (!audioUrl) {
+        throw new Error(`invalid_http_tts_response: ${String(textBody).slice(0, 300)}`);
+      }
+
+      return {
+        audio_url: normalizeRemoteAssetUrl(assetBaseUrl, audioUrl),
+        gif_url: normalizeRemoteAssetUrl(assetBaseUrl, parsed?.gif_url || parsed?.gifUrl || null),
+        gif_duration_ms: parsed?.gif_duration_ms ?? parsed?.gifDurationMs ?? null,
+        via: 'http',
+        requestBaseUrl: candidateBaseUrl,
+        publicBaseUrl: assetBaseUrl,
+      };
+    } catch (error_) {
+      lastError = error_;
+    }
   }
 
-  const audioUrl = parsed?.audio_url || parsed?.audioUrl || parsed?.url || parsed?.path || parsed?.file || parsed?.wav || null;
-  if (!audioUrl) {
-    throw new Error(`invalid_http_tts_response: ${String(textBody).slice(0, 300)}`);
-  }
-
-  return {
-    audio_url: normalizeRemoteAssetUrl(publicBaseUrl, audioUrl),
-    gif_url: normalizeRemoteAssetUrl(publicBaseUrl, parsed?.gif_url || parsed?.gifUrl || null),
-    gif_duration_ms: parsed?.gif_duration_ms ?? parsed?.gifDurationMs ?? null,
-    via: 'http',
-  };
+  throw lastError;
 }
 
-async function probePiperHttpHealth(baseUrl, enabled) {
+async function probeSinglePiperHttpHealth(baseUrl, enabled) {
   const candidates = ['/health', '/api/tts', '/', '/synthesize', '/tts'];
   let lastHttpStatus = null;
   let lastBody = '';
@@ -369,6 +403,43 @@ async function probePiperHttpHealth(baseUrl, enabled) {
     lastBody,
     lastError,
   };
+}
+
+async function probePiperHttpHealth(ttsConfig, enabled) {
+  const triedBaseUrls = getRemoteTtsBaseUrls(ttsConfig);
+  let lastProbe = {
+    ok: false,
+    statusCode: null,
+    path: null,
+    body: null,
+    lastHttpStatus: null,
+    lastBody: '',
+    lastError: null,
+    baseUrl: null,
+    triedBaseUrls,
+  };
+
+  if (!enabled) {
+    return lastProbe;
+  }
+
+  for (const baseUrl of triedBaseUrls) {
+    const probe = await probeSinglePiperHttpHealth(baseUrl, enabled);
+    if (probe.ok) {
+      return {
+        ...probe,
+        baseUrl,
+        triedBaseUrls,
+      };
+    }
+    lastProbe = {
+      ...probe,
+      baseUrl,
+      triedBaseUrls,
+    };
+  }
+
+  return lastProbe;
 }
 
 // Try to call a local Piper HTTP service. Tries several common paths.
@@ -513,13 +584,14 @@ function spawnPiperLocal(text, model) {
 
 // GET /api/tts/health -> probe local Piper service (try multiple endpoints)
 router.get('/tts/health', async (req, res) => {
-  const { host, port, requestBaseUrl, publicBaseUrl } = getLocalTtsConfig();
+  const ttsConfig = getLocalTtsConfig();
+  const { host, port, requestBaseUrl, publicBaseUrl } = ttsConfig;
   const preferHttpTts = shouldPreferHttpTts();
   const rawRequestedVoice = req.query && typeof req.query === 'object'
     ? (req.query.voice ?? req.query.model ?? '')
     : '';
   const requestedVoice = typeof rawRequestedVoice === 'string' ? (rawRequestedVoice.trim() || null) : null;
-  const httpProbe = await probePiperHttpHealth(requestBaseUrl, preferHttpTts);
+  const httpProbe = await probePiperHttpHealth(ttsConfig, preferHttpTts);
   const { lastHttpStatus, lastBody, lastError } = httpProbe;
 
   if (httpProbe.ok) {
@@ -529,6 +601,8 @@ router.get('/tts/health', async (req, res) => {
       statusCode: httpProbe.statusCode,
       path: httpProbe.path,
       body: httpProbe.body,
+      activeBaseUrl: httpProbe.baseUrl || requestBaseUrl,
+      triedBaseUrls: httpProbe.triedBaseUrls,
       requestBaseUrl,
       publicBaseUrl,
     });
@@ -580,6 +654,8 @@ router.get('/tts/health', async (req, res) => {
       error: httpWarning || 'piper_http_unreachable',
       host,
       port,
+      activeBaseUrl: httpProbe.baseUrl || null,
+      triedBaseUrls: httpProbe.triedBaseUrls,
       requestBaseUrl,
       publicBaseUrl,
       statusCode: lastHttpStatus || null,
