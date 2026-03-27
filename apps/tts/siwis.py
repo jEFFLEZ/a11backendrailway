@@ -366,31 +366,57 @@ except Exception:
     _HAS_REQUESTS = False
 
 def notify_a11_avatar(gif_path: str, endpoint: str = ""):
-    endpoint = (endpoint or os.environ.get("A11_AVATAR_UPDATE_URL", "")).strip()
-    if not endpoint:
+    def _normalize_avatar_endpoint(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.endswith("/api/avatar/update"):
+            return raw
+        return raw.rstrip("/") + "/api/avatar/update"
+
+    candidate_endpoints = []
+    for candidate in [
+        endpoint,
+        os.environ.get("A11_AVATAR_UPDATE_URL", ""),
+        os.environ.get("A11_SERVER_URL", ""),
+        os.environ.get("PUBLIC_API_URL", ""),
+        os.environ.get("API_URL", ""),
+        os.environ.get("BACKEND_URL", ""),
+        "http://a11backendrailway.railway.internal:8080",
+        "https://api.funesterie.pro",
+    ]:
+        normalized = _normalize_avatar_endpoint(candidate)
+        if normalized and normalized not in candidate_endpoints:
+            candidate_endpoints.append(normalized)
+
+    if not candidate_endpoints:
         print("[TTS][AVATAR] skipping notify: A11_AVATAR_UPDATE_URL not set")
         return
-    try:
-        payload = json.dumps({"gif_path": gif_path}).encode("utf-8")
-        if _HAS_REQUESTS:
-            try:
-                r = requests.post(endpoint, json={"gif_path": gif_path}, timeout=0.8)
-                print(f"[TTS][AVATAR] notify A-11: {r.status_code} {r.text}")
-            except Exception as e:
-                print("[TTS][AVATAR] requests.post failed:", e)
-                traceback.print_exc()
-        else:
-            req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method='POST')
-            try:
-                with urllib.request.urlopen(req, timeout=0.8) as resp:
-                    body = resp.read().decode('utf-8', errors='ignore')
-                    print(f"[TTS][AVATAR] notify A-11 urllib: {resp.status} {body}")
-            except urllib.error.URLError as e:
-                print("[TTS][AVATAR] urllib request failed:", e)
-                traceback.print_exc()
-    except Exception as e:
-        print("[TTS][AVATAR] notify error:", e)
-        traceback.print_exc()
+
+    payload = json.dumps({"gif_path": gif_path}).encode("utf-8")
+    failures = []
+    for current_endpoint in candidate_endpoints:
+        try:
+            if _HAS_REQUESTS:
+                response = requests.post(current_endpoint, json={"gif_path": gif_path}, timeout=1.5)
+                if 200 <= int(response.status_code) < 300:
+                    print(f"[TTS][AVATAR] notify A-11: {response.status_code} via {current_endpoint}")
+                    return
+                failures.append(f"{current_endpoint} -> HTTP {response.status_code}")
+                continue
+
+            req = urllib.request.Request(current_endpoint, data=payload, headers={"Content-Type": "application/json"}, method='POST')
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                body = resp.read().decode('utf-8', errors='ignore')
+                print(f"[TTS][AVATAR] notify A-11 urllib: {resp.status} via {current_endpoint} {body}")
+                return
+        except Exception as e:
+            failures.append(f"{current_endpoint} -> {e}")
+
+    if failures:
+        print("[TTS][AVATAR] notify skipped after failures:")
+        for failure in failures:
+            print(f"[TTS][AVATAR]  - {failure}")
 
 
 class TTSHandler(BaseHTTPRequestHandler):
