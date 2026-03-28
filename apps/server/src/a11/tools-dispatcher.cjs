@@ -3271,6 +3271,18 @@ async function runActionsEnvelope(envelope, context = {}) {
       ''
     ).trim() || context.conversationId || null,
   };
+  let lastArtifactPath = '';
+
+  const extractArtifactPathFromResult = (result) => String(
+    result?.outputPath
+    || result?.path
+    || result?.filePath
+    || result?.savedAs
+    || result?.zip?.outputPath
+    || result?.file?.path
+    || ''
+  ).trim();
+
   for (const a of envelope.actions) {
     const rawName = a.action || a.name;
     const name = normalizeDispatchActionName(rawName);
@@ -3278,6 +3290,9 @@ async function runActionsEnvelope(envelope, context = {}) {
       ...(a.arguments || a.input || {}),
       _context: executionContext,
     });
+    if ((name === 'share_file' || name === 'send_email' || name === 'schedule_email') && !args.path && lastArtifactPath) {
+      args.path = lastArtifactPath;
+    }
     // Validation stricte du nom d'action
     const valid = validateActionName(name);
     if (!valid.ok) {
@@ -3349,6 +3364,10 @@ async function runActionsEnvelope(envelope, context = {}) {
     }
     try {
       const result = await TOOL_IMPL[name](args);
+      const nextArtifactPath = extractArtifactPathFromResult(result);
+      if (nextArtifactPath) {
+        lastArtifactPath = nextArtifactPath;
+      }
       results.push({ action: name, ok: true, result });
     } catch (err) {
       results.push({
