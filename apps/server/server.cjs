@@ -6699,6 +6699,18 @@ function detectStorageInspectionReason(body) {
   return 'verifier le stockage A11';
 }
 
+function detectDownloadLinkRequestReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+  const asksLink = /\b(lien|link|url|telecharg|télécharg|download|recuper|récupér)\b/.test(text);
+  if (!asksLink) return null;
+  const asksForExistingArtifact = /\b(pdf|image|fichier|document|archive|ressource|dernier|derni[eè]re|ce pdf|ce fichier|le pdf|l'image)\b/.test(text)
+    || /^(tu as|donne|donne moi|envoie|montre)/.test(text);
+  if (!asksForExistingArtifact) return null;
+  return 'donner le lien de telechargement de la derniere ressource';
+}
+
 function detectCapabilityDiagnosticReason(body) {
   const latestUserMessage = getLatestUserMessage(body || {});
   const text = String(latestUserMessage || '').trim().toLowerCase();
@@ -6726,6 +6738,7 @@ function shouldAutoUseResourceAgent(body) {
   return !!(
     detectConversationImageReason(body)
     || detectStorageInspectionReason(body)
+    || detectDownloadLinkRequestReason(body)
     || detectCapabilityDiagnosticReason(body)
   );
 }
@@ -6769,6 +6782,18 @@ function buildDirectSafeUserEnvelope(body, { conversationId, userId } = {}) {
       actions: [
         { name: 'list_resources', id: 'res-1', arguments: { conversationId, limit: 12 } },
         { name: 'list_stored_files', id: 'files-1', arguments: { limit: 12 } },
+      ],
+    };
+  }
+
+  if (detectDownloadLinkRequestReason(body)) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        { name: 'get_latest_resource', id: 'latest-1', arguments: { conversationId } },
       ],
     };
   }
@@ -6823,6 +6848,17 @@ function buildDirectSafeUserReply(cerbere, latestUserMessage = '', imagePath = n
     return resourcesCount || filesCount
       ? `Oui. J'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s) dans l'espace A11.`
       : "Je peux verifier le stockage A11, mais je n'ai rien retrouve de stocke pour le moment.";
+  }
+
+  if (results.some((entry) => entry.action === 'get_latest_resource')) {
+    const latest = results.find((entry) => entry.action === 'get_latest_resource');
+    const resource = latest?.result?.resource || null;
+    const downloadUrl = String(resource?.downloadUrl || resource?.url || '').trim();
+    const filename = String(resource?.filename || '').trim() || 'fichier';
+    if (downloadUrl) {
+      return `Voici le lien de telechargement de ${filename} : [telecharger ${filename}](${downloadUrl})`;
+    }
+    return "J'ai retrouve la derniere ressource, mais aucun lien de telechargement valide n'est disponible.";
   }
 
   return "J'ai termine la verification demandee.";
