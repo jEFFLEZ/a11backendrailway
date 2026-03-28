@@ -1938,7 +1938,7 @@ async function sendConversationResourceEmailNow({
     to: recipients,
     subject: resolvedSubject,
     message: messageLines.join('\n\n'),
-    fileUrl: resolvedResource.url || null,
+    fileUrl: buildPublicResourceDownloadUrl(resolvedResource) || resolvedResource.url || null,
     attachment,
   });
 
@@ -2510,6 +2510,48 @@ async function sendFileEmail({ to, subject, message, fileUrl, attachment }) {
   return emailService.sendFileEmail({ to, subject, message, fileUrl, attachment });
 }
 
+const SLACK_WEBHOOK_URL = String(process.env.SLACK_WEBHOOK_URL || process.env.A11_SLACK_WEBHOOK_URL || '').trim();
+const SLACK_NOTIFY_ERRORS = !/^(0|false|off|no)$/i.test(String(process.env.SLACK_NOTIFY_ERRORS || '1').trim() || '1');
+
+async function sendSlackNotification({ text, blocks = null }) {
+  if (!SLACK_WEBHOOK_URL || !SLACK_NOTIFY_ERRORS) return { ok: false, skipped: true };
+  const payload = { text: String(text || '').trim().slice(0, 3000) || 'A11 notification' };
+  if (Array.isArray(blocks) && blocks.length) {
+    payload.blocks = blocks;
+  }
+  const response = await fetch(SLACK_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error(`slack_webhook_failed:${response.status}`);
+  }
+  return { ok: true };
+}
+
+function notifySlackError(scope, errorMessage, details = {}) {
+  if (!SLACK_WEBHOOK_URL || !SLACK_NOTIFY_ERRORS) return;
+  const normalizedScope = String(scope || 'A11').trim() || 'A11';
+  const normalizedMessage = String(errorMessage || 'Erreur inconnue').trim() || 'Erreur inconnue';
+  const detailLines = Object.entries(details || {})
+    .map(([key, value]) => {
+      const rendered = String(value ?? '').trim();
+      return rendered ? `• ${key}: ${rendered.slice(0, 500)}` : '';
+    })
+    .filter(Boolean);
+
+  const text = [
+    `A11 backend - ${normalizedScope}`,
+    normalizedMessage,
+    ...detailLines,
+  ].join('\n');
+
+  void sendSlackNotification({ text }).catch((error_) => {
+    console.warn('[Slack] notification failed:', error_?.message);
+  });
+}
+
 bootstrapScheduledMailJobs();
 
 // Ajout express.json AVANT les proxies pour garantir le body POST
@@ -2546,11 +2588,66 @@ try {
 // ✅ JWT configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const JWT_EXPIRY = '24h';
+const PUBLIC_RESOURCE_LINK_AUDIENCE = 'a11_resource_download';
+const PUBLIC_API_BASE_URL = normalizePublicAppUrl(
+  process.env.PUBLIC_API_URL
+  || process.env.API_URL
+  || process.env.BASE_URL
+  || 'https://api.funesterie.pro'
+);
 
 // ⚠️ SECURITY WARNING: si JWT_SECRET est le default, on log un warning en prod
 if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'dev-secret-change-in-production') {
   console.error('[SECURITY] ⚠️⚠️⚠️ JWT_SECRET is set to DEFAULT - SET IT IN PRODUCTION! ⚠️⚠️⚠️');
   console.error('[SECURITY] Si tu deploys sur Railway: ajoute JWT_SECRET dans les variables d\'env');
+}
+
+function resolvePublicApiBaseUrl(req = null) {
+  const requestHost = String(req?.get?.('host') || '').trim();
+  if (requestHost) {
+    const protoHeader = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+    const protocol = protoHeader || req?.protocol || 'https';
+    return normalizePublicAppUrl(`${protocol}://${requestHost}`);
+  }
+  return PUBLIC_API_BASE_URL;
+}
+
+function resolvePublicResourceLinkExpiry(resource) {
+  const resourceExpiry = normalizeOptionalTimestamp(resource?.expiresAt || resource?.expires_at || null);
+  if (resourceExpiry && resourceExpiry.getTime() > Date.now()) {
+    return resourceExpiry;
+  }
+  return new Date(Date.now() + TEMP_SHARED_FILE_TTL_MS);
+}
+
+function buildPublicResourceDownloadUrl(resource, req = null) {
+  const resourceId = Number(resource?.id || 0);
+  const userId = String(resource?.userId || resource?.user_id || '').trim();
+  if (!Number.isFinite(resourceId) || resourceId <= 0 || !userId) {
+    return '';
+  }
+
+  const expiresAt = resolvePublicResourceLinkExpiry(resource);
+  const token = jwt.sign({
+    typ: PUBLIC_RESOURCE_LINK_AUDIENCE,
+    aud: PUBLIC_RESOURCE_LINK_AUDIENCE,
+    rid: resourceId,
+    uid: userId,
+    exp: Math.floor(expiresAt.getTime() / 1000),
+  }, JWT_SECRET);
+
+  const baseUrl = resolvePublicApiBaseUrl(req);
+  return `${baseUrl}/api/public/resources/${resourceId}/download?token=${encodeURIComponent(token)}`;
+}
+
+function attachPublicDownloadUrl(resource, req = null) {
+  if (!resource || typeof resource !== 'object') return resource;
+  const downloadUrl = buildPublicResourceDownloadUrl(resource, req);
+  if (!downloadUrl) return resource;
+  return {
+    ...resource,
+    downloadUrl,
+  };
 }
 
 // ✅ JWT verification middleware
@@ -3553,20 +3650,32 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       mail,
     });
 
+    const publicConversationResource = ingestion.conversationResource
+      ? attachPublicDownloadUrl(ingestion.conversationResource, req)
+      : null;
+    const publicDownloadUrl = publicConversationResource?.downloadUrl
+      || ingestion.file.url
+      || '';
+
     return res.json({
       ok: true,
       conversationId: normalizedConversationId,
       file: {
         ...ingestion.file,
-        downloadUrl: ingestion.file.url,
+        downloadUrl: publicDownloadUrl || ingestion.file.url,
         expiresAt: resolvedExpiresAt.toISOString(),
       },
-      record: ingestion.record,
-      conversationResource: ingestion.conversationResource
+      record: ingestion.record
         ? {
-            ...ingestion.conversationResource,
-            downloadUrl: ingestion.conversationResource.url || ingestion.file.url,
-            expiresAt: ingestion.conversationResource.expiresAt || resolvedExpiresAt.toISOString(),
+            ...ingestion.record,
+            downloadUrl: publicDownloadUrl || ingestion.record.url || ingestion.file.url || '',
+          }
+        : null,
+      conversationResource: publicConversationResource
+        ? {
+            ...publicConversationResource,
+            url: publicConversationResource.downloadUrl || publicConversationResource.url || ingestion.file.url,
+            expiresAt: publicConversationResource.expiresAt || resolvedExpiresAt.toISOString(),
           }
         : null,
       mail,
@@ -3579,6 +3688,11 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       return res.status(413).json({ ok: false, error: e.code, maxBytes: e.maxBytes || FILE_UPLOAD_MAX_BYTES });
     }
     console.error('[FILES] upload failed:', e?.message);
+    notifySlackError('FILES upload failed', e?.message, {
+      route: '/api/files/upload',
+      conversationId: req.body?.conversationId || req.body?.convId || req.body?.sessionId || '',
+      filename: req.body?.filename || '',
+    });
     return res.status(500).json({ ok: false, error: 'upload_failed', message: String(e?.message) });
   }
 });
@@ -3598,12 +3712,18 @@ app.get('/api/resources/my', async (req, res) => {
       resourceKind: requestedKind,
       limit,
     });
+    const publicResources = resources.map((resource) => {
+      const hydrated = attachPublicDownloadUrl(resource, req);
+      return hydrated?.downloadUrl
+        ? { ...hydrated, url: hydrated.downloadUrl }
+        : hydrated;
+    });
 
     return res.json({
       ok: true,
       conversationId: requestedConversationId ? normalizeConversationId(requestedConversationId) : null,
-      resources,
-      count: resources.length,
+      resources: publicResources,
+      count: publicResources.length,
     });
   } catch (e) {
     console.error('[RESOURCES] list failed:', e?.message);
@@ -3662,7 +3782,73 @@ app.get('/api/resources/:id/download', async (req, res) => {
     return res.status(200).send(downloaded.buffer);
   } catch (e) {
     console.error('[RESOURCES] download failed:', e?.message);
+    notifySlackError('RESOURCES download failed', e?.message, {
+      route: `/api/resources/${req.params?.id || ''}/download`,
+      userId: req.user?.id || '',
+      resourceId: req.params?.id || '',
+    });
     return res.status(500).json({ ok: false, error: 'resource_download_failed', message: String(e?.message) });
+  }
+});
+
+app.get('/api/public/resources/:id/download', async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ ok: false, error: 'database_unavailable' });
+
+    const resourceId = Number(req.params?.id || 0);
+    if (!Number.isFinite(resourceId) || resourceId <= 0) {
+      return res.status(400).json({ ok: false, error: 'invalid_resource_id' });
+    }
+
+    const token = String(req.query?.token || '').trim();
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'missing_download_token' });
+    }
+
+    let decoded = null;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET, { audience: PUBLIC_RESOURCE_LINK_AUDIENCE });
+    } catch (error_) {
+      return res.status(401).json({ ok: false, error: 'invalid_download_token', message: String(error_?.message || 'invalid_download_token') });
+    }
+
+    const tokenResourceId = Number(decoded?.rid || 0);
+    const tokenUserId = String(decoded?.uid || '').trim();
+    const tokenType = String(decoded?.typ || '').trim();
+    if (tokenType !== PUBLIC_RESOURCE_LINK_AUDIENCE || tokenResourceId !== resourceId || !tokenUserId) {
+      return res.status(403).json({ ok: false, error: 'download_token_mismatch' });
+    }
+
+    const resource = await getConversationResourceById(tokenUserId, resourceId);
+    if (!resource) {
+      return res.status(404).json({ ok: false, error: 'resource_not_found' });
+    }
+    if (isResourceExpired(resource)) {
+      return res.status(410).json({ ok: false, error: 'resource_expired' });
+    }
+    if (!resource.storageKey || !isR2Configured()) {
+      return res.status(409).json({ ok: false, error: 'resource_download_not_available' });
+    }
+
+    const downloaded = await downloadBufferFromR2(resource.storageKey);
+    const downloadName = sanitizeFileName(resource.filename || `resource-${resourceId}.bin`);
+    const encodedDownloadName = encodeURIComponent(downloadName);
+
+    res.setHeader('Content-Type', downloaded.contentType || resource.contentType || 'application/octet-stream');
+    if (downloaded.contentLength || resource.sizeBytes) {
+      res.setHeader('Content-Length', String(downloaded.contentLength || resource.sizeBytes || 0));
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"; filename*=UTF-8''${encodedDownloadName}`);
+    res.setHeader('Cache-Control', 'private, no-store');
+
+    return res.status(200).send(downloaded.buffer);
+  } catch (e) {
+    console.error('[RESOURCES] public download failed:', e?.message);
+    notifySlackError('RESOURCES public download failed', e?.message, {
+      route: `/api/public/resources/${req.params?.id || ''}/download`,
+      resourceId: req.params?.id || '',
+    });
+    return res.status(500).json({ ok: false, error: 'public_resource_download_failed', message: String(e?.message) });
   }
 });
 
@@ -3682,9 +3868,12 @@ app.get('/api/resources/latest', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'latest_resource_not_found' });
     }
 
+    const publicResource = attachPublicDownloadUrl(latestResource, req);
     return res.json({
       ok: true,
-      resource: latestResource,
+      resource: publicResource?.downloadUrl
+        ? { ...publicResource, url: publicResource.downloadUrl }
+        : publicResource,
     });
   } catch (e) {
     console.error('[RESOURCES] latest failed:', e?.message);
@@ -3720,6 +3909,11 @@ app.post('/api/resources/email', express.json({ limit: '1mb' }), async (req, res
     return res.json(result);
   } catch (e) {
     console.error('[RESOURCES] email failed:', e?.message);
+    notifySlackError('RESOURCES email failed', e?.message, {
+      route: '/api/resources/email',
+      userId: req.user?.id || '',
+      resourceId: req.body?.resourceId || '',
+    });
     return res.status(500).json({ ok: false, error: 'resource_email_failed', message: String(e?.message) });
   }
 });
@@ -3753,6 +3947,11 @@ app.post('/api/resources/latest/email', express.json({ limit: '1mb' }), async (r
     return res.json(result);
   } catch (e) {
     console.error('[RESOURCES] latest email failed:', e?.message);
+    notifySlackError('RESOURCES latest email failed', e?.message, {
+      route: '/api/resources/latest/email',
+      userId: req.user?.id || '',
+      conversationId: req.body?.conversationId || req.body?.convId || req.body?.sessionId || req.query?.conversationId || '',
+    });
     return res.status(500).json({ ok: false, error: 'latest_resource_email_failed', message: String(e?.message) });
   }
 });
@@ -5464,8 +5663,8 @@ function buildTemporaryLinkSuffix(entry) {
   if (!link) return '';
   const expiresAt = normalizeOptionalTimestamp(extractPrimaryExpiry(entry));
   return expiresAt
-    ? ` Lien valable jusqu'a ${expiresAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })} : ${link}`
-    : ` Lien de telechargement : ${link}`;
+    ? ` Lien valable jusqu'a ${expiresAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })} : [telecharger le fichier](${link})`
+    : ` Lien de telechargement : [telecharger le fichier](${link})`;
 }
 
 function buildDevActionResultDetails(action, result = {}) {
@@ -7773,6 +7972,11 @@ app.post('/api/agent', express.json(), async (req, res) => {
     });
   } catch (e) {
     console.error('[A11][agent] error:', e);
+    notifySlackError('A11 agent error', e?.message || e, {
+      route: '/api/agent',
+      userId: req.user?.id || '',
+      conversationId: req.body?.conversationId || req.body?.convId || req.body?.sessionId || '',
+    });
     return res.status(500).json({
       ok: false,
       error: String(e?.message)
