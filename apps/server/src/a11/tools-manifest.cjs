@@ -34,6 +34,54 @@ const TOOL_MANIFEST = {
       payload: "object (paramètres pour le flow)"
     }
   },
+  qflush_memory_write: {
+    description: "Ecrit une memoire ephemere dans QFLUSH avec TTL.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      value: "any (valeur JSON courte)",
+      ttlSec: "number (optionnel, TTL en secondes)",
+      scope: "string (optionnel, scope logique)",
+      namespace: "string (optionnel, namespace logique)"
+    }
+  },
+  qflush_memory_read: {
+    description: "Lit une memoire ephemere depuis QFLUSH.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)"
+    }
+  },
+  qflush_memory_list: {
+    description: "Liste les memoires ephemeres QFLUSH pour un scope donne.",
+    dangerLevel: "low",
+    args: {
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)",
+      prefix: "string (optionnel)",
+      limit: "number (optionnel)"
+    }
+  },
+  qflush_memory_delete: {
+    description: "Supprime une memoire ephemere precise dans QFLUSH.",
+    dangerLevel: "low",
+    args: {
+      key: "string (cle memoire)",
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)"
+    }
+  },
+  qflush_memory_clear: {
+    description: "Vide les memoires ephemeres QFLUSH pour un scope/namespace.",
+    dangerLevel: "medium",
+    args: {
+      scope: "string (optionnel)",
+      namespace: "string (optionnel)",
+      prefix: "string (optionnel)"
+    }
+  },
   fs_read: {
     description: "Lire le contenu texte d’un fichier.",
     dangerLevel: "low",
