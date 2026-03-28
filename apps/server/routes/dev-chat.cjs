@@ -30,19 +30,21 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
       if (!validatePrompt(prompt)) {
         return res.status(400).json({ ok: false, error: 'invalid_prompt' });
       }
-      const scriptPath = path.resolve(__dirname, '../../a11llm/scripts/generate_sd_image.py');
-      if (!fs.existsSync(scriptPath)) {
-        return res.status(500).json({ ok: false, error: 'missing_script' });
+      // Nouvelle logique : variables d'environnement et robustesse
+      const enableSd = String(process.env.ENABLE_SD || '').toLowerCase() === 'true';
+      if (!enableSd) {
+        return res.status(503).json({ ok: false, error: 'sd_disabled', message: 'Stable Diffusion désactivé sur cet environnement' });
       }
-      const pythonBin = getPythonBin(scriptPath);
-      const { randomUUID } = require('crypto');
-      const isProd = process.env.NODE_ENV === 'production';
-      const tempDir = isProd ? '/tmp/a11-images' : path.join(process.cwd(), 'tmp', 'generated');
+      const scriptPath = String(process.env.SD_SCRIPT_PATH || '').trim();
+      if (!scriptPath || !fs.existsSync(scriptPath)) {
+        return res.status(503).json({ ok: false, error: 'sd_unavailable', message: 'Stable Diffusion indisponible sur cet environnement' });
+      }
+      const pythonBin = process.env.SD_PYTHON_PATH || getPythonBin(scriptPath) || 'python3';
+      const tempDir = String(process.env.SD_OUTPUT_DIR || (process.env.NODE_ENV === 'production' ? '/tmp/a11-images' : path.join(process.cwd(), 'tmp', 'generated')));
       fs.mkdirSync(tempDir, { recursive: true });
       const outputName = `sd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
       const outputPath = path.join(tempDir, outputName);
       const args = [scriptPath, '--prompt', prompt, '--output', outputPath];
-      const py = spawn(pythonBin, args, { cwd: path.dirname(scriptPath) });
       let stdout = Buffer.alloc(0);
       let stderr = Buffer.alloc(0);
       let finished = false;
@@ -53,6 +55,7 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
           return res.status(504).json({ ok: false, error: 'timeout', message: 'Image generation timed out' });
         }
       }, 60000);
+      const py = spawn(pythonBin, args, { cwd: path.dirname(scriptPath) });
       py.stdout.on('data', (data) => { stdout = Buffer.concat([stdout, data]); });
       py.stderr.on('data', (data) => { stderr = Buffer.concat([stderr, data]); });
       py.on('close', async (code) => {

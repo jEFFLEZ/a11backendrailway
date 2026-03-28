@@ -115,17 +115,17 @@ app.post('/api/tools/generate_sd', express.json({ limit: '2mb' }), async (req, r
     const height = Number(req.body?.height || 768);
     const seed = req.body?.seed !== undefined ? String(req.body.seed) : undefined;
 
-    // Lance le script Python diffusers
-    const scriptPath = path.resolve(__dirname, '../../../a11llm/scripts/generate_sd_image.py');
-    if (!fs.existsSync(scriptPath)) {
-      return res.status(500).json({ ok: false, error: 'missing_script', message: 'Script Python non trouvé' });
+    // Nouvelle logique : variables d'environnement
+    const enableSd = String(process.env.ENABLE_SD || '').toLowerCase() === 'true';
+    if (!enableSd) {
+      return res.status(503).json({ ok: false, error: 'sd_disabled', message: 'Stable Diffusion désactivé sur cet environnement' });
     }
-
-    // Utilise le Python du venv si défini, sinon 'python' par défaut
-    const pythonBin = process.env.SD_PYTHON_PATH || path.join(path.dirname(scriptPath), 'venv', 'Scripts', 'python.exe');
-    const { randomUUID } = require('crypto');
-    const isProd = process.env.NODE_ENV === 'production';
-    const tempDir = isProd ? '/tmp/a11-images' : path.join(process.cwd(), 'tmp', 'generated');
+    const scriptPath = String(process.env.SD_SCRIPT_PATH || '').trim();
+    if (!scriptPath || !fs.existsSync(scriptPath)) {
+      return res.status(503).json({ ok: false, error: 'sd_unavailable', message: 'Stable Diffusion indisponible sur cet environnement' });
+    }
+    const pythonBin = process.env.SD_PYTHON_PATH || 'python3';
+    const tempDir = String(process.env.SD_OUTPUT_DIR || (process.env.NODE_ENV === 'production' ? '/tmp/a11-images' : path.join(process.cwd(), 'tmp', 'generated')));
     fs.mkdirSync(tempDir, { recursive: true });
     const outputName = `sd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
     const outputPath = path.join(tempDir, outputName);
