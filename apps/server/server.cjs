@@ -12,7 +12,6 @@ const express = require('express');
 const app = express();
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
-const uploadBufferToR2 = fileStorage.uploadBufferToR2;
 
 
 // --- Chat principal (web image intent + fallback LLM) ---
