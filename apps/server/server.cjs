@@ -3819,6 +3819,21 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       || ingestion.file.url
       || '';
 
+    if (!publicConversationResource?.downloadUrl) {
+      notifySlackError('FILES public download URL missing', 'public_download_url_missing', {
+        route: '/api/files/upload',
+        conversationId: normalizedConversationId,
+        filename: ingestion.file?.filename || filename || '',
+        storageKey: ingestion.file?.storageKey || '',
+        publicApiUrl: PUBLIC_API_BASE_URL,
+      });
+      return res.status(502).json({
+        ok: false,
+        error: 'public_download_url_missing',
+        message: 'Le fichier a ete stocke, mais aucun lien public signe n a pu etre genere.',
+      });
+    }
+
     let mail = null;
     if (emailTo) {
       mail = await sendFileEmail({
