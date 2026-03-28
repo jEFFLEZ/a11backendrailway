@@ -1,3 +1,10 @@
+
+// --- Express setup: always at the very top ---
+const express = require('express');
+const app = express();
+const { createFileStorage } = require('./lib/file-storage.cjs');
+const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
+
 // --- Routeur DEV chat (injection dépendances, wiring propre) ---
 const { detectImageIntent } = require('./lib/intent-detection.cjs');
 const { uploadBufferToR2 } = require('./lib/file-storage.cjs');
@@ -7,11 +14,6 @@ require('./routes/dev-chat.cjs')({
   uploadBufferToR2,
   detectImageIntent
 });
-// --- Express setup: always at the very top ---
-const express = require('express');
-const app = express();
-const { createFileStorage } = require('./lib/file-storage.cjs');
-const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
 
 
 // --- Chat principal (web image intent + fallback LLM) ---
