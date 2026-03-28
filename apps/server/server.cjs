@@ -1,3 +1,59 @@
+// --- Génération d'image via OpenAI DALL·E ---
+const fetch = require('node-fetch');
+app.post('/api/tools/generate_png', express.json({ limit: '2mb' }), async (req, res) => {
+  try {
+    const prompt = String(req.body?.prompt || '').trim();
+    if (!prompt) return res.status(400).json({ ok: false, error: 'missing_prompt' });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ ok: false, error: 'missing_openai_key' });
+
+    // Appel OpenAI DALL·E (v3)
+    const dalleRes = await fetch('https://api.openai.com/v1/images/generations', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        prompt,
+        n: 1,
+        size: '1024x1024',
+        response_format: 'url'
+      })
+    });
+    if (!dalleRes.ok) {
+      const err = await dalleRes.text();
+      return res.status(502).json({ ok: false, error: 'openai_failed', details: err });
+    }
+    const dalleJson = await dalleRes.json();
+    const imageUrl = dalleJson?.data?.[0]?.url;
+    if (!imageUrl) return res.status(502).json({ ok: false, error: 'no_image_url' });
+
+    // Télécharge l'image
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) return res.status(502).json({ ok: false, error: 'image_download_failed' });
+    const buffer = await imgRes.buffer();
+
+    // Stocke dans R2/local via la logique existante
+    const filename = `dalle_${Date.now()}.png`;
+    const userId = req.user?.id || 'image-tool';
+    const uploadResult = await uploadBufferToR2({
+      userId,
+      filename,
+      buffer,
+      contentType: 'image/png'
+    });
+
+    return res.json({
+      ok: true,
+      url: uploadResult.url || null,
+      filename,
+      prompt
+    });
+  } catch (e) {
+    console.error('[A11][generate_png] failed:', e?.message);
+    return res.status(500).json({ ok: false, error: 'internal_error', message: String(e?.message) });
+  }
+});
 // --- Express setup: always at the very top ---
 const express = require('express');
 const app = express();
