@@ -102,10 +102,10 @@ function createFileStorage(config = {}) {
   }
 
   function getPublicUrl(storageKey) {
-    if (r2Config.publicBaseUrl) {
-      return `${r2Config.publicBaseUrl.replace(/\/$/, '')}/${storageKey}`;
+    if (!r2Config.publicBaseUrl) {
+      return '';
     }
-    return `${r2Config.endpoint.replace(/\/$/, '')}/${r2Config.bucket}/${storageKey}`;
+    return `${r2Config.publicBaseUrl.replace(/\/$/, '')}/${storageKey}`;
   }
 
   async function uploadBuffer({ userId, filename, buffer, contentType }) {

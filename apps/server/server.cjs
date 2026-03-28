@@ -2752,10 +2752,14 @@ try {
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const JWT_EXPIRY = '24h';
 const PUBLIC_RESOURCE_LINK_AUDIENCE = 'a11_resource_download';
-const PUBLIC_API_BASE_URL = normalizePublicAppUrl(
+const EXPLICIT_PUBLIC_API_BASE_URL = String(
   process.env.PUBLIC_API_URL
   || process.env.API_URL
   || process.env.BASE_URL
+  || ''
+).trim();
+const PUBLIC_API_BASE_URL = normalizePublicAppUrl(
+  EXPLICIT_PUBLIC_API_BASE_URL
   || 'https://api.funesterie.pro'
 );
 
@@ -2768,6 +2772,27 @@ if (process.env.NODE_ENV === 'production' && JWT_SECRET === 'dev-secret-change-i
 function resolvePublicApiBaseUrl(req = null) {
   const requestHost = String(req?.get?.('host') || '').trim();
   if (requestHost) {
+    const hostname = String(requestHost.split(',')[0] || '')
+      .trim()
+      .replace(/^\[|\]$/g, '')
+      .replace(/:\d+$/, '')
+      .toLowerCase();
+    const isLoopbackHost = (
+      !hostname
+      || hostname === 'localhost'
+      || hostname === '0.0.0.0'
+      || hostname === '::1'
+      || hostname === 'host.docker.internal'
+      || hostname.endsWith('.internal')
+      || hostname.endsWith('.local')
+      || /^127\./.test(hostname)
+      || /^10\./.test(hostname)
+      || /^192\.168\./.test(hostname)
+      || /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname)
+    );
+    if (isLoopbackHost && EXPLICIT_PUBLIC_API_BASE_URL) {
+      return PUBLIC_API_BASE_URL;
+    }
     const protoHeader = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
     const protocol = protoHeader || req?.protocol || 'https';
     return normalizePublicAppUrl(`${protocol}://${requestHost}`);
@@ -3787,13 +3812,20 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       expiresAt: resolvedExpiresAt,
     });
 
+    const publicConversationResource = ingestion.conversationResource
+      ? attachPublicDownloadUrl(ingestion.conversationResource, req)
+      : null;
+    const publicDownloadUrl = publicConversationResource?.downloadUrl
+      || ingestion.file.url
+      || '';
+
     let mail = null;
     if (emailTo) {
       mail = await sendFileEmail({
         to: emailTo,
         subject: emailSubject || 'A11 — fichier généré',
         message: emailMessage || 'Ton fichier est prêt.',
-        fileUrl: ingestion.file.url,
+        fileUrl: publicDownloadUrl || '',
         attachment: attachToEmail ? { filename: ingestion.file.filename, buffer: ingestion.buffer } : null,
       });
     }
@@ -3805,20 +3837,13 @@ app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) 
       file: {
         filename: ingestion.file.filename,
         storageKey: ingestion.file.storageKey,
-        url: ingestion.file.url,
+        url: publicDownloadUrl || ingestion.file.url,
         contentType: ingestion.file.contentType,
         sizeBytes: ingestion.file.sizeBytes,
       },
       analysis: ingestion.analysis || ingestion.conversationResource?.metadata?.analysis || null,
       mail,
     });
-
-    const publicConversationResource = ingestion.conversationResource
-      ? attachPublicDownloadUrl(ingestion.conversationResource, req)
-      : null;
-    const publicDownloadUrl = publicConversationResource?.downloadUrl
-      || ingestion.file.url
-      || '';
 
     return res.json({
       ok: true,
