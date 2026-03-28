@@ -1,12 +1,14 @@
-const DEFAULT_SHELL_WHITELIST = [
-  /^git status\b/i,
-  /^git diff\b/i,
-  /^npm test\b/i,
-  /^npm run build\b/i,
-  /^dotnet --info\b/i,
-  /^dotnet --version\b/i,
-  /^dotnet build\b/i
+const DEFAULT_SHELL_ENTRIES = [
+  { example: 'git status', tool: 'git', pattern: /^git status\b/i },
+  { example: 'git diff', tool: 'git', pattern: /^git diff\b/i },
+  { example: 'npm test', tool: 'npm', pattern: /^npm test\b/i },
+  { example: 'npm run build', tool: 'npm', pattern: /^npm run build\b/i },
+  { example: 'dotnet --info', tool: 'dotnet', pattern: /^dotnet --info\b/i },
+  { example: 'dotnet --version', tool: 'dotnet', pattern: /^dotnet --version\b/i },
+  { example: 'dotnet build', tool: 'dotnet', pattern: /^dotnet build\b/i }
 ];
+
+const DEFAULT_SHELL_WHITELIST = DEFAULT_SHELL_ENTRIES.map((entry) => entry.pattern);
 
 function getExtraShellPrefixes() {
   return String(process.env.A11_SHELL_ALLOWLIST || '')
@@ -30,17 +32,20 @@ function isShellAllowed(cmd) {
 
 function getShellAllowlistSummary() {
   return {
-    defaultExamples: [
-      'git status',
-      'git diff',
-      'npm test',
-      'npm run build',
-      'dotnet --info',
-      'dotnet --version',
-      'dotnet build'
-    ],
+    defaultExamples: DEFAULT_SHELL_ENTRIES.map((entry) => entry.example),
     extraPrefixes: getExtraShellPrefixes()
   };
+}
+
+function getShellAllowlistEntries() {
+  return DEFAULT_SHELL_ENTRIES.map((entry) => ({ ...entry }));
+}
+
+function getShellToolName(command) {
+  const normalized = String(command || '').trim();
+  if (!normalized) return null;
+  const matched = DEFAULT_SHELL_ENTRIES.find((entry) => entry.pattern.test(normalized));
+  return matched?.tool || null;
 }
 
 function assertShellAllowed(cmd, label = 'command') {
@@ -54,5 +59,7 @@ function assertShellAllowed(cmd, label = 'command') {
 module.exports = {
   isShellAllowed,
   assertShellAllowed,
-  getShellAllowlistSummary
+  getShellAllowlistSummary,
+  getShellAllowlistEntries,
+  getShellToolName
 };

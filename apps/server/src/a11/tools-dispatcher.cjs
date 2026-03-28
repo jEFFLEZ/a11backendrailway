@@ -6,7 +6,7 @@ const AdmZip = require('adm-zip');
 const PDFDocument = require('pdfkit');
 const fsSync = require('node:fs');
 const { exec } = require('node:child_process');
-const { isShellAllowed } = require('../../lib/safe-shell.cjs');
+const { getShellToolName, isShellAllowed } = require('../../lib/safe-shell.cjs');
 
 // ⚠️ IMPORTANT : importer le manifest AVANT d'utiliser WORKSPACE_ROOTS
 const { TOOL_MANIFEST, WORKSPACE_ROOTS, SAFE_DATA_ROOT } = require('./tools-manifest.cjs');
@@ -2012,11 +2012,43 @@ async function t_vs_execute_shell(args = {}) {
   if (!status.ok) return status;
 
   try {
-    const output = await callA11Host('ExecuteShell', command);
+    const rawResult = await callA11Host('ExecuteShell', command);
+    const normalized =
+      rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)
+        ? rawResult
+        : {
+            ok: true,
+            command,
+            exitCode: 0,
+            stdout: String(rawResult || ''),
+            stderr: '',
+            output: String(rawResult || ''),
+            unavailable: false,
+            message: null,
+          };
+    const output = String(
+      normalized.output ||
+      [normalized.stdout, normalized.stderr].filter(Boolean).join('\n')
+    ).trim();
+    const unavailable =
+      normalized.unavailable === true ||
+      Number(normalized.exitCode) === 127 ||
+      /not found|is not recognized|command not found|enoent/i.test(String(normalized.stderr || normalized.message || ''));
+    const message = String(
+      normalized.message ||
+      (unavailable
+        ? `La commande "${getShellToolName(command) || command.split(/\s+/)[0]}" n'est pas disponible sur ce runtime A11.`
+        : normalized.stderr || '')
+    ).trim();
     return {
-      ok: true,
+      ok: normalized.ok !== false && Number(normalized.exitCode || 0) === 0,
       command,
       output,
+      stdout: String(normalized.stdout || ''),
+      stderr: String(normalized.stderr || ''),
+      exitCode: Number.isFinite(normalized.exitCode) ? Number(normalized.exitCode) : 0,
+      unavailable,
+      message: message || null,
       mode: status.mode
     };
   } catch (err) {
