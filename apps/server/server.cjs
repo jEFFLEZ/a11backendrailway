@@ -5919,6 +5919,46 @@ function extractPrimaryResultLabel(entry) {
   return '';
 }
 
+function extractArtifactPathFromActionEntry(entry) {
+  const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
+  return String(
+    result.outputPath
+      || result.path
+      || result.filePath
+      || result.savedAs
+      || result?.zip?.outputPath
+      || result?.file?.path
+      || result?.resource?.path
+      || ''
+  ).trim();
+}
+
+function findLatestConversationArtifactPath(userId, conversationId, limit = 40) {
+  const entries = readConversationLogEntries({ userId, conversationId, limit });
+  for (const entry of entries) {
+    if (String(entry?.type || '').trim() !== 'agent_actions') continue;
+    const results = Array.isArray(entry?.cerbere?.results) ? entry.cerbere.results : [];
+    for (let index = results.length - 1; index >= 0; index -= 1) {
+      const resultEntry = results[index];
+      if (!resultEntry?.ok) continue;
+      const actionName = String(resultEntry?.action || '').trim();
+      if (!['generate_pdf', 'generate_png', 'download_file', 'zip_create', 'zip_and_email', 'share_file'].includes(actionName)) {
+        continue;
+      }
+      const candidatePath = extractArtifactPathFromActionEntry(resultEntry);
+      if (!candidatePath) continue;
+      try {
+        if (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isFile()) {
+          return candidatePath;
+        }
+      } catch {
+        // ignore invalid candidate paths
+      }
+    }
+  }
+  return '';
+}
+
 function extractPrimaryRecipient(entry) {
   const result = entry?.result && typeof entry.result === 'object' ? entry.result : {};
   const rawRecipients = []
@@ -6886,6 +6926,69 @@ function buildDirectSafeUserReply(cerbere, latestUserMessage = '', imagePath = n
   return "J'ai termine la verification demandee.";
 }
 
+async function tryRecoverAndShareLatestArtifact({ userId, conversationId, executionContext = null }) {
+  const artifactPath = findLatestConversationArtifactPath(userId, conversationId);
+  if (!artifactPath) return null;
+
+  const envelope = {
+    version: 'a11-envelope-1',
+    mode: 'actions',
+    conversationId,
+    userId,
+    actions: [
+      {
+        name: 'share_file',
+        id: 'share-recovered-1',
+        arguments: {
+          conversationId,
+          path: artifactPath,
+        },
+      },
+    ],
+  };
+
+  const cerbere = await runActionsEnvelope(envelope, {
+    ...(executionContext || {}),
+    conversationId,
+    userId,
+    allowedActions: [...CHAT_SAFE_RESOURCE_ACTIONS],
+  });
+  const sharedResult = Array.isArray(cerbere?.results)
+    ? cerbere.results.find((entry) => entry?.ok && entry?.action === 'share_file')
+    : null;
+  const link = String(
+    sharedResult?.url
+      || sharedResult?.file?.downloadUrl
+      || sharedResult?.conversationResource?.downloadUrl
+      || ''
+  ).trim();
+  if (!sharedResult?.ok || !link || sharedResult?.mailOnly) {
+    return null;
+  }
+
+  const filename = String(
+    sharedResult?.conversationResource?.filename
+      || sharedResult?.file?.filename
+      || path.basename(artifactPath)
+      || 'fichier'
+  ).trim() || 'fichier';
+  const expiresAt = normalizeOptionalTimestamp(
+    sharedResult?.expiresAt
+      || sharedResult?.file?.expiresAt
+      || sharedResult?.conversationResource?.expiresAt
+      || null
+  );
+  const suffix = expiresAt
+    ? ` Lien valable jusqu'a ${expiresAt.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}.`
+    : '';
+
+  return {
+    content: `Voici le lien de telechargement de ${filename} : [telecharger ${filename}](${link}).${suffix}`,
+    cerbere,
+    envelope,
+  };
+}
+
 function extractPreviewImageFromHtml(html, sourceUrl) {
   const raw = String(html || '');
   if (!raw) return '';
@@ -7014,6 +7117,29 @@ async function tryRunDirectSafeUserIntent({ body, userId, conversationId, reques
     imagePath = await findPreviewImageUrlFromSearchResults(searchResults);
   }
   const reply = buildDirectSafeUserReply(cerbere, getLatestUserMessage(body || {}), imagePath);
+
+  if (detectDownloadLinkRequestReason(body)) {
+    const latestResult = Array.isArray(cerbere?.results)
+      ? cerbere.results.find((entry) => entry?.action === 'get_latest_resource')
+      : null;
+    const resource = latestResult?.result?.resource || null;
+    const downloadUrl = String(resource?.downloadUrl || resource?.url || '').trim();
+    if (!downloadUrl) {
+      const recovered = await tryRecoverAndShareLatestArtifact({
+        userId,
+        conversationId,
+        executionContext,
+      });
+      if (recovered) {
+        return {
+          content: normalizeAssistantOutput(recovered.content),
+          imagePath: null,
+          cerbere: recovered.cerbere,
+          envelope: recovered.envelope,
+        };
+      }
+    }
+  }
 
   return {
     content: normalizeAssistantOutput(reply),
