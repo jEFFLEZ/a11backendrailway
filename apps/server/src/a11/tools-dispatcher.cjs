@@ -7,6 +7,7 @@ const PDFDocument = require('pdfkit');
 const fsSync = require('node:fs');
 const { exec } = require('node:child_process');
 const { getShellToolName, isShellAllowed } = require('../../lib/safe-shell.cjs');
+const { analyzeUploadedResource } = require('../../lib/resource-reader.cjs');
 
 // ⚠️ IMPORTANT : importer le manifest AVANT d'utiliser WORKSPACE_ROOTS
 const { TOOL_MANIFEST, WORKSPACE_ROOTS, SAFE_DATA_ROOT } = require('./tools-manifest.cjs');
@@ -392,6 +393,284 @@ async function resolveStoredUserFile(ref, options = {}) {
   const selected = bestScore >= 68 ? best : null;
   if (cache?.resolvedStoredFilesByRef instanceof Map) cache.resolvedStoredFilesByRef.set(rawRef, selected);
   return selected;
+}
+
+function isImageLikeContentType(value) {
+  return String(value || '').trim().toLowerCase().startsWith('image/');
+}
+
+function isImageLikeFilename(value) {
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(String(value || '').trim());
+}
+
+function getExistingResourceAnalysis(resource) {
+  const metadata = resource?.metadata && typeof resource.metadata === 'object' ? resource.metadata : null;
+  const analysis = metadata?.analysis && typeof metadata.analysis === 'object' ? metadata.analysis : null;
+  return analysis || null;
+}
+
+async function findLatestImageConversationResource(options = {}) {
+  const resources = await listConversationResourcesForContext({
+    ...options,
+    limit: Math.max(12, Number(options.limit || 24)),
+  });
+  if (!Array.isArray(resources) || !resources.length) return null;
+  return resources.find((resource) => {
+    const analysis = getExistingResourceAnalysis(resource);
+    return isImageLikeContentType(resource?.contentType)
+      || isImageLikeFilename(resource?.filename)
+      || isImageLikeContentType(analysis?.mime)
+      || isImageLikeFilename(resource?.url);
+  }) || null;
+}
+
+async function loadConversationResourceBuffer(resource, context = {}) {
+  const resourceId = Number(resource?.id || 0);
+  if (!Number.isFinite(resourceId) || resourceId <= 0) return null;
+  const downloaded = await fetchInternalBuffer(`/api/resources/${resourceId}/download`, {
+    method: 'GET',
+  }, context);
+  if (!downloaded?.ok || !downloaded.buffer) {
+    throw new Error(downloaded?.error || downloaded?.message || 'resource_download_failed');
+  }
+  return {
+    buffer: downloaded.buffer,
+    filename: String(resource?.filename || `resource-${resourceId}.bin`).trim(),
+    contentType: String(downloaded.contentType || resource?.contentType || '').trim() || 'application/octet-stream',
+    source: 'conversation_resource',
+    resourceId,
+    resource,
+  };
+}
+
+async function resolveVisionImageSource(args = {}, options = {}) {
+  const context = options.context || {};
+  const conversationId = String(
+    options.conversationId ||
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    ''
+  ).trim();
+  const resourceCache = options.resourceCache && typeof options.resourceCache === 'object'
+    ? options.resourceCache
+    : {
+        resolvedByRef: new Map(),
+        resolvedStoredFilesByRef: new Map(),
+        resourcesPromise: null,
+        storedFilesPromise: null,
+      };
+  const explicitRef = String(
+    args.path ||
+    args.imagePath ||
+    args.filePath ||
+    args.resourceRef ||
+    args.ref ||
+    args.url ||
+    ''
+  ).trim();
+  const requestedResourceId = Number(args.resourceId || args.resource_id || args.id || 0);
+
+  if (Number.isFinite(requestedResourceId) && requestedResourceId > 0) {
+    const resources = await listConversationResourcesForContext({
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    });
+    const matched = resources.find((entry) => Number(entry?.id || 0) === requestedResourceId) || null;
+    if (!matched) {
+      throw new Error(`vision_analyze: resource ${requestedResourceId} introuvable`);
+    }
+    return loadConversationResourceBuffer(matched, context);
+  }
+
+  if (explicitRef) {
+    const matchedResource = await resolveStoredConversationResource(explicitRef, {
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    }).catch(() => null);
+    if (matchedResource) {
+      return loadConversationResourceBuffer(matchedResource, context);
+    }
+
+    const matchedFile = await resolveStoredUserFile(explicitRef, {
+      context,
+      conversationId,
+      resourceCache,
+      limit: 60,
+    }).catch(() => null);
+    if (matchedFile?.url) {
+      const response = await fetch(String(matchedFile.url));
+      if (!response.ok) {
+        throw new Error(`vision_analyze: impossible de recuperer ${matchedFile.url} (${response.status})`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        buffer,
+        filename: String(matchedFile.filename || path.basename(explicitRef) || 'image').trim(),
+        contentType: String(matchedFile.content_type || matchedFile.contentType || guessContentType(matchedFile.filename || explicitRef)).trim(),
+        source: 'stored_file',
+        file: matchedFile,
+      };
+    }
+
+    if (/^https?:\/\//i.test(explicitRef)) {
+      const response = await fetch(explicitRef);
+      if (!response.ok) {
+        throw new Error(`vision_analyze: impossible de recuperer ${explicitRef} (${response.status})`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        buffer,
+        filename: path.basename(new URL(explicitRef).pathname || 'image'),
+        contentType: String(response.headers.get('content-type') || '').trim() || 'application/octet-stream',
+        source: 'remote_url',
+        url: explicitRef,
+      };
+    }
+
+    const localPath = resolveManagedPath(explicitRef, 'vision_analyze.path');
+    if (!fsSync.existsSync(localPath)) {
+      throw new Error(`vision_analyze: image introuvable (${localPath})`);
+    }
+    const stats = fsSync.statSync(localPath);
+    if (!stats.isFile()) {
+      throw new Error(`vision_analyze: le chemin n'est pas un fichier (${localPath})`);
+    }
+    return {
+      buffer: await fsp.readFile(localPath),
+      filename: path.basename(localPath),
+      contentType: guessContentType(localPath),
+      source: 'local_path',
+      path: localPath,
+    };
+  }
+
+  const latestImage = await findLatestImageConversationResource({
+    context,
+    conversationId,
+    resourceCache,
+    limit: 40,
+  });
+  if (!latestImage) {
+    throw new Error('vision_analyze: aucune image recente trouvee dans cette conversation');
+  }
+  return loadConversationResourceBuffer(latestImage, context);
+}
+
+function extractVisionTextContent(value) {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        if (typeof entry === 'string') return entry.trim();
+        if (entry && typeof entry === 'object' && entry.type === 'text') {
+          return String(entry.text || '').trim();
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  return '';
+}
+
+async function describeImageWithRemoteVision(source, args = {}) {
+  const apiKey = String(
+    args.apiKey ||
+    process.env.A11_VISION_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    ''
+  ).trim();
+  const baseUrl = String(
+    args.baseUrl ||
+    process.env.A11_VISION_BASE_URL ||
+    process.env.A11_OPENAI_BASE_URL ||
+    process.env.OPENAI_BASE_URL ||
+    ''
+  ).trim();
+  const model = String(
+    args.model ||
+    process.env.A11_VISION_MODEL ||
+    process.env.OPENAI_VISION_MODEL ||
+    process.env.OPENAI_MODEL ||
+    'gpt-4o-mini'
+  ).trim();
+
+  if (!apiKey || !baseUrl || !Buffer.isBuffer(source?.buffer) || !source.buffer.length) {
+    return null;
+  }
+
+  const normalizedBase = baseUrl.replace(/\/+$/, '');
+  const url = normalizedBase.endsWith('/v1')
+    ? `${normalizedBase}/chat/completions`
+    : `${normalizedBase}/v1/chat/completions`;
+  const task = String(args.task || 'describe').trim().toLowerCase();
+  const prompt = task === 'ocr'
+    ? "Lis tout le texte visible dans l'image. Si aucun texte n'est visible, dis-le clairement."
+    : "Decris tres brievement ce qui est visible dans cette image, sans inventer. Si le contenu est incertain, dis-le.";
+  const dataUrl = `data:${String(source.contentType || 'image/png').trim() || 'image/png'};base64,${source.buffer.toString('base64')}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        {
+          role: 'system',
+          content: 'Tu es un module de vision pour A11. Reponds en francais, en 1 ou 2 phrases courtes maximum, sans inventer.',
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ],
+        },
+      ],
+      max_tokens: 220,
+      stream: false,
+    }),
+  });
+
+  const rawText = await response.text();
+  if (!response.ok) {
+    throw new Error(`vision_remote_failed:${response.status}:${rawText.slice(0, 240)}`);
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return rawText.trim();
+  }
+
+  return extractVisionTextContent(parsed?.choices?.[0]?.message?.content || parsed?.output_text || '');
+}
+
+function buildVisionSummary(source, analysis, remoteDescription, task = '') {
+  const normalizedTask = String(task || '').trim().toLowerCase();
+  if (remoteDescription) return remoteDescription;
+  if (analysis?.readableInChatContext && analysis.preview) {
+    return normalizedTask === 'ocr'
+      ? `J'ai pu lire ce texte dans l'image : ${String(analysis.preview).trim()}`
+      : `Je peux au moins lire ceci dans l'image : ${String(analysis.preview).trim()}`;
+  }
+
+  const format = String(analysis?.format || source?.contentType || 'image').trim();
+  const width = Number(analysis?.width || 0) || null;
+  const height = Number(analysis?.height || 0) || null;
+  const dimensions = width && height ? ` (${width}x${height})` : '';
+  return `Je peux confirmer que c'est une image ${format}${dimensions}, mais aucun modele vision n'est configure ici pour decrire son contenu visuel avec fiabilite.`;
 }
 
 function normalizeRecipientsInput(value) {
@@ -1819,6 +2098,59 @@ async function t_generate_png(args = {}) {
   };
 }
 
+async function t_vision_analyze(args = {}) {
+  const context = args._context || {};
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    context.convId ||
+    context.sessionId ||
+    ''
+  ).trim();
+  const resourceCache = {
+    resolvedByRef: new Map(),
+    resolvedStoredFilesByRef: new Map(),
+    resourcesPromise: null,
+    storedFilesPromise: null,
+  };
+
+  const source = await resolveVisionImageSource(args, {
+    context,
+    conversationId,
+    resourceCache,
+  });
+  const analysis = await analyzeUploadedResource({
+    filename: source.filename,
+    contentType: source.contentType,
+    buffer: source.buffer,
+  });
+
+  let remoteDescription = '';
+  try {
+    remoteDescription = String(await describeImageWithRemoteVision(source, args) || '').trim();
+  } catch (error_) {
+    remoteDescription = '';
+  }
+
+  return {
+    ok: true,
+    task: String(args.task || 'describe').trim() || 'describe',
+    summary: buildVisionSummary(source, analysis, remoteDescription, args.task),
+    description: remoteDescription || null,
+    analysis,
+    source: {
+      kind: source.source,
+      filename: source.filename,
+      contentType: source.contentType,
+      path: source.path || null,
+      url: source.url || source.resource?.url || source.file?.url || null,
+      resourceId: source.resourceId || source.resource?.id || null,
+    },
+  };
+}
+
 // VS / A11Host
 async function t_vs_status() {
   return await getA11HostStatus();
@@ -2338,6 +2670,12 @@ function normalizeDispatchActionName(name) {
   if (!lowered) return normalized;
 
   if (lowered === 'generate_image') return 'generate_png';
+  if (lowered === 'vision' || lowered === 'image_analyze' || lowered === 'analyze_image' || lowered === 'analyse_image') {
+    return 'vision_analyze';
+  }
+  if (lowered === 'zip') return 'zip_create';
+  if (lowered === 'unzip') return 'unzip_extract';
+  if (lowered === 'ocr' || lowered === 'ocr-file') return 'ocr_file';
   if (lowered === 'websearch') return 'web_search';
   if (lowered === 'share-file' || lowered === 'sharefile' || lowered === 'upload_file' || lowered === 'publish_file') {
     return 'share_file';
@@ -2550,6 +2888,10 @@ function normalizeDispatchActionArgs(actionName, rawArgs = {}) {
     args.limit = args.max || args.count || args.top || args.n || undefined;
   }
 
+  if ((actionName === 'vision_analyze' || actionName === 'ocr_file') && !args.task) {
+    args.task = actionName === 'ocr_file' ? 'ocr' : (args.mode || 'describe');
+  }
+
   return args;
 }
 
@@ -2568,7 +2910,9 @@ const TOOL_IMPL = {
 
   // ZIP (stubs)
   zip_create: t_zip_create,
+  zip: t_zip_create,
   unzip_extract: t_unzip_extract,
+  unzip: t_unzip_extract,
 
   // SHELL
   shell_exec: t_shell_exec,
@@ -2600,6 +2944,8 @@ const TOOL_IMPL = {
   // PDF / PNG
   generate_pdf: t_generate_pdf,
   generate_png: t_generate_png,
+  vision_analyze: t_vision_analyze,
+  ocr_file: t_vision_analyze,
 
   // Download direct d’image/fichier
   download_file: t_download_file,
@@ -2626,7 +2972,15 @@ const TOOL_IMPL = {
   // Mémoire A-11 (KV + historique)
   a11_memory_write: t_a11_memory_write,
   a11_memory_read: t_a11_memory_read,
-  a11_memory_history: t_a11_memory_history
+  a11_memory_history: t_a11_memory_history,
+  a11_env_snapshot: t_a11_env_snapshot,
+  a11_debug_echo: t_a11_debug_echo,
+  agent_log: async (args = {}) => {
+    const level = String(args.level || 'info').trim().toLowerCase() || 'info';
+    const message = String(args.message || '').trim() || '(vide)';
+    console.log(`[A11][agent_log][${level}] ${message}`);
+    return { ok: true, level, message };
+  }
 };
 
 // --- Ajout: Validation stricte des noms d'actions ---
@@ -2825,6 +3179,7 @@ module.exports = {
   t_llm_analyze_text,
   t_generate_pdf,
   t_generate_png,
+  t_vision_analyze,
   t_share_file,
   t_list_stored_files,
   t_list_resources,
