@@ -5777,7 +5777,7 @@ function sanitizeEnvelopeForLatestUserIntent(envelope, messages = []) {
     return envelope;
   }
 
-  const sanitizedActions = envelope.actions
+  let sanitizedActions = envelope.actions
     .filter((entry) => ![
       'send_email',
       'email_resource',
@@ -5806,6 +5806,20 @@ function sanitizeEnvelopeForLatestUserIntent(envelope, messages = []) {
         arguments: nextArguments,
       };
     });
+
+  const hasGeneratePdf = sanitizedActions.some((entry) => String(entry?.action || '').trim() === 'generate_pdf');
+  const hasGeneratePng = sanitizedActions.some((entry) => String(entry?.action || '').trim() === 'generate_png');
+  const hasShareFile = sanitizedActions.some((entry) => String(entry?.action || '').trim() === 'share_file');
+  if ((hasGeneratePdf || hasGeneratePng) && !hasShareFile) {
+    sanitizedActions = sanitizedActions.concat({
+      action: 'share_file',
+      arguments: {
+        attachToEmail: false,
+        asAttachment: false,
+        conversationId: envelope.conversationId || undefined,
+      },
+    });
+  }
 
   return {
     ...envelope,
