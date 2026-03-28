@@ -1,5 +1,5 @@
 // --- Génération d'image via OpenAI DALL·E ---
-const fetch = require('node-fetch');
+const fetch = (...args) => import('node-fetch').then(mod => mod.default(...args));
 app.post('/api/tools/generate_png', express.json({ limit: '2mb' }), async (req, res) => {
   try {
     const prompt = String(req.body?.prompt || '').trim();
