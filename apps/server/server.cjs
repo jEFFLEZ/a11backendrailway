@@ -1,3 +1,6 @@
+// --- Express setup: always at the very top ---
+const express = require('express');
+const app = express();
 // --- Génération d'image via OpenAI DALL·E ---
 const fetch = (...args) => import('node-fetch').then(mod => mod.default(...args));
 app.post('/api/tools/generate_png', express.json({ limit: '2mb' }), async (req, res) => {
