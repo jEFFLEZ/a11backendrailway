@@ -4337,9 +4337,217 @@ app.get('/api/artifacts/my', async (req, res) => {
 });
 app.get('/', (_req, res) => res.status(200).json({ ok: true, service: 'a11-api' }));
 
-function getOpenAICompletionsUrl() {
-  const base = String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+function getOpenAICompletionsUrl(baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1') {
+  const base = String(baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '');
   return base.endsWith('/v1') ? `${base}/chat/completions` : `${base}/v1/chat/completions`;
+}
+
+function resolveRemoteProviderCatalogPath() {
+  const configuredPath = String(process.env.A11_REMOTE_PROVIDER_CATALOG_FILE || '').trim();
+  if (configuredPath) {
+    return path.isAbsolute(configuredPath)
+      ? configuredPath
+      : path.resolve(__dirname, configuredPath);
+  }
+
+  if (String(process.env.A11_LOCAL_MODE || '').trim() === '1') {
+    return path.resolve(__dirname, 'runtime', 'remote-providers.json');
+  }
+
+  return null;
+}
+
+function createEmptyRemoteProviderCatalog() {
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    profiles: [],
+  };
+}
+
+function ensureRemoteProviderCatalogDirectory(targetPath) {
+  const directory = path.dirname(targetPath);
+  fs.mkdirSync(directory, { recursive: true });
+}
+
+function readRemoteProviderCatalog() {
+  const catalogPath = resolveRemoteProviderCatalogPath();
+  if (!catalogPath) {
+    return {
+      enabled: false,
+      path: null,
+      catalog: createEmptyRemoteProviderCatalog(),
+    };
+  }
+
+  if (!fs.existsSync(catalogPath)) {
+    return {
+      enabled: true,
+      path: catalogPath,
+      catalog: createEmptyRemoteProviderCatalog(),
+    };
+  }
+
+  try {
+    const raw = fs.readFileSync(catalogPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const profiles = Array.isArray(parsed?.profiles) ? parsed.profiles : [];
+    return {
+      enabled: true,
+      path: catalogPath,
+      catalog: {
+        version: Number(parsed?.version || 1) || 1,
+        updatedAt: String(parsed?.updatedAt || '').trim() || null,
+        profiles,
+      },
+    };
+  } catch (error_) {
+    console.warn('[A11][providers] catalog read failed:', error_?.message);
+    return {
+      enabled: true,
+      path: catalogPath,
+      catalog: createEmptyRemoteProviderCatalog(),
+    };
+  }
+}
+
+function writeRemoteProviderCatalog(catalog) {
+  const catalogInfo = readRemoteProviderCatalog();
+  if (!catalogInfo.enabled || !catalogInfo.path) {
+    throw new Error('Le catalogue des IA distantes n\'est pas configure sur ce runtime.');
+  }
+
+  ensureRemoteProviderCatalogDirectory(catalogInfo.path);
+  const payload = {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    profiles: Array.isArray(catalog?.profiles) ? catalog.profiles : [],
+  };
+  fs.writeFileSync(catalogInfo.path, JSON.stringify(payload, null, 2), 'utf8');
+  return payload;
+}
+
+function sanitizeRemoteProviderProfile(profile) {
+  if (!profile || typeof profile !== 'object') return null;
+  const id = String(profile.id || '').trim();
+  const label = String(profile.label || profile.name || '').trim();
+  const baseUrl = String(profile.baseUrl || '').trim();
+  const model = String(profile.model || '').trim();
+  if (!id || !label || !baseUrl || !model) return null;
+
+  return {
+    id,
+    label,
+    baseUrl,
+    model,
+    apiKeyPresent: !!String(profile.apiKey || '').trim(),
+    createdAt: String(profile.createdAt || '').trim() || null,
+    updatedAt: String(profile.updatedAt || '').trim() || null,
+  };
+}
+
+function listRemoteProviderProfiles() {
+  const catalogInfo = readRemoteProviderCatalog();
+  const profiles = (catalogInfo.catalog?.profiles || [])
+    .map((entry) => sanitizeRemoteProviderProfile(entry))
+    .filter(Boolean);
+  return {
+    enabled: catalogInfo.enabled,
+    path: catalogInfo.path,
+    profiles,
+  };
+}
+
+function saveRemoteProviderProfile(input = {}) {
+  const label = String(input.label || '').trim();
+  const baseUrl = String(input.baseUrl || '').trim();
+  const model = String(input.model || '').trim();
+  const apiKey = String(input.apiKey || '').trim();
+  const requestedId = String(input.id || '').trim();
+
+  if (!label) throw new Error('Nom du profil requis.');
+  if (!baseUrl) throw new Error('Base URL requise.');
+  if (!model) throw new Error('Modele requis.');
+  if (!apiKey) throw new Error('Cle API requise.');
+
+  const catalogInfo = readRemoteProviderCatalog();
+  if (!catalogInfo.enabled) {
+    throw new Error('Catalogue des IA distantes indisponible sur ce runtime.');
+  }
+
+  const now = new Date().toISOString();
+  const profiles = Array.isArray(catalogInfo.catalog?.profiles)
+    ? [...catalogInfo.catalog.profiles]
+    : [];
+  const normalizedId = requestedId || `provider-${crypto.randomUUID()}`;
+  const existingIndex = profiles.findIndex((entry) => String(entry?.id || '').trim() === normalizedId);
+  const previous = existingIndex >= 0 ? profiles[existingIndex] : null;
+  const nextEntry = {
+    id: normalizedId,
+    label,
+    baseUrl,
+    model,
+    apiKey,
+    createdAt: String(previous?.createdAt || '').trim() || now,
+    updatedAt: now,
+  };
+
+  if (existingIndex >= 0) {
+    profiles[existingIndex] = nextEntry;
+  } else {
+    profiles.unshift(nextEntry);
+  }
+
+  writeRemoteProviderCatalog({ profiles });
+  return sanitizeRemoteProviderProfile(nextEntry);
+}
+
+function deleteRemoteProviderProfile(profileId) {
+  const normalizedId = String(profileId || '').trim();
+  if (!normalizedId) throw new Error('Profil introuvable.');
+
+  const catalogInfo = readRemoteProviderCatalog();
+  if (!catalogInfo.enabled) {
+    throw new Error('Catalogue des IA distantes indisponible sur ce runtime.');
+  }
+
+  const profiles = Array.isArray(catalogInfo.catalog?.profiles)
+    ? [...catalogInfo.catalog.profiles]
+    : [];
+  const nextProfiles = profiles.filter((entry) => String(entry?.id || '').trim() !== normalizedId);
+  const removed = nextProfiles.length !== profiles.length;
+  if (!removed) {
+    throw new Error('Profil distant introuvable.');
+  }
+
+  writeRemoteProviderCatalog({ profiles: nextProfiles });
+  return { ok: true, removedId: normalizedId };
+}
+
+function resolveRemoteProviderRequestConfig(body) {
+  const requestedId = String(body?.providerProfileId || '').trim();
+  if (!requestedId) return null;
+
+  const catalogInfo = readRemoteProviderCatalog();
+  const match = Array.isArray(catalogInfo.catalog?.profiles)
+    ? catalogInfo.catalog.profiles.find((entry) => String(entry?.id || '').trim() === requestedId)
+    : null;
+  if (!match) return null;
+
+  const baseUrl = String(match.baseUrl || '').trim();
+  const model = String(body?.model || match.model || '').trim();
+  const apiKey = String(match.apiKey || '').trim();
+  if (!baseUrl || !model || !apiKey) {
+    return null;
+  }
+
+  return {
+    id: requestedId,
+    label: String(match.label || requestedId).trim(),
+    baseUrl,
+    model,
+    apiKey,
+  };
 }
 
 function extractLowercaseOrigin(value) {
@@ -5052,6 +5260,7 @@ async function resolveAssistantActionEnvelope({
   userId,
   requestOrigin = '',
   executionContext = null,
+  allowedActions = null,
   messages = [],
 }) {
   const envelope = parseAssistantActionEnvelope(content, { conversationId, userId });
@@ -5080,7 +5289,10 @@ async function resolveAssistantActionEnvelope({
     };
   }
 
-  const cerbere = await runActionsEnvelope(envelope, executionContext || {});
+  const cerbere = await runActionsEnvelope(envelope, {
+    ...(executionContext || {}),
+    ...(Array.isArray(allowedActions) ? { allowedActions } : {}),
+  });
   const publicImageUrl = extractImagePathFromCerbere(cerbere, requestOrigin);
   const explanation = await generateDevActionReply({
     messages,
@@ -5289,6 +5501,28 @@ function buildDevActionResultDetails(action, result = {}) {
     };
   }
 
+  if (action === 'vision_analyze') {
+    return {
+      summary: truncateTemporalPreview(result.summary || result.description || '', 500) || undefined,
+      source: result.source && typeof result.source === 'object'
+        ? {
+            filename: String(result.source.filename || '').trim() || undefined,
+            resourceId: Number(result.source.resourceId || 0) || undefined,
+          }
+        : undefined,
+    };
+  }
+
+  if (action === 'a11_env_snapshot') {
+    const snapshot = result.snapshot && typeof result.snapshot === 'object' ? result.snapshot : result;
+    return {
+      roots: Array.isArray(snapshot.roots) ? snapshot.roots.slice(0, 4) : undefined,
+      qflushAvailable: snapshot.qflush?.available === true,
+      llmReady: snapshot.llm?.ok === true,
+      toolsCount: Array.isArray(snapshot.tools) ? snapshot.tools.length : undefined,
+    };
+  }
+
   return undefined;
 }
 
@@ -5381,6 +5615,22 @@ function buildDeterministicDevActionReply(context) {
       return `C'est fait. Le dernier fichier stocke a bien ete envoye a ${mailedLatestResult.to}.`;
     }
 
+    if (okActions.has('a11_env_snapshot')) {
+      const resourcesCount = Number(results.find((entry) => entry.action === 'list_resources')?.count || 0);
+      const filesCount = Number(results.find((entry) => entry.action === 'list_stored_files')?.count || 0);
+      return resourcesCount || filesCount
+        ? `Diagnostic rapide: le runtime A11 repond, et j'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s).`
+        : "Diagnostic rapide: le runtime A11 repond, mais je n'ai trouve aucune ressource stockee pour le moment.";
+    }
+
+    if (okActions.has('list_resources') && okActions.has('list_stored_files')) {
+      const resourcesCount = Number(results.find((entry) => entry.action === 'list_resources')?.count || 0);
+      const filesCount = Number(results.find((entry) => entry.action === 'list_stored_files')?.count || 0);
+      return resourcesCount || filesCount
+        ? `Je peux bien verifier le stockage A11. J'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s).`
+        : "Je peux verifier le stockage A11, mais je n'ai trouve aucun fichier stocke pour le moment.";
+    }
+
     if (results.length > 1) {
       return context?.imageReady
         ? "C'est fait. La demande a bien ete executee et le resultat est pret."
@@ -5405,11 +5655,18 @@ function buildDeterministicDevActionReply(context) {
         : `C'est fait. Le fichier a bien ete partage.${buildTemporaryLinkSuffix(firstResult)}`;
     }
     if (firstResult?.action === 'web_search') {
+      if (context?.imageReady) {
+        return "Voici une image trouvee sur le web.";
+      }
       return firstResult?.count
         ? `J'ai trouve ${firstResult.count} resultat${firstResult.count > 1 ? 's' : ''} sur internet.`
         : "J'ai lance la recherche sur internet.";
     }
     if (firstResult?.action === 'web_fetch') return "J'ai consulte la page demandee.";
+    if (firstResult?.action === 'vision_analyze') {
+      const summary = String(firstResult?.details?.summary || '').trim();
+      return summary || "J'ai analyse l'image demandee.";
+    }
     if (firstResult?.action === 'zip_and_email') return "C'est fait. L'archive a ete creee et envoyee.";
     if (firstResult?.action === 'list_scheduled_emails') {
       if (!firstResult?.count) return "C'est fait. Il n'y a aucun email planifie pour le moment.";
@@ -5575,7 +5832,14 @@ function getCompletionsUrlForRequest(body) {
   if (provider === 'local') {
     return getLocalCompletionsUrl();
   }
-  return getOpenAICompletionsUrl();
+  const remoteProfileBaseUrl = String(body?.providerConfig?.baseUrl || '').trim();
+  return getOpenAICompletionsUrl(remoteProfileBaseUrl || undefined);
+}
+
+function getResolvedRemoteModelForRequest(body, fallbackModel = process.env.OPENAI_MODEL || 'gpt-4o-mini') {
+  const profileModel = String(body?.providerConfig?.model || '').trim();
+  const requestedModel = String(body?.model || '').trim();
+  return requestedModel || profileModel || String(fallbackModel || 'gpt-4o-mini').trim();
 }
 
 function getQflushChatFlow() {
@@ -5733,8 +5997,9 @@ function buildOpenAIProxyHeaders(reqHeaders, options = {}) {
   delete headers['transfer-encoding'];
   delete headers['Transfer-Encoding'];
   headers['content-type'] = 'application/json';
-  if (provider !== 'local' && process.env.OPENAI_API_KEY) {
-    headers.authorization = `Bearer ${process.env.OPENAI_API_KEY}`;
+  const resolvedApiKey = String(options.apiKey || process.env.OPENAI_API_KEY || '').trim();
+  if (provider !== 'local' && resolvedApiKey) {
+    headers.authorization = `Bearer ${resolvedApiKey}`;
   }
   return headers;
 }
@@ -5870,6 +6135,7 @@ const USER_SAFE_AGENT_ACTIONS = Object.freeze([
   'download_file',
   'generate_pdf',
   'generate_png',
+  'vision_analyze',
   'share_file',
   'list_stored_files',
   'list_resources',
@@ -5884,11 +6150,20 @@ const USER_SAFE_AGENT_ACTIONS = Object.freeze([
   'cancel_scheduled_email',
   'zip_create',
   'zip_and_email',
+  'a11_env_snapshot',
 ]);
 
 const INTERNET_SAFE_AGENT_ACTIONS = Object.freeze([
   'web_search',
   'web_fetch',
+]);
+
+const CHAT_SAFE_RESOURCE_ACTIONS = Object.freeze([
+  'vision_analyze',
+  'list_resources',
+  'list_stored_files',
+  'get_latest_resource',
+  'a11_env_snapshot',
 ]);
 
 function buildRequestMessagesFromBody(body) {
@@ -5917,6 +6192,229 @@ function buildRequestMessagesFromBody(body) {
       ts: new Date().toISOString(),
     },
   ];
+}
+
+function detectConversationImageReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+
+  const asksAboutCurrentImage = /(cette image|l'image|mon image|image importee|image importé|image importee|photo importee|photo importée|capture|fichier import[eé]|fichier joint|piece jointe|pi[eè]ce jointe|dessus|sur l'image|dans l'image|que vois-tu|que voit tu|qu'y a-t-il|qu'y a t il|qui a t'il|decris|décris|analyse)/i.test(text);
+  if (!asksAboutCurrentImage) return null;
+  return 'analyser la derniere image de la conversation';
+}
+
+function detectStorageInspectionReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+  const mentionsStorage = /(bucket|r2|stocke|stocker|stockee|stocké|stockée|sauvegarde|sauvegarder|ressource stockee|fichier stocke|tes donnees|tes données)/i.test(text);
+  const asksStatus = /\?$/.test(text) || /(peux tu|tu peux|est ce que|combien|liste|montre|ou|où|verifie|v[eé]rifie)/i.test(text);
+  if (!mentionsStorage || !asksStatus) return null;
+  return 'verifier le stockage A11';
+}
+
+function detectCapabilityDiagnosticReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+  const asksDiagnostic = /(fonctionne pas|fonctionnent pas|qu['’]est ce qui|qu['’]est-ce qui|detaille|d[eé]taille|diagnostic|debug|problemes|probl[eè]mes|capacites|capacités|capabilites|capabilities)/i.test(text);
+  if (!asksDiagnostic) return null;
+  return 'diagnostiquer les capacites A11';
+}
+
+function detectWebImageLookupReason(body) {
+  const latestUserMessage = getLatestUserMessage(body || {});
+  const text = String(latestUserMessage || '').trim().toLowerCase();
+  if (!text) return null;
+  const mentionsExistingImage = detectConversationImageReason(body);
+  if (mentionsExistingImage) return null;
+  const asksToShow = /(montre|affiche|trouve|cherche|donne|fais voir|envoie)/i.test(text);
+  const wantsImage = /(image|photo|illustration|dessin|portrait|fond d['’]ecran|fond d'ecran)/i.test(text);
+  if (asksToShow && wantsImage) {
+    return 'trouver une image sur internet';
+  }
+  return null;
+}
+
+function shouldAutoUseResourceAgent(body) {
+  return !!(
+    detectConversationImageReason(body)
+    || detectStorageInspectionReason(body)
+    || detectCapabilityDiagnosticReason(body)
+  );
+}
+
+function buildDirectSafeUserEnvelope(body, { conversationId, userId } = {}) {
+  const latestUserMessage = stripDevEnginePrefix(getLatestUserMessage(body || {}));
+  if (!latestUserMessage) return null;
+
+  if (detectCapabilityDiagnosticReason(body)) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        { name: 'a11_env_snapshot', id: 'env-1', arguments: {} },
+        { name: 'list_resources', id: 'res-1', arguments: { conversationId, limit: 12 } },
+        { name: 'list_stored_files', id: 'files-1', arguments: { limit: 12 } },
+      ],
+    };
+  }
+
+  if (detectConversationImageReason(body)) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        { name: 'vision_analyze', id: 'vision-1', arguments: { conversationId, task: 'describe' } },
+      ],
+    };
+  }
+
+  if (detectStorageInspectionReason(body)) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        { name: 'list_resources', id: 'res-1', arguments: { conversationId, limit: 12 } },
+        { name: 'list_stored_files', id: 'files-1', arguments: { limit: 12 } },
+      ],
+    };
+  }
+
+  if (detectWebImageLookupReason(body)) {
+    return {
+      version: 'a11-envelope-1',
+      mode: 'actions',
+      conversationId,
+      userId,
+      actions: [
+        { name: 'web_search', id: 'img-1', arguments: { query: latestUserMessage, limit: 6 } },
+      ],
+    };
+  }
+
+  return null;
+}
+
+function buildDirectSafeUserReply(cerbere, latestUserMessage = '', imagePath = null) {
+  const results = Array.isArray(cerbere?.results) ? cerbere.results : [];
+  const first = results[0];
+  if (!first) return "Je n'ai pas pu confirmer le resultat.";
+
+  if (first.action === 'vision_analyze') {
+    return String(first?.result?.summary || '').trim() || "J'ai analyse l'image demandee.";
+  }
+
+  if (first.action === 'web_search') {
+    return imagePath
+      ? `Voici une image trouvee pour ${stripDevEnginePrefix(latestUserMessage)}.`
+      : "J'ai trouve des resultats, mais pas d'image exploitable a afficher directement.";
+  }
+
+  if (results.some((entry) => entry.action === 'a11_env_snapshot')) {
+    const envResult = results.find((entry) => entry.action === 'a11_env_snapshot')?.result || {};
+    const snapshot = envResult.snapshot && typeof envResult.snapshot === 'object' ? envResult.snapshot : envResult;
+    const resourcesCount = Number(results.find((entry) => entry.action === 'list_resources')?.result?.count || 0);
+    const filesCount = Number(results.find((entry) => entry.action === 'list_stored_files')?.result?.count || 0);
+    const issues = [];
+    if (snapshot.llm?.ok !== true) issues.push('le LLM local ne repond pas correctement');
+    if (snapshot.qflush?.available !== true) issues.push('Qflush n est pas disponible');
+    if (!issues.length) {
+      return `Diagnostic rapide: le runtime A11 repond, et j'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s).`;
+    }
+    return `Je vois surtout ces points a corriger: ${issues.join(' ; ')}. Cote stockage, j'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s).`;
+  }
+
+  if (results.some((entry) => entry.action === 'list_resources') || results.some((entry) => entry.action === 'list_stored_files')) {
+    const resourcesCount = Number(results.find((entry) => entry.action === 'list_resources')?.result?.count || 0);
+    const filesCount = Number(results.find((entry) => entry.action === 'list_stored_files')?.result?.count || 0);
+    return resourcesCount || filesCount
+      ? `Oui. J'ai retrouve ${resourcesCount} ressource(s) de conversation et ${filesCount} fichier(s) stocke(s) dans l'espace A11.`
+      : "Je peux verifier le stockage A11, mais je n'ai rien retrouve de stocke pour le moment.";
+  }
+
+  return "J'ai termine la verification demandee.";
+}
+
+function extractPreviewImageFromHtml(html, sourceUrl) {
+  const raw = String(html || '');
+  if (!raw) return '';
+  const patterns = [
+    /<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["']/i,
+    /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = raw.match(pattern);
+    const candidate = String(match?.[1] || '').trim();
+    if (!candidate) continue;
+    try {
+      return new URL(candidate, sourceUrl).toString();
+    } catch {
+      return candidate;
+    }
+  }
+
+  return '';
+}
+
+async function findPreviewImageUrlFromSearchResults(results = []) {
+  const candidates = Array.isArray(results) ? results.slice(0, 3) : [];
+  for (const entry of candidates) {
+    const pageUrl = String(entry?.url || '').trim();
+    if (!/^https?:\/\//i.test(pageUrl)) continue;
+    try {
+      const response = await fetch(pageUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        },
+        signal: AbortSignal.timeout(6000),
+      });
+      if (!response.ok) continue;
+      const html = await response.text();
+      const preview = extractPreviewImageFromHtml(html, pageUrl);
+      if (preview) return preview;
+    } catch {
+      // ignore individual preview fetch failures
+    }
+  }
+  return '';
+}
+
+async function tryRunDirectSafeUserIntent({ body, userId, conversationId, requestOrigin = '', executionContext = null }) {
+  const envelope = buildDirectSafeUserEnvelope(body, { conversationId, userId });
+  if (!envelope) return null;
+
+  const cerbere = await runActionsEnvelope(envelope, {
+    ...(executionContext || {}),
+    conversationId,
+    userId,
+    allowedActions: [...CHAT_SAFE_RESOURCE_ACTIONS, ...INTERNET_SAFE_AGENT_ACTIONS],
+  });
+  let imagePath = extractImagePathFromCerbere(cerbere, requestOrigin);
+  if (!imagePath) {
+    const webSearchResult = Array.isArray(cerbere?.results)
+      ? cerbere.results.find((entry) => entry?.action === 'web_search' && entry?.ok)
+      : null;
+    const searchResults = Array.isArray(webSearchResult?.result?.results) ? webSearchResult.result.results : [];
+    imagePath = await findPreviewImageUrlFromSearchResults(searchResults);
+  }
+  const reply = buildDirectSafeUserReply(cerbere, getLatestUserMessage(body || {}), imagePath);
+
+  return {
+    content: normalizeAssistantOutput(reply),
+    imagePath: imagePath || null,
+    cerbere,
+    envelope,
+  };
 }
 
 function detectDevModeRequiredReason(body) {
@@ -5966,8 +6464,10 @@ function detectInternetResearchReason(body) {
   const asksSearch = /(cherche|recherche|trouve|regarde|consulte|compare|verifie|vérifie|check|liste|resume|résume|explique)/i.test(text);
   const asksCurrentInfo = /(aujourd'hui|today|actuellement|en ce moment|maintenant|dernier|derniere|dernière|latest|recent|récent|récente|meteo|météo|prix|cours|score|resultat|résultat|horaire|programme|trafic|tendance|actualite|actualité|actu|news|version actuelle|derniere version|dernière version|latest version|date de sortie|sortie recente|sortie récente)/i.test(text);
   const asksQuestion = /^(qui|que|quoi|quand|quel|quelle|quels|quelles|combien|ou|où|comment|donne|montre|dis|liste|compare|resume|résume|cherche|recherche|trouve)\b/i.test(text) || /\?$/.test(text);
+  const asksImageLookup = /(montre|affiche|trouve|cherche|donne|envoie|fais voir)/i.test(text) && /(image|photo|illustration|dessin|portrait)/i.test(text);
 
   if (asksConsultUrl) return 'consulter une page web';
+  if (asksImageLookup) return 'trouver une image sur internet';
   if (mentionsInternet && asksSearch) return 'chercher sur internet';
   if (asksCurrentInfo && (asksQuestion || asksSearch)) return 'recuperer une information actuelle';
   return null;
@@ -6053,6 +6553,7 @@ async function proxyQflushChat(req, res) {
       executionContext: {
         authToken: getAuthTokenFromRequest(req),
       },
+      allowedActions: USER_SAFE_AGENT_ACTIONS,
       messages: Array.isArray(body.messages) ? body.messages : [],
     });
     const content = resolvedAssistant.content;
@@ -6135,6 +6636,7 @@ async function proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, body
       executionContext: {
         authToken: getAuthTokenFromRequest(req),
       },
+      allowedActions: USER_SAFE_AGENT_ACTIONS,
       messages: Array.isArray(body.messages) ? body.messages : [],
     });
     const content = resolvedAssistant.content;
@@ -6178,6 +6680,18 @@ async function proxyChatToOpenAI(req, res) {
   const latestUserMessage = getLatestUserMessage(req.body || {});
   const userId = String(req.user?.id || req.body?._user || '').trim();
   const conversationId = normalizeConversationId(req.body?.conversationId || req.body?.convId || req.body?.sessionId);
+  const requestedProviderProfileId = String(req.body?.providerProfileId || '').trim();
+  const remoteProviderConfig = provider === 'local'
+    ? null
+    : resolveRemoteProviderRequestConfig(req.body);
+
+  if (provider !== 'local' && requestedProviderProfileId && !remoteProviderConfig) {
+    return res.status(400).json({
+      ok: false,
+      error: 'provider_profile_not_found',
+      message: 'Le profil IA distant selectionne est introuvable ou incomplet.',
+    });
+  }
 
   if (isSiwisStatusQuestion(latestUserMessage)) {
     try {
@@ -6191,6 +6705,30 @@ async function proxyChatToOpenAI(req, res) {
       appendChatTurnLogSafe(req.body, fallback, 'a11-runtime-tts-health', userId);
       return res.status(200).json(fallback);
     }
+  }
+
+  const directSafeIntent = await tryRunDirectSafeUserIntent({
+    body: req.body || {},
+    userId,
+    conversationId,
+    requestOrigin: getRequestOrigin(req),
+    executionContext: {
+      authToken: getAuthTokenFromRequest(req),
+    },
+  });
+  if (directSafeIntent) {
+    const data = toSimpleAssistantCompletion(directSafeIntent.content, 'a11-safe-tools');
+    if (directSafeIntent.imagePath || directSafeIntent.cerbere) {
+      data.a11Agent = {
+        imagePath: directSafeIntent.imagePath || null,
+        ...(directSafeIntent.cerbere ? { results: directSafeIntent.cerbere.results } : {}),
+      };
+    }
+    if (userId && directSafeIntent.content) {
+      await saveChatMemoryMessage(userId, 'assistant', directSafeIntent.content, conversationId);
+    }
+    appendChatTurnLogSafe(req.body, data, 'a11-safe-tools', userId);
+    return res.status(200).json(data);
   }
 
   if (shouldAutoUseUserActionAgent(req.body)) {
@@ -6254,6 +6792,10 @@ async function proxyChatToOpenAI(req, res) {
   }
 
   let upstreamBody = req.body ? { ...req.body } : {};
+  if (remoteProviderConfig) {
+    upstreamBody.providerConfig = remoteProviderConfig;
+    upstreamBody.model = getResolvedRemoteModelForRequest(upstreamBody, remoteProviderConfig.model);
+  }
 
   if (userId) {
     const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);
@@ -6278,7 +6820,7 @@ async function proxyChatToOpenAI(req, res) {
     return proxyLocalLlamaCompletion(req, res, localLlamaCompletionUrl, upstreamBody);
   }
 
-  const upstreamUrl = getCompletionsUrlForRequest(req.body);
+  const upstreamUrl = getCompletionsUrlForRequest(upstreamBody);
   if (!upstreamUrl) {
     return res.status(500).json({
       ok: false,
@@ -6302,7 +6844,10 @@ async function proxyChatToOpenAI(req, res) {
     const upstreamRes = await axios({
       method: 'post',
       url: upstreamUrl,
-      headers: buildOpenAIProxyHeaders(req.headers, { provider }),
+      headers: buildOpenAIProxyHeaders(req.headers, {
+        provider,
+        apiKey: remoteProviderConfig?.apiKey || '',
+      }),
       data: upstreamBody && Object.keys(upstreamBody).length ? upstreamBody : undefined,
       timeout: 60000,
     });
@@ -6318,6 +6863,7 @@ async function proxyChatToOpenAI(req, res) {
       executionContext: {
         authToken: getAuthTokenFromRequest(req),
       },
+      allowedActions: USER_SAFE_AGENT_ACTIONS,
       messages: Array.isArray(req.body?.messages) ? req.body.messages : [],
     });
     const content = resolvedAssistant.content;
@@ -6934,6 +7480,25 @@ function extractImagePathFromCerbere(cerbere, requestOrigin = '') {
     if (r?.ok === false) {
       continue;
     }
+    if (tool === 'share_file') {
+      const sharedUrl = String(
+        r?.file?.downloadUrl ||
+        r?.file?.url ||
+        r?.conversationResource?.downloadUrl ||
+        r?.conversationResource?.url ||
+        r?.url ||
+        ''
+      ).trim();
+      if (/\.(?:png|jpe?g|gif|webp|bmp|svg)(?:[?#].*)?$/i.test(sharedUrl)) {
+        return sharedUrl;
+      }
+    }
+    if (tool === 'web_search') {
+      const firstImage = (Array.isArray(r?.results) ? r.results : []).find((entry) => entry?.isImage && typeof entry?.url === 'string' && entry.url.trim());
+      if (firstImage?.url) {
+        return String(firstImage.url).trim();
+      }
+    }
     if ((tool === 'download_file' || tool === 'generate_png' || tool === 'generate_image') && typeof p === 'string' && p.length > 0) {
       return toPublicWorkspaceFileUrl(p, requestOrigin) || p;
     }
@@ -7143,7 +7708,9 @@ app.post('/api/agent', express.json(), async (req, res) => {
     const conversationId = normalizeConversationId(body.conversationId || body.convId || body.sessionId);
     const executionContext = {
       authToken: getAuthTokenFromRequest(req),
+      providerProfileId: String(body.providerProfileId || '').trim() || null,
     };
+    const agentAllowedActions = USER_SAFE_AGENT_ACTIONS;
 
     let envelope = normalizeActionEnvelopeShape(body.envelope, {
       conversationId,
@@ -7151,12 +7718,26 @@ app.post('/api/agent', express.json(), async (req, res) => {
     });
 
     if (!envelope && Array.isArray(body.messages) && body.messages.length > 0) {
+      let agentMessages = body.messages;
+      if (userId) {
+        const latestUserMessage = getLatestUserMessageFromMessages(body.messages);
+        const memoryContext = await loadUserMemoryContext(userId, latestUserMessage, conversationId);
+        agentMessages = buildChatMessagesWithMemory(
+          body.messages,
+          memoryContext.logicalMemory,
+          memoryContext.structuredMemoryContext,
+          memoryContext.conversationResourceContext,
+          undefined
+        );
+      }
+
       const loopResult = await runA11AgentLoop({
-        messages: body.messages,
+        messages: agentMessages,
         conversationId,
         userId,
         requestOrigin: getRequestOrigin(req),
         executionContext,
+        allowedActions: agentAllowedActions,
       });
       return res.json({
         ok: true,
@@ -7183,6 +7764,7 @@ app.post('/api/agent', express.json(), async (req, res) => {
       userId,
       requestOrigin: getRequestOrigin(req),
       executionContext,
+      allowedActions: agentAllowedActions,
       messages: Array.isArray(body.messages) ? body.messages : [],
     });
 
@@ -7271,6 +7853,62 @@ app.post('/api/a11/memo', express.json(), (req, res) => {
 app.get('/api/a11/memo/all', (req, res) => {
   const entries = loadAllMemos();
   return res.json({ ok: true, entries });
+});
+
+app.get('/api/a11/providers', verifyJWT, (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required' });
+    }
+    const payload = listRemoteProviderProfiles();
+    return res.json({
+      ok: true,
+      enabled: payload.enabled,
+      profiles: payload.profiles,
+      count: payload.profiles.length,
+    });
+  } catch (e) {
+    console.error('[A11][providers] list failed:', e?.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'provider_catalog_failed',
+      message: e?.message || 'provider_catalog_failed',
+    });
+  }
+});
+
+app.post('/api/a11/providers', verifyJWT, express.json({ limit: '256kb' }), (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required' });
+    }
+    const profile = saveRemoteProviderProfile(req.body || {});
+    return res.json({ ok: true, profile });
+  } catch (e) {
+    console.error('[A11][providers] save failed:', e?.message);
+    return res.status(400).json({
+      ok: false,
+      error: 'provider_save_failed',
+      message: e?.message || 'provider_save_failed',
+    });
+  }
+});
+
+app.delete('/api/a11/providers/:id', verifyJWT, (req, res) => {
+  try {
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required' });
+    }
+    const result = deleteRemoteProviderProfile(req.params.id);
+    return res.json(result);
+  } catch (e) {
+    console.error('[A11][providers] delete failed:', e?.message);
+    return res.status(400).json({
+      ok: false,
+      error: 'provider_delete_failed',
+      message: e?.message || 'provider_delete_failed',
+    });
+  }
 });
 
 app.get('/api/a11/memo/summary', verifyJWT, (req, res) => {
