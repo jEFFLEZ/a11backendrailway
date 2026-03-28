@@ -3787,10 +3787,17 @@ app.use('/api/artifacts', verifyJWT);
 app.use('/api/resources', verifyJWT);
 app.use('/api/mail', verifyJWT);
 
+
 app.post('/api/files/upload', express.json({ limit: '20mb' }), async (req, res) => {
   try {
-    const userId = String(req.user?.id || '').trim();
-    if (!userId) return res.status(401).json({ ok: false, error: 'missing_user' });
+    let userId = String(req.user?.id || '').trim();
+    // Permettre l'appel interne (A11/Qflush) sans JWT via un header spécial
+    const isInternal = req.headers['x-internal-call'] === 'true';
+    if (!userId && isInternal) {
+      req.user = { id: 'internal-tool' };
+      userId = 'internal-tool';
+    }
+    if (!userId && !isInternal) return res.status(401).json({ ok: false, error: 'missing_user' });
 
     if (!isR2Configured()) {
       return res.status(503).json({ ok: false, error: 'r2_not_configured' });
