@@ -105,7 +105,10 @@ app.post('/api/tools/generate_sd', express.json({ limit: '2mb' }), async (req, r
     // Utilise le Python du venv si défini, sinon 'python' par défaut
     const pythonBin = process.env.SD_PYTHON_PATH || path.join(path.dirname(scriptPath), 'venv', 'Scripts', 'python.exe');
     const { randomUUID } = require('crypto');
-    const outputPath = path.join(path.dirname(scriptPath), `output_${randomUUID()}.png`);
+    const tempDir = path.join(process.cwd(), 'tmp', 'generated');
+    fs.mkdirSync(tempDir, { recursive: true });
+    const outputName = `sd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
+    const outputPath = path.join(tempDir, outputName);
     // Construit la liste d'arguments
     const args = [
       scriptPath,
