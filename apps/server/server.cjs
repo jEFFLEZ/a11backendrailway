@@ -6767,6 +6767,8 @@ function detectDownloadLinkRequestReason(body) {
   if (!text) return null;
   const asksLink = /\b(lien|link|url|telecharg|télécharg|download|recuper|récupér)\b/.test(text);
   if (!asksLink) return null;
+  const asksCreate = /\b(cr[eé]e|gen[eè]re|g[eé]n[eè]re|fabrique|produis|pr[eé]pare|fais|fait|construis|realise|r[eé]alise)\b/.test(text);
+  if (asksCreate) return null;
   const asksForExistingArtifact = /\b(pdf|image|fichier|document|archive|ressource|dernier|derni[eè]re|ce pdf|ce fichier|le pdf|l'image)\b/.test(text)
     || /^(tu as|donne|donne moi|envoie|montre)/.test(text);
   if (!asksForExistingArtifact) return null;
