@@ -8,9 +8,15 @@ const path = require('node:path');
 const fs = require('node:fs/promises');
 const childProcess = require('node:child_process');
 const util = require('node:util');
-const { assertShellAllowed, getShellAllowlistSummary } = require('../lib/safe-shell.cjs');
+const {
+  assertShellAllowed,
+  getShellAllowlistEntries,
+  getShellAllowlistSummary,
+  getShellToolName,
+} = require('../lib/safe-shell.cjs');
 
 const execAsync = util.promisify(childProcess.exec);
+const execFileAsync = util.promisify(childProcess.execFile);
 
 // =========================
 // BRIDGES & CONFIG
@@ -85,6 +91,129 @@ function setHeadlessConfig(cfg = {}) {
   console.log('[A11Host] Headless config updated:', headlessConfig);
 }
 
+const SHELL_TOOL_PROBE_TTL_MS = 30_000;
+let cachedShellRuntime = {
+  expiresAt: 0,
+  value: null,
+};
+
+function normalizeShellOutput(stdout, stderr) {
+  return [String(stdout || '').trim(), String(stderr || '').trim()]
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function looksLikeMissingExecutable(message) {
+  const normalized = String(message || '').toLowerCase();
+  return (
+    normalized.includes('not found') ||
+    normalized.includes('is not recognized as an internal or external command') ||
+    normalized.includes('command not found') ||
+    normalized.includes('enoent')
+  );
+}
+
+function buildShellUnavailableMessage(command, stderr) {
+  const tool = getShellToolName(command) || String(command || '').trim().split(/\s+/)[0] || 'outil';
+  return `La commande "${tool}" n'est pas disponible sur ce runtime A11 pour le moment.`;
+}
+
+function normalizeShellExecutionResult(command, cwd, rawResult) {
+  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
+    const stdout = String(rawResult.stdout || '');
+    const stderr = String(rawResult.stderr || '');
+    const exitCode =
+      Number.isFinite(rawResult.exitCode) ? Number(rawResult.exitCode) :
+      rawResult.ok === false ? -1 : 0;
+    const unavailable =
+      rawResult.unavailable === true ||
+      (exitCode === 127) ||
+      looksLikeMissingExecutable(stderr || rawResult.message || '');
+    const output = String(rawResult.output || normalizeShellOutput(stdout, stderr));
+    const message = String(
+      rawResult.message ||
+      (unavailable ? buildShellUnavailableMessage(command, stderr) : '')
+    ).trim();
+
+    return {
+      ok: rawResult.ok !== false,
+      command: String(rawResult.command || command || '').trim(),
+      cwd: String(rawResult.cwd || cwd || '').trim() || null,
+      exitCode,
+      stdout,
+      stderr,
+      output,
+      unavailable,
+      message: message || null,
+    };
+  }
+
+  const output = String(rawResult || '').trim();
+  return {
+    ok: true,
+    command: String(command || '').trim(),
+    cwd: String(cwd || '').trim() || null,
+    exitCode: 0,
+    stdout: output,
+    stderr: '',
+    output,
+    unavailable: false,
+    message: null,
+  };
+}
+
+async function probeShellTool(tool) {
+  const binary = String(tool || '').trim();
+  if (!binary) return false;
+
+  try {
+    if (process.platform === 'win32') {
+      await execFileAsync('where', [binary], { windowsHide: true });
+    } else {
+      await execFileAsync('sh', ['-lc', `command -v ${binary}`]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getHeadlessShellRuntime() {
+  const now = Date.now();
+  if (cachedShellRuntime.value && cachedShellRuntime.expiresAt > now) {
+    return cachedShellRuntime.value;
+  }
+
+  const entries = getShellAllowlistEntries();
+  const toolsToProbe = Array.from(new Set(entries.map((entry) => entry.tool).filter(Boolean)));
+  const toolPairs = await Promise.all(
+    toolsToProbe.map(async (tool) => [tool, await probeShellTool(tool)])
+  );
+  const tools = Object.fromEntries(toolPairs);
+  const unavailableTools = Object.entries(tools)
+    .filter(([, available]) => !available)
+    .map(([tool]) => tool);
+  const unavailableExamples = entries
+    .filter((entry) => entry.tool && tools[entry.tool] === false)
+    .map((entry) => entry.example);
+
+  const value = {
+    source: 'headless',
+    platform: process.platform,
+    probed: true,
+    tools,
+    unavailableTools,
+    unavailableExamples,
+  };
+
+  cachedShellRuntime = {
+    expiresAt: now + SHELL_TOOL_PROBE_TTL_MS,
+    value,
+  };
+  return value;
+}
+
 // =========================
 // HEADLESS HOST
 // =========================
@@ -125,8 +254,30 @@ const headlessHost = {
       headlessConfig.workspaceRoot ||
       process.cwd();
 
-    const { stdout, stderr } = await execAsync(command, { cwd });
-    return stdout + (stderr ? '\n' + stderr : '');
+    try {
+      const { stdout, stderr } = await execAsync(command, { cwd });
+      return normalizeShellExecutionResult(command, cwd, {
+        ok: true,
+        command,
+        cwd,
+        exitCode: 0,
+        stdout,
+        stderr,
+      });
+    } catch (err) {
+      return normalizeShellExecutionResult(command, cwd, {
+        ok: false,
+        command,
+        cwd,
+        exitCode: Number.isFinite(err?.code) ? Number(err.code) : -1,
+        stdout: err?.stdout || '',
+        stderr: err?.stderr || err?.message || '',
+        unavailable: looksLikeMissingExecutable(err?.stderr || err?.message || ''),
+        message: looksLikeMissingExecutable(err?.stderr || err?.message || '')
+          ? buildShellUnavailableMessage(command, err?.stderr || err?.message || '')
+          : null,
+      });
+    }
   },
 
   /**
@@ -232,6 +383,17 @@ async function getA11HostCapabilities() {
     console.warn('[A11Host] Unable to resolve workspace root for status:', error.message);
   }
 
+  const shellRuntime = a11HostBridge
+    ? {
+        source: 'vsix',
+        platform: process.platform,
+        probed: false,
+        tools: {},
+        unavailableTools: [],
+        unavailableExamples: [],
+      }
+    : await getHeadlessShellRuntime();
+
   return {
     mode: a11HostBridge ? 'vsix' : 'headless',
     bridgeConnected: !!a11HostBridge,
@@ -249,6 +411,7 @@ async function getA11HostCapabilities() {
       headless: headlessMethods
     },
     capabilities: buildCapabilityFlags(),
+    shellRuntime,
     shellPolicy: {
       whitelisted: true,
       ...getShellAllowlistSummary()
@@ -270,7 +433,9 @@ async function getA11HostStatus() {
     methods: capabilities.methods.active,
     bridgeMethods: capabilities.methods.bridge,
     headlessMethods: capabilities.methods.headless,
-    capabilities: capabilities.capabilities
+    capabilities: capabilities.capabilities,
+    shellPolicy: capabilities.shellPolicy,
+    shellRuntime: capabilities.shellRuntime,
   };
 }
 
@@ -621,9 +786,21 @@ function registerA11HostRoutes(router) {
         });
       }
       
-      const output = await callA11Host('ExecuteShell', command);
+      const cwd =
+        headlessConfig.shellCwd ||
+        headlessConfig.workspaceRoot ||
+        process.cwd();
+      const shellResult = normalizeShellExecutionResult(
+        command,
+        cwd,
+        await callA11Host('ExecuteShell', command)
+      );
       console.log(`[A11Host] ExecuteShell: ${command.substring(0, 50)}...`);
-      res.json({ ok: true, output, command });
+      res.json({
+        ok: true,
+        ...shellResult,
+        shellPolicy: getShellAllowlistSummary(),
+      });
     } catch (err) {
       console.error('[A11Host] ExecuteShell error:', err.message);
       res.status(500).json({ ok: false, error: err.message });
