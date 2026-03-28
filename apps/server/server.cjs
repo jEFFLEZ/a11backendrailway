@@ -62,14 +62,36 @@ function adoptEnvAlias(target, aliases) {
   return '';
 }
 
+function preferStrongerEnvValue(target, aliases, minLength = 1) {
+  const current = String(process.env[target] || '').trim();
+  let strongest = current;
+
+  for (const alias of aliases) {
+    const candidate = String(process.env[alias] || '').trim();
+    if (!candidate) continue;
+    if (!strongest || strongest.length < minLength || candidate.length > strongest.length) {
+      strongest = candidate;
+    }
+  }
+
+  if (strongest) {
+    process.env[target] = strongest;
+  }
+  return strongest;
+}
+
 adoptEnvAlias('PUBLIC_API_URL', ['API_URL', 'A11_SERVER_URL']);
 adoptEnvAlias('API_URL', ['PUBLIC_API_URL', 'A11_SERVER_URL']);
 adoptEnvAlias('LLM_ROUTER_URL', ['VITE_LLM_ROUTER_URL']);
 adoptEnvAlias('A11_OPENAI_BASE_URL', ['OPENAI_BASE_URL']);
 adoptEnvAlias('A11_OPENAI_MODEL', ['OPENAI_MODEL']);
-adoptEnvAlias('R2_BUCKET', ['R2_BUCKET_NAME']);
-adoptEnvAlias('R2_ACCESS_KEY', ['R2_ACCESS_KEY_ID']);
-adoptEnvAlias('R2_SECRET_KEY', ['R2_SECRET_ACCESS_KEY']);
+adoptEnvAlias('R2_BUCKET', ['R2_BUCKET_NAME', 'R2_BUCKET_ID']);
+adoptEnvAlias('R2_ACCESS_KEY', ['R2_ACCESS_KEY_ID', 'Access_Key_ID']);
+adoptEnvAlias('R2_SECRET_KEY', ['R2_SECRET_ACCESS_KEY', 'Secret_Access_Key']);
+adoptEnvAlias('CLOUDFLARE_API_TOKEN', ['TokenR2CODEX']);
+preferStrongerEnvValue('R2_BUCKET', ['R2_BUCKET_NAME', 'R2_BUCKET_ID'], 3);
+preferStrongerEnvValue('R2_ACCESS_KEY', ['R2_ACCESS_KEY_ID', 'Access_Key_ID'], 16);
+preferStrongerEnvValue('R2_SECRET_KEY', ['R2_SECRET_ACCESS_KEY', 'Secret_Access_Key'], 40);
 adoptEnvAlias('TTS_PUBLIC_BASE_URL', ['TTS_BASE_URL']);
 adoptEnvAlias('TTS_MODEL_PATH', ['MODEL_PATH']);
 adoptEnvAlias('MODEL_PATH', ['TTS_MODEL_PATH']);
