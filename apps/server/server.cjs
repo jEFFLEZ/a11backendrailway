@@ -5,6 +5,23 @@ const app = express();
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
 
+
+// --- Dépendances OpenAI ---
+let OpenAI;
+try {
+  OpenAI = require('openai');
+} catch (error_) {
+  console.warn('[A11] OpenAI SDK unavailable:', error_.message);
+  OpenAI = null;
+}
+const openaiClient = OpenAI ? new OpenAI({
+  baseURL: process.env.OPENAI_BASE_URL || (process.env.UPSTREAM_ORIGIN || 'https://api.funesterie.me') + '/v1',
+  apiKey: process.env.OPENAI_API_KEY || 'dummy',
+  defaultHeaders: {
+    'X-NEZ-TOKEN': process.env.NEZ_ALLOWED_TOKEN || process.env.NEZ_TOKENS || 'nez:a11-client-funesterie-pro'
+  }
+}) : null;
+
 // --- Routeur DEV chat (injection dépendances, wiring propre) ---
 const { detectImageIntent } = require('./lib/intent-detection.cjs');
 const { uploadBufferToR2 } = require('./lib/file-storage.cjs');
