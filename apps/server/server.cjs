@@ -872,6 +872,9 @@ const TASK_RETENTION_DAYS = Number(process.env.TASK_RETENTION_DAYS || 60);
 const FILE_RETENTION_DAYS = Number(process.env.FILE_RETENTION_DAYS || 120);
 const MEMORY_PURGE_EVERY_USER_MESSAGES = Number(process.env.MEMORY_PURGE_EVERY_USER_MESSAGES || 50);
 const DEFAULT_QFLUSH_MEMORY_SUMMARY_FLOW = 'a11.memory.summary.v1';
+const DEFAULT_QFLUSH_EPHEMERAL_MEMORY_FLOW = 'a11.memory.ephemeral.v1';
+const A11_EPHEMERAL_CHAT_TTL_SEC = Math.max(300, Number(process.env.A11_EPHEMERAL_CHAT_TTL_SEC || 2 * 60 * 60));
+const A11_EPHEMERAL_CHAT_CONTEXT_LIMIT = Math.max(2, Math.min(12, Number(process.env.A11_EPHEMERAL_CHAT_CONTEXT_LIMIT || 6)));
 const R2_ENDPOINT = String(process.env.R2_ENDPOINT || '').trim();
 const R2_ACCESS_KEY = String(process.env.R2_ACCESS_KEY || '').trim();
 const R2_SECRET_KEY = String(process.env.R2_SECRET_KEY || '').trim();
@@ -1061,8 +1064,19 @@ async function saveChatMemoryMessage(userId, role, content, conversationId) {
   const normalizedConversationId = normalizeConversationId(conversationId);
   const normalizedRole = String(role || '').trim().toLowerCase();
   const normalizedContent = typeof content === 'string' ? content.trim() : '';
-  if (!db || !normalizedUserId || !normalizedRole || !normalizedContent) return;
+  if (!normalizedUserId || !normalizedRole || !normalizedContent) return;
   if (normalizedRole === 'assistant' && looksLikeInternalPromptLeak(normalizedContent)) return;
+
+  saveEphemeralChatMemoryMessage(
+    normalizedUserId,
+    normalizedRole,
+    normalizedContent,
+    normalizedConversationId
+  ).catch((error_) => {
+    console.warn('[A11][memory] ephemeral save failed:', error_?.message);
+  });
+
+  if (!db) return;
 
   await db.query(
     'INSERT INTO messages (user_id, conversation_id, role, content) VALUES ($1, $2, $3, $4)',
@@ -1530,6 +1544,152 @@ async function saveUserFileMemory({ userId, filename, storageKey, url, contentTy
       normalizedExpiresAt,
     ]
   );
+}
+
+function getQflushEphemeralMemoryFlow() {
+  return String(process.env.QFLUSH_EPHEMERAL_MEMORY_FLOW || DEFAULT_QFLUSH_EPHEMERAL_MEMORY_FLOW).trim();
+}
+
+function buildEphemeralConversationScope(userId, conversationId) {
+  return `conversation:${String(userId || '').trim() || 'anon'}:${normalizeConversationId(conversationId)}`;
+}
+
+function buildEphemeralUserScope(userId) {
+  return `user:${String(userId || '').trim() || 'anon'}`;
+}
+
+function truncateEphemeralText(value, maxChars = 800) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+async function runEphemeralMemoryFlow(payload = {}) {
+  const flow = getQflushEphemeralMemoryFlow();
+  if (!flow) return null;
+  return await runQflushFlow(flow, payload, { admin: true });
+}
+
+async function saveEphemeralChatMemoryMessage(userId, role, content, conversationId) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedRole = String(role || '').trim().toLowerCase();
+  const normalizedContent = truncateEphemeralText(content, 1200);
+  if (!normalizedUserId || !normalizedRole || !normalizedContent) return;
+
+  const normalizedConversationId = normalizeConversationId(conversationId);
+  const timestamp = new Date().toISOString();
+  const conversationScope = buildEphemeralConversationScope(normalizedUserId, normalizedConversationId);
+  const userScope = buildEphemeralUserScope(normalizedUserId);
+
+  const writes = [
+    {
+      op: 'set',
+      namespace: 'a11',
+      scope: conversationScope,
+      key: `turn:${Date.now()}:${normalizedRole}`,
+      ttlSec: A11_EPHEMERAL_CHAT_TTL_SEC,
+      value: {
+        role: normalizedRole,
+        content: normalizedContent,
+        ts: timestamp,
+        conversationId: normalizedConversationId,
+      },
+      metadata: {
+        kind: 'chat_turn',
+        role: normalizedRole,
+      },
+    },
+    {
+      op: 'set',
+      namespace: 'a11',
+      scope: conversationScope,
+      key: `latest_${normalizedRole}_message`,
+      ttlSec: A11_EPHEMERAL_CHAT_TTL_SEC,
+      value: {
+        role: normalizedRole,
+        content: normalizedContent,
+        ts: timestamp,
+      },
+      metadata: {
+        kind: 'chat_latest',
+        role: normalizedRole,
+      },
+    },
+    {
+      op: 'set',
+      namespace: 'a11',
+      scope: userScope,
+      key: 'latest_conversation',
+      ttlSec: A11_EPHEMERAL_CHAT_TTL_SEC,
+      value: {
+        conversationId: normalizedConversationId,
+        role: normalizedRole,
+        content: normalizedContent,
+        ts: timestamp,
+      },
+      metadata: {
+        kind: 'conversation_pointer',
+      },
+    },
+  ];
+
+  await Promise.allSettled(writes.map((payload) => runEphemeralMemoryFlow(payload)));
+}
+
+function normalizeEphemeralMemoryItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const value = item.value && typeof item.value === 'object' ? item.value : {};
+  return {
+    key: String(item.key || '').trim(),
+    role: String(value.role || item.role || '').trim(),
+    content: truncateEphemeralText(value.content || item.content || '', 400),
+    ts: String(value.ts || item.updatedAt || item.createdAt || '').trim(),
+    ttlRemainingSec: Number(item.ttlRemainingSec || 0) || 0,
+  };
+}
+
+function buildEphemeralMemoryContext(items = []) {
+  const normalized = (Array.isArray(items) ? items : [])
+    .map(normalizeEphemeralMemoryItem)
+    .filter(Boolean)
+    .slice(0, A11_EPHEMERAL_CHAT_CONTEXT_LIMIT);
+
+  if (!normalized.length) return '';
+
+  const lines = [
+    'Memoire ephemere recente (court terme, TTL):',
+    '- Utiliser uniquement comme contexte temporaire recent.',
+    '- Ne pas la traiter comme une verite durable.',
+  ];
+
+  for (const item of normalized) {
+    const role = item.role || 'memo';
+    const ttlMinutes = item.ttlRemainingSec > 0 ? Math.max(1, Math.ceil(item.ttlRemainingSec / 60)) : 0;
+    const suffix = ttlMinutes ? ` (~${ttlMinutes} min)` : '';
+    lines.push(`- ${role}${suffix}: ${item.content}`);
+  }
+
+  return lines.join('\n');
+}
+
+async function listEphemeralConversationMemory(userId, conversationId, limit = A11_EPHEMERAL_CHAT_CONTEXT_LIMIT) {
+  const normalizedUserId = String(userId || '').trim();
+  if (!normalizedUserId) return [];
+  const normalizedConversationId = normalizeConversationId(conversationId);
+  try {
+    const result = await runEphemeralMemoryFlow({
+      op: 'list',
+      namespace: 'a11',
+      scope: buildEphemeralConversationScope(normalizedUserId, normalizedConversationId),
+      limit,
+    });
+    if (!result?.ok || !Array.isArray(result.items)) return [];
+    return result.items;
+  } catch (error_) {
+    console.warn('[A11][memory] ephemeral conversation list failed:', error_?.message);
+    return [];
+  }
 }
 
 function normalizeConversationResourceKind(resourceKind) {
@@ -2198,13 +2358,16 @@ function bootstrapScheduledMailJobs() {
   }
 }
 
-function buildMemorySystemMessage(logicalMemory, structuredMemoryContext, conversationResourceContext) {
+function buildMemorySystemMessage(logicalMemory, structuredMemoryContext, conversationResourceContext, ephemeralMemoryContext = '') {
   const parts = [];
   if (logicalMemory) {
     parts.push(`Contexte utilisateur (memoire logique):\n${logicalMemory}`);
   }
   if (structuredMemoryContext) {
     parts.push(structuredMemoryContext);
+  }
+  if (ephemeralMemoryContext) {
+    parts.push(ephemeralMemoryContext);
   }
   if (conversationResourceContext) {
     parts.push(conversationResourceContext);
@@ -6233,6 +6396,8 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
       conversationResources: [],
       conversationResourceContext: '',
       structuredMemoryContext: '',
+      ephemeralMemoryItems: [],
+      ephemeralMemoryContext: '',
     };
   }
 
@@ -6262,7 +6427,7 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
     });
   }
 
-  const [structuredFacts, structuredTasks, structuredFiles, conversationResources] = await Promise.all([
+  const [structuredFacts, structuredTasks, structuredFiles, conversationResources, ephemeralMemoryItems] = await Promise.all([
     getUserFacts(normalizedUserId, FACT_MEMORY_LIMIT),
     getUserTasks(normalizedUserId, TASK_MEMORY_LIMIT),
     getUserFilesMemory(normalizedUserId, FILE_MEMORY_LIMIT),
@@ -6270,6 +6435,7 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
       conversationId: normalizedConversationId,
       limit: 4,
     }),
+    listEphemeralConversationMemory(normalizedUserId, normalizedConversationId, A11_EPHEMERAL_CHAT_CONTEXT_LIMIT),
   ]);
 
   markFactsAsUsed(normalizedUserId, structuredFacts).catch((error_) => {
@@ -6284,6 +6450,8 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
     structuredFiles,
     conversationResources,
     conversationResourceContext: buildConversationResourceContext(conversationResources, { maxResources: 4 }),
+    ephemeralMemoryItems,
+    ephemeralMemoryContext: buildEphemeralMemoryContext(ephemeralMemoryItems),
     structuredMemoryContext: buildStructuredMemoryContext({
       facts: structuredFacts,
       tasks: structuredTasks,
@@ -6292,7 +6460,7 @@ async function loadUserMemoryContext(userId, latestUserMessage, conversationId) 
   };
 }
 
-function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
+function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt, ephemeralMemoryContext = '') {
   const messages = [];
   const normalizedSystemPrompt = String(systemPrompt || '').trim();
   const sanitizedBaseMessages = sanitizePromptMessages(baseMessages);
@@ -6316,7 +6484,8 @@ function buildChatMessagesWithMemory(baseMessages, logicalMemory, structuredMemo
   const memorySystemMessage = buildMemorySystemMessage(
     logicalMemory,
     structuredMemoryContext,
-    conversationResourceContext
+    conversationResourceContext,
+    ephemeralMemoryContext
   );
   if (memorySystemMessage) {
     messages.push(memorySystemMessage);
@@ -6671,13 +6840,14 @@ function shouldAutoUseInternetAgent(body) {
   return !!detectInternetResearchReason(body);
 }
 
-function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt) {
+function buildQflushMessagesWithMemory(storedMessages, logicalMemory, structuredMemoryContext, conversationResourceContext, systemPrompt, ephemeralMemoryContext = '') {
   return buildChatMessagesWithMemory(
     Array.isArray(storedMessages) ? storedMessages : [],
     logicalMemory,
     structuredMemoryContext,
     conversationResourceContext,
-    systemPrompt
+    systemPrompt,
+    ephemeralMemoryContext
   );
 }
 
@@ -6707,6 +6877,7 @@ async function proxyQflushChat(req, res) {
       conversationResources,
       conversationResourceContext,
       structuredMemoryContext,
+      ephemeralMemoryContext,
     } = memoryContext;
 
     const prompt = latestUserMessage || buildPromptFromMessages(storedMessages);
@@ -6715,7 +6886,8 @@ async function proxyQflushChat(req, res) {
       logicalMemory,
       structuredMemoryContext,
       conversationResourceContext,
-      body.systemPrompt
+      body.systemPrompt,
+      ephemeralMemoryContext
     );
 
     console.log('[A11] USING QFLUSH flow ->', qflushChatFlow);
@@ -6946,7 +7118,8 @@ async function proxyChatToOpenAI(req, res) {
         memoryContext.logicalMemory,
         memoryContext.structuredMemoryContext,
         memoryContext.conversationResourceContext,
-        req.body?.systemPrompt
+        req.body?.systemPrompt,
+        memoryContext.ephemeralMemoryContext
       );
     }
 
@@ -6999,7 +7172,8 @@ async function proxyChatToOpenAI(req, res) {
       memoryContext.logicalMemory,
       memoryContext.structuredMemoryContext,
       memoryContext.conversationResourceContext,
-      req.body?.systemPrompt
+      req.body?.systemPrompt,
+      memoryContext.ephemeralMemoryContext
     );
 
     if ((!upstreamBody.prompt || !String(upstreamBody.prompt).trim()) && upstreamBody.messages.length) {
@@ -7921,7 +8095,8 @@ app.post('/api/agent', express.json(), async (req, res) => {
           memoryContext.logicalMemory,
           memoryContext.structuredMemoryContext,
           memoryContext.conversationResourceContext,
-          undefined
+          undefined,
+          memoryContext.ephemeralMemoryContext
         );
       }
 

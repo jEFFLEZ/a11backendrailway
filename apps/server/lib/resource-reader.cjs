@@ -20,6 +20,11 @@ const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bm
 const IMAGE_OCR_ENABLED = String(process.env.IMAGE_OCR_ENABLED || 'true').trim().toLowerCase() !== 'false';
 const IMAGE_OCR_MAX_BYTES = Number(process.env.IMAGE_OCR_MAX_BYTES || 4 * 1024 * 1024);
 const IMAGE_OCR_MAX_WIDTH = Number(process.env.IMAGE_OCR_MAX_WIDTH || 1600);
+const IMAGE_OCR_MIN_WIDTH = Math.max(640, Math.min(IMAGE_OCR_MAX_WIDTH, Number(process.env.IMAGE_OCR_MIN_WIDTH || 960)));
+const IMAGE_OCR_TARGET_BYTES = Math.max(
+  512 * 1024,
+  Math.min(IMAGE_OCR_MAX_BYTES, Number(process.env.IMAGE_OCR_TARGET_BYTES || 2 * 1024 * 1024))
+);
 const IMAGE_OCR_TIMEOUT_MS = Number(process.env.IMAGE_OCR_TIMEOUT_MS || 20000);
 
 let sharpLib = null;
@@ -120,6 +125,123 @@ function promiseWithTimeout(promise, timeoutMs, code) {
       }, timeoutMs);
     }),
   ]);
+}
+
+function buildOcrResizeWidths(metadata) {
+  const sourceWidth = Number(metadata?.width || 0) || IMAGE_OCR_MAX_WIDTH;
+  const preferred = [
+    Math.min(sourceWidth, IMAGE_OCR_MAX_WIDTH),
+    1440,
+    1280,
+    1080,
+    IMAGE_OCR_MIN_WIDTH,
+    800,
+    640,
+  ];
+  return preferred
+    .map((value) => Math.max(320, Math.round(Number(value || 0))))
+    .filter((value, index, list) => value > 0 && value <= sourceWidth && list.indexOf(value) === index)
+    .filter((value) => value >= Math.min(IMAGE_OCR_MIN_WIDTH, sourceWidth) || value === sourceWidth);
+}
+
+async function prepareImageBufferForOcr(buffer) {
+  const sharp = getSharp();
+  if (!sharp) {
+    return {
+      metadata: null,
+      preparedBuffer: buffer,
+      preparedFormat: null,
+      preparedBytes: buffer.length,
+      compressedForOcr: false,
+      resizedForOcr: false,
+    };
+  }
+
+  try {
+    const probe = sharp(buffer, { failOn: 'none' });
+    const metadata = await probe.metadata();
+    const widths = buildOcrResizeWidths(metadata);
+    const jpegQualities = [84, 76, 68, 60, 52];
+
+    let best = null;
+    let bestDelta = Number.POSITIVE_INFINITY;
+
+    const buildPipeline = (width) => sharp(buffer, { failOn: 'none' })
+      .rotate()
+      .resize({
+        width,
+        withoutEnlargement: true,
+      })
+      .grayscale()
+      .normalize();
+
+    for (const width of widths) {
+      try {
+        const pngBuffer = await buildPipeline(width).png().toBuffer();
+        const delta = Math.abs(pngBuffer.length - IMAGE_OCR_TARGET_BYTES);
+        if (!best || pngBuffer.length < best.preparedBytes || delta < bestDelta) {
+          best = {
+            metadata,
+            preparedBuffer: pngBuffer,
+            preparedFormat: 'png',
+            preparedBytes: pngBuffer.length,
+            compressedForOcr: pngBuffer.length < buffer.length,
+            resizedForOcr: width < (Number(metadata?.width || 0) || width),
+          };
+          bestDelta = delta;
+        }
+        if (pngBuffer.length <= IMAGE_OCR_MAX_BYTES) return best;
+      } catch {
+        // ignore a failed encode and continue to the next candidate
+      }
+
+      for (const quality of jpegQualities) {
+        try {
+          const jpegBuffer = await buildPipeline(width)
+            .jpeg({
+              quality,
+              mozjpeg: true,
+            })
+            .toBuffer();
+          const delta = Math.abs(jpegBuffer.length - IMAGE_OCR_TARGET_BYTES);
+          if (!best || jpegBuffer.length < best.preparedBytes || delta < bestDelta) {
+            best = {
+              metadata,
+              preparedBuffer: jpegBuffer,
+              preparedFormat: 'jpeg',
+              preparedBytes: jpegBuffer.length,
+              compressedForOcr: jpegBuffer.length < buffer.length,
+              resizedForOcr: width < (Number(metadata?.width || 0) || width),
+            };
+            bestDelta = delta;
+          }
+          if (jpegBuffer.length <= IMAGE_OCR_MAX_BYTES) return best;
+        } catch {
+          // ignore a failed encode and continue to the next candidate
+        }
+      }
+    }
+
+    if (best) return best;
+
+    return {
+      metadata,
+      preparedBuffer: buffer,
+      preparedFormat: String(metadata?.format || '').trim() || null,
+      preparedBytes: buffer.length,
+      compressedForOcr: false,
+      resizedForOcr: false,
+    };
+  } catch {
+    return {
+      metadata: null,
+      preparedBuffer: buffer,
+      preparedFormat: null,
+      preparedBytes: buffer.length,
+      compressedForOcr: false,
+      resizedForOcr: false,
+    };
+  }
 }
 
 function decodePdfLiteralString(value) {
@@ -271,29 +393,9 @@ function extractPdfTextPreview(buffer) {
 }
 
 async function analyzeImageBuffer(buffer, mime) {
-  const sharp = getSharp();
-  let metadata = null;
-  let preparedBuffer = buffer;
-
-  if (sharp) {
-    try {
-      const image = sharp(buffer, { failOn: 'none' });
-      metadata = await image.metadata();
-      preparedBuffer = await image
-        .rotate()
-        .resize({
-          width: IMAGE_OCR_MAX_WIDTH,
-          withoutEnlargement: true,
-        })
-        .grayscale()
-        .normalize()
-        .png()
-        .toBuffer();
-    } catch {
-      metadata = null;
-      preparedBuffer = buffer;
-    }
-  }
+  const prepared = await prepareImageBufferForOcr(buffer);
+  const metadata = prepared.metadata;
+  const preparedBuffer = prepared.preparedBuffer || buffer;
 
   const base = {
     readableInChatContext: false,
@@ -303,6 +405,11 @@ async function analyzeImageBuffer(buffer, mime) {
     height: Number(metadata?.height || 0) || null,
     density: Number(metadata?.density || 0) || null,
     format: String(metadata?.format || mime || 'image').trim() || 'image',
+    originalBytes: buffer.length,
+    preparedBytes: Number(prepared.preparedBytes || preparedBuffer.length || buffer.length) || buffer.length,
+    preparedFormat: prepared.preparedFormat || null,
+    compressedForOcr: Boolean(prepared.compressedForOcr),
+    resizedForOcr: Boolean(prepared.resizedForOcr),
     note: 'image_recue_sans_texte_detecte',
   };
 
@@ -314,11 +421,11 @@ async function analyzeImageBuffer(buffer, mime) {
     };
   }
 
-  if (buffer.length > IMAGE_OCR_MAX_BYTES) {
+  if (preparedBuffer.length > IMAGE_OCR_MAX_BYTES) {
     return {
       ...base,
       parser: 'image_ocr_skipped_size',
-      note: 'ocr_image_ignoree_taille',
+      note: 'ocr_image_ignoree_taille_apres_optimisation',
     };
   }
 
