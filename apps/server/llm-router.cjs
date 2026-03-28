@@ -1162,8 +1162,8 @@ ${userPrompt}
   }
 });
 
-// module.exports = router pour usage dans server.cjs ou ailleurs
-module.exports = router;
+// Exporte à la fois le router et BACKENDS pour usage externe
+module.exports = { router, BACKENDS };
 
 // Ajoute la whitelist en haut du fichier
 const MODULES_WHITELIST = new Set([

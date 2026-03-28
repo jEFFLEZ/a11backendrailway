@@ -8895,7 +8895,7 @@ const a11HistoryRouter = require('./routes/a11-history.cjs');
 app.use(a11HistoryRouter);
 
 // Ajout du routeur Cerbère (llm-router.cjs)
-const llmRouter = require('./llm-router.cjs');
+const { router: llmRouter } = require('./llm-router.cjs');
 app.use(llmRouter);
 
 // Fallback: ensure server starts
