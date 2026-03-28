@@ -6140,6 +6140,10 @@ async function generateDevActionReply({ messages = [], cerbere, imagePath = null
           userRequest: context.userRequest || null,
         },
       });
+      const qflushVerificationState = extractQflushVerificationState(qflushResult);
+      if (qflushVerificationState && getA11QflushVerificationMode() !== 'pass') {
+        return fallbackReply;
+      }
       const qflushText = normalizeAssistantOutput(extractAssistantText(qflushResult));
       if (qflushText && !isUnsafeDevFollowupReply(qflushText) && !isThinDevFinalReply(qflushText)) {
         return qflushText;
@@ -6792,6 +6796,69 @@ async function findPreviewImageUrlFromSearchResults(results = []) {
   return '';
 }
 
+function getA11QflushVerificationMode() {
+  const mode = String(process.env.A11_QFLUSH_VERIFY_MODE || 'refuse').trim().toLowerCase();
+  if (mode === 'pass' || mode === 'ignore' || mode === 'off') return 'pass';
+  return 'refuse';
+}
+
+function parseQflushVerifyPrefix(text) {
+  const normalized = String(text || '').trim();
+  if (!normalized.startsWith('[QFLUSH VERIFY]')) {
+    return null;
+  }
+  const match = normalized.match(/^\[QFLUSH VERIFY\]\s*Réponse potentiellement non vérifiée:\s*(.+?)(?:\n{2,}([\s\S]*))?$/i);
+  if (!match) {
+    return {
+      flagged: true,
+      summary: 'la reponse distante a ete marquee comme non verifiee',
+      content: normalized.replace(/^\[QFLUSH VERIFY\]\s*/i, '').trim(),
+    };
+  }
+  return {
+    flagged: true,
+    summary: String(match[1] || '').trim() || 'la reponse distante a ete marquee comme non verifiee',
+    content: String(match[2] || '').trim(),
+  };
+}
+
+function extractQflushVerificationState(qflushResult) {
+  const verification = qflushResult && typeof qflushResult === 'object' && qflushResult.verification && typeof qflushResult.verification === 'object'
+    ? qflushResult.verification
+    : null;
+  const extractedText = extractAssistantText(qflushResult);
+  const prefixed = parseQflushVerifyPrefix(extractedText);
+  const suspicious = Boolean(
+    verification?.suspicious
+    || verification?.shouldBlock
+    || prefixed?.flagged
+    || (qflushResult && qflushResult.ok === false && /chat_output_verification_failed/i.test(String(qflushResult.error || '')))
+  );
+  if (!suspicious) return null;
+  return {
+    suspicious: true,
+    summary: String(
+      verification?.summary
+      || prefixed?.summary
+      || qflushResult?.message
+      || qflushResult?.error
+      || 'la reponse distante a ete marquee comme douteuse'
+    ).trim(),
+    mode: verification?.mode || qflushResult?.mode || null,
+    rawContent: String(prefixed?.content || extractedText || '').trim(),
+    verification: verification || null,
+  };
+}
+
+function buildA11QflushVerificationReply(verificationState) {
+  const summary = String(verificationState?.summary || '').trim() || 'la reponse distante a ete marquee comme douteuse';
+  return [
+    "Je prefere ne pas te donner une information incertaine.",
+    `Qflush a marque cette reponse comme non verifiee : ${summary}.`,
+    "Redemande l'action de maniere concrete, ou passe en mode DEV si tu veux une verification plus stricte.",
+  ].join(' ');
+}
+
 async function tryRunDirectSafeUserIntent({ body, userId, conversationId, requestOrigin = '', executionContext = null }) {
   const envelope = buildDirectSafeUserEnvelope(body, { conversationId, userId });
   if (!envelope) return null;
@@ -6949,6 +7016,46 @@ async function proxyQflushChat(req, res) {
       request: body
     });
 
+    const qflushVerificationState = extractQflushVerificationState(qflushResult);
+    if (qflushVerificationState && getA11QflushVerificationMode() !== 'pass') {
+      const content = buildA11QflushVerificationReply(qflushVerificationState);
+      if (userId && content) {
+        await saveChatMemoryMessage(userId, 'assistant', content, conversationId);
+      }
+
+      const data = {
+        id: `chatcmpl-qflush-${Date.now()}`,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: body.model || 'qflush',
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content,
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        memory: {
+          userId: userId || null,
+          historyCount: storedMessages.length,
+          logicalSummary: logicalMemory || null,
+          factsCount: structuredFacts.length,
+          tasksCount: structuredTasks.length,
+          filesCount: structuredFiles.length,
+          conversationResourcesCount: conversationResources.length,
+          historyLimit: CHAT_MEMORY_LIMIT,
+        },
+        qflush: qflushResult,
+        qflushVerification: qflushVerificationState,
+      };
+
+      appendChatTurnLogSafe(body, data, 'qflush', userId);
+      return res.status(200).json(data);
+    }
+
     const rawContent = extractAssistantText(qflushResult);
     const resolvedAssistant = await resolveAssistantActionEnvelope({
       content: rawContent,
@@ -6990,10 +7097,13 @@ async function proxyQflushChat(req, res) {
         tasksCount: structuredTasks.length,
         filesCount: structuredFiles.length,
         conversationResourcesCount: conversationResources.length,
-        historyLimit: CHAT_MEMORY_LIMIT,
-      },
+      historyLimit: CHAT_MEMORY_LIMIT,
+    },
       qflush: qflushResult,
     };
+    if (qflushVerificationState) {
+      data.qflushVerification = qflushVerificationState;
+    }
     if (resolvedAssistant.extras) {
       data.a11Agent = resolvedAssistant.extras;
     }
