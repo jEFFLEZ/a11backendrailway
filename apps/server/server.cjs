@@ -74,11 +74,6 @@ adoptEnvAlias('TTS_PUBLIC_BASE_URL', ['TTS_BASE_URL']);
 adoptEnvAlias('TTS_MODEL_PATH', ['MODEL_PATH']);
 adoptEnvAlias('MODEL_PATH', ['TTS_MODEL_PATH']);
 
-// DEBUG: log Nez env vars
-console.log('[NEZ ENV] NEZ_TOKENS=', process.env.NEZ_TOKENS);
-console.log('[NEZ ENV] NEZ_ADMIN_TOKEN=', process.env.NEZ_ADMIN_TOKEN);
-console.log('[NEZ ENV] NEZ_ALLOWED_TOKEN=', process.env.NEZ_ALLOWED_TOKEN);
-
 // Ensure runtime configuration defaults are set to avoid ReferenceErrors
 const CTX_SIZE = Number(process.env.CTX_SIZE) || 8192;
 const BATCH_SIZE = Number(process.env.BATCH_SIZE) || 4096;
