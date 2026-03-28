@@ -5686,7 +5686,9 @@ async function resolveAssistantActionEnvelope({
     };
   }
 
-  const cerbere = await runActionsEnvelope(envelope, {
+  const sanitizedEnvelope = sanitizeEnvelopeForLatestUserIntent(envelope, messages);
+
+  const cerbere = await runActionsEnvelope(sanitizedEnvelope, {
     ...(executionContext || {}),
     ...(Array.isArray(allowedActions) ? { allowedActions } : {}),
   });
@@ -5699,9 +5701,9 @@ async function resolveAssistantActionEnvelope({
 
   appendConversationLog({
     type: 'agent_actions',
-    userId: String(userId || envelope.userId || '').trim() || null,
-    conversationId: envelope.conversationId || normalizeConversationId(conversationId),
-    envelope,
+    userId: String(userId || sanitizedEnvelope.userId || '').trim() || null,
+    conversationId: sanitizedEnvelope.conversationId || normalizeConversationId(conversationId),
+    envelope: sanitizedEnvelope,
     explanation,
     imagePath: publicImageUrl,
     cerbere,
@@ -5709,7 +5711,7 @@ async function resolveAssistantActionEnvelope({
 
   return {
     content: explanation,
-    envelope,
+    envelope: sanitizedEnvelope,
     blocked: false,
     executed: true,
     cerbere,
@@ -5747,6 +5749,68 @@ function getLatestUserMessageFromMessages(messages) {
     }
   }
   return '';
+}
+
+function userRequestMentionsEmailDelivery(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return false;
+  return /@/.test(text) || /\b(mail|email|e-mail|envoy[ea]|envoi|transmets|adresse mail)\b/.test(text);
+}
+
+function userRequestMentionsDownloadLink(value) {
+  const text = String(value || '').trim().toLowerCase();
+  if (!text) return false;
+  return /\b(lien|link|telecharg|télécharg|download|recuper|récupér)\b/.test(text);
+}
+
+function sanitizeEnvelopeForLatestUserIntent(envelope, messages = []) {
+  if (!envelope || envelope.mode !== 'actions' || !Array.isArray(envelope.actions)) {
+    return envelope;
+  }
+
+  const latestUserMessage = getLatestUserMessageFromMessages(messages);
+  if (!latestUserMessage) return envelope;
+
+  const asksEmail = userRequestMentionsEmailDelivery(latestUserMessage);
+  const asksDownloadLink = userRequestMentionsDownloadLink(latestUserMessage);
+  if (!asksDownloadLink || asksEmail) {
+    return envelope;
+  }
+
+  const sanitizedActions = envelope.actions
+    .filter((entry) => ![
+      'send_email',
+      'email_resource',
+      'email_latest_resource',
+      'schedule_email',
+      'schedule_resource_email',
+      'schedule_latest_resource_email',
+      'zip_and_email',
+    ].includes(String(entry?.action || '').trim()))
+    .map((entry) => {
+      if (String(entry?.action || '').trim() !== 'share_file') {
+        return entry;
+      }
+      const nextArguments = { ...(entry.arguments || {}) };
+      delete nextArguments.to;
+      delete nextArguments.emailTo;
+      delete nextArguments.email;
+      delete nextArguments.recipient;
+      delete nextArguments.recipients;
+      delete nextArguments.emailSubject;
+      delete nextArguments.emailMessage;
+      nextArguments.attachToEmail = false;
+      nextArguments.asAttachment = false;
+      return {
+        ...entry,
+        arguments: nextArguments,
+      };
+    });
+
+  return {
+    ...envelope,
+    actions: sanitizedActions,
+  };
 }
 
 function isThinDevFinalReply(value) {
