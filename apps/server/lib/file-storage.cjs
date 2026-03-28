@@ -192,6 +192,7 @@ function createFileStorage(config = {}) {
     buildStorageKey,
     getPublicUrl,
     uploadBuffer,
+    uploadBufferToR2: uploadBuffer, // Alias for compatibility
     downloadBuffer,
     deleteObject,
     sanitizeFileName,
