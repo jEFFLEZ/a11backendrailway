@@ -50,6 +50,7 @@ function buildRuntimeConfig(env = process.env) {
     qflush: {
       remoteUrl: qflushRemoteUrl,
       memorySummaryFlow: String(env.QFLUSH_MEMORY_SUMMARY_FLOW || 'a11.memory.summary.v1').trim(),
+      ephemeralMemoryFlow: String(env.QFLUSH_EPHEMERAL_MEMORY_FLOW || 'a11.memory.ephemeral.v1').trim(),
       chatFlow: String(env.QFLUSH_CHAT_FLOW || '').trim(),
       manageTts: toBoolean(env.MANAGE_TTS),
     },
@@ -110,6 +111,7 @@ function getPublicRuntimeStatus(options = {}) {
         remoteUrl: config.qflush.remoteUrl || null,
         chatFlow: config.qflush.chatFlow || null,
         memorySummaryFlow: config.qflush.memorySummaryFlow || null,
+        ephemeralMemoryFlow: config.qflush.ephemeralMemoryFlow || null,
         manageTts: config.qflush.manageTts,
       },
     },

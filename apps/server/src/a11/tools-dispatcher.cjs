@@ -1496,7 +1496,75 @@ async function t_qflush_flow(args = {}) {
   if (!flow || typeof flow !== 'string') {
     throw new Error('qflush_flow: missing "flow"');
   }
-  return await runQflushFlow(flow, payload || {});
+  return await runQflushFlow(flow, payload || {}, {
+    admin: args.admin === true,
+  });
+}
+
+function resolveQflushMemoryScope(args = {}) {
+  const context = args._context || {};
+  const explicitScope = String(args.scope || '').trim();
+  if (explicitScope) return explicitScope;
+  const conversationId = String(
+    args.conversationId ||
+    args.convId ||
+    args.sessionId ||
+    context.conversationId ||
+    ''
+  ).trim();
+  if (conversationId) return `conversation:${conversationId}`;
+  const userId = String(args.userId || context.userId || '').trim();
+  if (userId) return `user:${userId}`;
+  return 'shared';
+}
+
+function resolveQflushMemoryNamespace(args = {}) {
+  return String(args.namespace || 'a11').trim() || 'a11';
+}
+
+async function runQflushMemoryOperation(op, args = {}) {
+  return await runQflushFlow('a11.memory.ephemeral.v1', {
+    op,
+    key: args.key,
+    value: args.value,
+    ttlSec: args.ttlSec ?? args.ttl ?? args.expiresInSec,
+    scope: resolveQflushMemoryScope(args),
+    namespace: resolveQflushMemoryNamespace(args),
+    prefix: args.prefix,
+    limit: args.limit,
+    metadata: args.metadata,
+  }, {
+    admin: true,
+  });
+}
+
+async function t_qflush_memory_write(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_write: missing "key"');
+  }
+  return await runQflushMemoryOperation('set', args);
+}
+
+async function t_qflush_memory_read(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_read: missing "key"');
+  }
+  return await runQflushMemoryOperation('get', args);
+}
+
+async function t_qflush_memory_list(args = {}) {
+  return await runQflushMemoryOperation('list', args);
+}
+
+async function t_qflush_memory_delete(args = {}) {
+  if (!String(args.key || '').trim()) {
+    throw new Error('qflush_memory_delete: missing "key"');
+  }
+  return await runQflushMemoryOperation('delete', args);
+}
+
+async function t_qflush_memory_clear(args = {}) {
+  return await runQflushMemoryOperation('clear', args);
 }
 
 // FS
@@ -2719,6 +2787,21 @@ function normalizeDispatchActionName(name) {
   if (lowered === 'email_file' || lowered === 'mail_file' || lowered === 'share_and_email_file') {
     return 'share_file';
   }
+  if (lowered === 'qflush_memory_write' || lowered === 'qflush_memory_set' || lowered === 'memory_ephemeral_write') {
+    return 'qflush_memory_write';
+  }
+  if (lowered === 'qflush_memory_read' || lowered === 'qflush_memory_get' || lowered === 'memory_ephemeral_read') {
+    return 'qflush_memory_read';
+  }
+  if (lowered === 'qflush_memory_list' || lowered === 'memory_ephemeral_list') {
+    return 'qflush_memory_list';
+  }
+  if (lowered === 'qflush_memory_delete' || lowered === 'memory_ephemeral_delete') {
+    return 'qflush_memory_delete';
+  }
+  if (lowered === 'qflush_memory_clear' || lowered === 'memory_ephemeral_clear') {
+    return 'qflush_memory_clear';
+  }
 
   return normalized;
 }
@@ -2898,6 +2981,11 @@ function normalizeDispatchActionArgs(actionName, rawArgs = {}) {
 const TOOL_IMPL = {
   // QFlush
   qflush_flow: t_qflush_flow,
+  qflush_memory_write: t_qflush_memory_write,
+  qflush_memory_read: t_qflush_memory_read,
+  qflush_memory_list: t_qflush_memory_list,
+  qflush_memory_delete: t_qflush_memory_delete,
+  qflush_memory_clear: t_qflush_memory_clear,
 
   // FS
   fs_read: t_fs_read,
@@ -3163,6 +3251,11 @@ module.exports = {
   t_a11_memory_history,
   t_download_file,
   t_qflush_flow,
+  t_qflush_memory_write,
+  t_qflush_memory_read,
+  t_qflush_memory_list,
+  t_qflush_memory_delete,
+  t_qflush_memory_clear,
   t_fs_read,
   t_fs_write,
   t_write_file,

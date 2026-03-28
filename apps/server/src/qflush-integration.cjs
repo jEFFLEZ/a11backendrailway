@@ -471,14 +471,32 @@ async function initQflush(options = {}) {
  * @param {object} payload - Arguments for the flow
  * @returns {Promise<object>} Result of the flow
  */
-async function runQflushFlow(flow, payload) {
+function getQflushRemoteToken() {
+  return String(
+    process.env.QFLUSH_TOKEN ||
+    process.env.QFLUSH_REMOTE_TOKEN ||
+    process.env.NPZ_ADMIN_TOKEN ||
+    ''
+  ).trim();
+}
+
+async function runQflushFlow(flow, payload, options = {}) {
   const remoteUrl = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL;
   if (remoteUrl) {
     // Use remote qflush service
     try {
-      const response = await fetch(`${remoteUrl}/run`, {
+      const remoteToken = getQflushRemoteToken();
+      const endpointPath = options.admin === true ? '/api/admin/run' : '/run';
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      if (remoteToken) {
+        headers['Authorization'] = `Bearer ${remoteToken}`;
+        headers['x-qflush-token'] = remoteToken;
+      }
+      const response = await fetch(`${String(remoteUrl).replace(/\/+$/, '')}${endpointPath}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ flow, payload })
       });
       if (!response.ok) {
