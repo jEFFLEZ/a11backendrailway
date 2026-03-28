@@ -35,7 +35,8 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
         return res.status(500).json({ ok: false, error: 'missing_script' });
       }
       const pythonBin = getPythonBin(scriptPath);
-      const outputPath = path.join(path.dirname(scriptPath), 'output.png');
+      const { randomUUID } = require('crypto');
+      const outputPath = path.join(path.dirname(scriptPath), `output_${randomUUID()}.png`);
       const args = [scriptPath, '--prompt', prompt, '--output', outputPath];
       const py = spawn(pythonBin, args, { cwd: path.dirname(scriptPath) });
       let stdout = Buffer.alloc(0);
@@ -62,6 +63,12 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
           return res.status(500).json({ ok: false, error: 'bad_python_output', raw: stdout.toString() });
         }
         if (!outputJson?.ok || !outputJson?.output_path || !fs.existsSync(outputJson.output_path)) {
+          // LOGS DIAGNOSTIC AVANT no_image
+          console.error('[no_image] stdout:', stdout.toString());
+          console.error('[no_image] stderr:', stderr.toString());
+          console.error('[no_image] outputJson:', outputJson);
+          console.error('[no_image] output_path:', outputJson?.output_path);
+          console.error('[no_image] existsSync:', outputJson?.output_path ? fs.existsSync(outputJson.output_path) : 'no path');
           return res.status(500).json({ ok: false, error: 'no_image', raw: outputJson });
         }
         try {

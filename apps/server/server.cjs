@@ -104,7 +104,8 @@ app.post('/api/tools/generate_sd', express.json({ limit: '2mb' }), async (req, r
 
     // Utilise le Python du venv si défini, sinon 'python' par défaut
     const pythonBin = process.env.SD_PYTHON_PATH || path.join(path.dirname(scriptPath), 'venv', 'Scripts', 'python.exe');
-    const outputPath = path.join(path.dirname(scriptPath), 'output.png');
+    const { randomUUID } = require('crypto');
+    const outputPath = path.join(path.dirname(scriptPath), `output_${randomUUID()}.png`);
     // Construit la liste d'arguments
     const args = [
       scriptPath,
@@ -138,6 +139,12 @@ app.post('/api/tools/generate_sd', express.json({ limit: '2mb' }), async (req, r
         return res.status(500).json({ ok: false, error: 'bad_python_output', message: 'Sortie Python non JSON', raw: stdout.toString() });
       }
       if (!outputJson?.ok || !outputJson?.output_path || !fs.existsSync(outputJson.output_path)) {
+        // LOGS DIAGNOSTIC AVANT no_image
+        console.error('[no_image] stdout:', stdout.toString());
+        console.error('[no_image] stderr:', stderr.toString());
+        console.error('[no_image] outputJson:', outputJson);
+        console.error('[no_image] output_path:', outputJson?.output_path);
+        console.error('[no_image] existsSync:', outputJson?.output_path ? fs.existsSync(outputJson.output_path) : 'no path');
         return res.status(500).json({ ok: false, error: 'no_image', message: 'Aucune image générée', raw: outputJson });
       }
       try {
@@ -155,6 +162,7 @@ app.post('/api/tools/generate_sd', express.json({ limit: '2mb' }), async (req, r
         return res.json({
           ok: true,
           url: uploadResult.url || null,
+          image_url: uploadResult.url || null, // Pour compatibilité frontend
           filename,
           prompt,
           negative_prompt,
