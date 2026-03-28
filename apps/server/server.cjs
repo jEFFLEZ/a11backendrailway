@@ -57,9 +57,7 @@ app.post('/api/tools/generate_png', express.json({ limit: '2mb' }), async (req, 
     return res.status(500).json({ ok: false, error: 'internal_error', message: String(e?.message) });
   }
 });
-// --- Express setup: always at the very top ---
-const express = require('express');
-const app = express();
+
 
 // --- Endpoint de healthcheck Railway ---
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
