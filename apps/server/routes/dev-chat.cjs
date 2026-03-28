@@ -36,7 +36,8 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
       }
       const pythonBin = getPythonBin(scriptPath);
       const { randomUUID } = require('crypto');
-      const tempDir = path.join(process.cwd(), 'tmp', 'generated');
+      const isProd = process.env.NODE_ENV === 'production';
+      const tempDir = isProd ? '/tmp/a11-images' : path.join(process.cwd(), 'tmp', 'generated');
       fs.mkdirSync(tempDir, { recursive: true });
       const outputName = `sd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.png`;
       const outputPath = path.join(tempDir, outputName);
