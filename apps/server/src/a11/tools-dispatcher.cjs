@@ -150,6 +150,14 @@ function guessContentType(filePath) {
   }
 }
 
+function extractShareFileDownloadUrl(result = {}) {
+  return String(
+    result?.file?.downloadUrl
+    || result?.conversationResource?.downloadUrl
+    || ''
+  ).trim();
+}
+
 async function fetchInternalJson(pathname, options = {}, context = {}) {
   const authToken = getAuthTokenFromContext(context);
   if (!authToken) {
@@ -1032,6 +1040,15 @@ async function t_share_file(args = {}) {
   }, context);
 
   if (result?.ok) {
+    const publicDownloadUrl = extractShareFileDownloadUrl(result);
+    if (!publicDownloadUrl) {
+      return {
+        ok: false,
+        path: fullPath,
+        error: 'public_download_url_missing',
+        detail: result,
+      };
+    }
     return {
       ok: true,
       path: fullPath,
@@ -1039,13 +1056,13 @@ async function t_share_file(args = {}) {
       mail: result.mail || null,
       record: result.record || null,
       conversationResource: result.conversationResource || null,
-      url: result?.file?.downloadUrl || result?.file?.url || result?.conversationResource?.downloadUrl || result?.conversationResource?.url || '',
+      url: publicDownloadUrl,
       expiresAt: result?.file?.expiresAt || result?.conversationResource?.expiresAt || null,
     };
   }
 
   const errorCode = String(result?.error || result?.message || '').trim();
-  const storageLikelyFailed = /r2_|upload_failed|signature|storage/i.test(errorCode)
+  const storageLikelyFailed = /r2_|upload_failed|signature|storage|public_download_url_missing/i.test(errorCode)
     || /signature/i.test(String(result?.detail?.message || result?.detail?.error || ''));
   if (recipients.length && storageLikelyFailed) {
     const mailFallback = await t_send_email({
@@ -1937,7 +1954,13 @@ async function t_llm_analyze_text(args = {}) {
 
 // Helper pour charger une image (URL, path, ou ressource de conversation)
 async function loadImageBuffer(ref, options = {}) {
-  if (!ref || typeof ref !== 'string') return null;
+  if (!ref || typeof ref !== 'string') {
+    return {
+      ok: false,
+      ref: String(ref || '').trim(),
+      error: 'image_ref_missing',
+    };
+  }
 
   // URL HTTP/HTTPS
   if (/^https?:\/\//i.test(ref)) {
@@ -1945,21 +1968,47 @@ async function loadImageBuffer(ref, options = {}) {
       const r = await fetch(ref);
       if (!r.ok) {
         console.warn('[generate_pdf] image URL failed:', ref, r.status);
-        return null;
+        return {
+          ok: false,
+          ref,
+          error: 'image_url_unavailable',
+          status: Number(r.status || 0) || null,
+        };
       }
       const ab = await r.arrayBuffer();
-      return Buffer.from(ab);
+      return {
+        ok: true,
+        ref,
+        source: 'url',
+        buffer: Buffer.from(ab),
+      };
     } catch (e) {
       console.warn('[generate_pdf] image URL error:', ref, e && e.message);
-      return null;
+      return {
+        ok: false,
+        ref,
+        error: 'image_url_fetch_failed',
+        detail: e && e.message ? String(e.message) : String(e || ''),
+      };
     }
   }
 
   if (/^\/api\//i.test(ref)) {
     const downloaded = await fetchInternalBuffer(ref, { method: 'GET' }, options.context || {});
     if (downloaded?.ok && downloaded.buffer) {
-      return downloaded.buffer;
+      return {
+        ok: true,
+        ref,
+        source: 'api',
+        buffer: downloaded.buffer,
+      };
     }
+    return {
+      ok: false,
+      ref,
+      error: 'image_api_unavailable',
+      detail: String(downloaded?.error || downloaded?.status || 'unknown'),
+    };
   }
 
   // Chemin local
@@ -1969,7 +2018,13 @@ async function loadImageBuffer(ref, options = {}) {
   }
 
   try {
-    return await fsp.readFile(filePath);
+    return {
+      ok: true,
+      ref,
+      source: 'path',
+      resolvedPath: filePath,
+      buffer: await fsp.readFile(filePath),
+    };
   } catch (e) {
     const matchedResource = await resolveStoredConversationResource(ref, options).catch(() => null);
     if (matchedResource?.id) {
@@ -1977,7 +2032,14 @@ async function loadImageBuffer(ref, options = {}) {
         method: 'GET',
       }, options.context || {});
       if (downloaded?.ok && downloaded.buffer) {
-        return downloaded.buffer;
+        return {
+          ok: true,
+          ref,
+          source: 'conversation_resource',
+          resourceId: matchedResource.id,
+          resolvedPath: `/api/resources/${matchedResource.id}/download`,
+          buffer: downloaded.buffer,
+        };
       }
       console.warn('[generate_pdf] stored image download failed:', matchedResource.id, downloaded?.error || downloaded?.status || 'unknown');
     }
@@ -1987,7 +2049,13 @@ async function loadImageBuffer(ref, options = {}) {
         const remote = await fetch(String(matchedFile.url));
         if (remote.ok) {
           const arrayBuffer = await remote.arrayBuffer();
-          return Buffer.from(arrayBuffer);
+          return {
+            ok: true,
+            ref,
+            source: 'stored_file_url',
+            resolvedPath: String(matchedFile.url),
+            buffer: Buffer.from(arrayBuffer),
+          };
         }
         console.warn('[generate_pdf] stored file image URL failed:', matchedFile.url, remote.status);
       } catch (remoteError) {
@@ -1995,7 +2063,13 @@ async function loadImageBuffer(ref, options = {}) {
       }
     }
     console.warn('[generate_pdf] image file not found:', filePath);
-    return null;
+    return {
+      ok: false,
+      ref,
+      error: 'image_not_found',
+      resolvedPath: filePath,
+      detail: e && e.message ? String(e.message) : '',
+    };
   }
 }
 
@@ -2030,6 +2104,55 @@ async function t_generate_pdf(args = {}) {
   author = author || "Auteur: Anonyme";
   date = date || new Date().toLocaleDateString();
   sections = Array.isArray(sections) ? sections : [];
+  const failOnMissingImages = (
+    args.allowMissingImages !== true
+    && args.skipMissingImages !== true
+    && args.strictImages !== false
+    && args.strictAssets !== false
+  );
+  const missingAssets = [];
+  const preparedSections = [];
+
+  for (let idx = 0; idx < sections.length; idx++) {
+    const section = sections[idx] || {};
+    const heading = section.heading || section.title || `Section ${idx + 1}`;
+    const text = section.text || section.content || "";
+    const images = Array.isArray(section.images) ? section.images : [];
+    const resolvedImages = [];
+
+    for (const ref of images) {
+      const imageResult = await loadImageBuffer(ref, {
+        context,
+        conversationId,
+        resourceCache,
+      });
+      if (!imageResult?.ok || !Buffer.isBuffer(imageResult.buffer)) {
+        missingAssets.push({
+          sectionIndex: idx,
+          heading,
+          ref: String(ref || '').trim(),
+          error: String(imageResult?.error || 'image_not_found'),
+          resolvedPath: String(imageResult?.resolvedPath || '').trim() || null,
+          detail: String(imageResult?.detail || '').trim() || null,
+        });
+        continue;
+      }
+      resolvedImages.push(imageResult);
+    }
+
+    preparedSections.push({
+      heading,
+      text,
+      images: resolvedImages,
+    });
+  }
+
+  if (missingAssets.length && failOnMissingImages) {
+    const error = new Error(`generate_pdf_missing_assets: ${missingAssets.map((entry) => entry.ref).join(', ')}`);
+    error.code = 'generate_pdf_missing_assets';
+    error.missingAssets = missingAssets;
+    throw error;
+  }
 
   const doc = new PDFDocument({ margin: 50 });
   const stream = fs.createWriteStream(outputPath);
@@ -2062,10 +2185,10 @@ async function t_generate_pdf(args = {}) {
   doc.addPage();
 
   // ----------- Sections -----------
-  for (let idx = 0; idx < sections.length; idx++) {
-    const section = sections[idx];
-    const heading = section.heading || section.title || `Section ${idx + 1}`;
-    const text = section.text || section.content || "";
+  for (let idx = 0; idx < preparedSections.length; idx++) {
+    const section = preparedSections[idx];
+    const heading = section.heading;
+    const text = section.text;
     const images = Array.isArray(section.images) ? section.images : [];
 
     doc.fontSize(18).fillColor('#2563eb').font("Helvetica-Bold").text(heading, { align: "left" }).moveDown(1);
@@ -2073,13 +2196,8 @@ async function t_generate_pdf(args = {}) {
       doc.fontSize(12).fillColor('#111827').font("Helvetica").text(text, { align: "left" }).moveDown(1);
     }
     // Images centrées
-    for (const ref of images) {
-      const buf = await loadImageBuffer(ref, {
-        context,
-        conversationId,
-        resourceCache,
-      });
-      if (!buf) continue;
+    for (const image of images) {
+      const buf = image.buffer;
       const maxWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
       doc.moveDown(0.5).image(buf, {
         fit: [maxWidth * 0.8, 250],
@@ -2103,7 +2221,9 @@ async function t_generate_pdf(args = {}) {
 
   return {
     ok: true,
-    outputPath
+    outputPath,
+    imageCount: preparedSections.reduce((total, section) => total + (Array.isArray(section.images) ? section.images.length : 0), 0),
+    missingAssets,
   };
 }
 
