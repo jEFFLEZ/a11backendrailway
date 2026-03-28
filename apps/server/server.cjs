@@ -1,3 +1,22 @@
+// --- ADMIN: POST /api/admin/run ---
+app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
+  try {
+    // Vérification admin stricte (token header)
+    if (!isAdminRequest(req)) {
+      return res.status(403).json({ ok: false, error: 'admin_required', message: 'Accès réservé à l’admin.' });
+    }
+    const { flow, payload } = req.body || {};
+    if (!flow || typeof flow !== 'string') {
+      return res.status(400).json({ ok: false, error: 'missing_flow', message: 'Champ "flow" requis.' });
+    }
+    // Exécution du flow Qflush en mode admin
+    const result = await runQflushFlow(flow, payload || {}, { admin: true });
+    return res.json({ ok: true, result });
+  } catch (e) {
+    console.error('[A11][admin/run] error:', e?.message);
+    return res.status(500).json({ ok: false, error: String(e?.message) });
+  }
+});
 
 // --- Express setup: always at the very top ---
 const express = require('express');
