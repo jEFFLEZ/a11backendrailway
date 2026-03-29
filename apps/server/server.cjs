@@ -1,3 +1,7 @@
+
+// --- Express setup: always at the very top ---
+const express = require('express');
+const app = express();
 // --- ADMIN: POST /api/admin/run ---
 app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
   try {
@@ -17,10 +21,6 @@ app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
     return res.status(500).json({ ok: false, error: String(e?.message) });
   }
 });
-
-// --- Express setup: always at the very top ---
-const express = require('express');
-const app = express();
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
 
