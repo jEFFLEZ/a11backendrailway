@@ -20,6 +20,13 @@ app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
     console.error('[A11][admin/run] error:', e?.message);
     return res.status(500).json({ ok: false, error: String(e?.message) });
   }
+    } catch (e) {
+      console.error('[A11][admin/run] error:', e?.message);
+      return res.status(500).json({ ok: false, error: String(e?.message) });
+    }
+    // ...existing code...
+    // (Fixed malformed log statement or removed if not needed)
+    // ...existing code...
 });
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
@@ -7452,7 +7459,8 @@ async function proxyQflushChat(req, res) {
       ephemeralMemoryContext
     );
 
-    console.log('[A11] USING QFLUSH flow ->', qflushChatFlow);
+    const qflushUrl = process.env.QFLUSH_URL || process.env.QFLUSH_REMOTE_URL || 'not_set';
+    console.log('[A11] USING QFLUSH flow ->', qflushChatFlow, '| QFLUSH_URL =', qflushUrl);
     const qflushResult = await runQflushFlow(qflushChatFlow, {
       prompt,
       messages: qflushMessages,
@@ -7470,6 +7478,7 @@ async function proxyQflushChat(req, res) {
       user: req.user || null,
       request: body
     });
+    console.log('[A11][QFLUSH][DEBUG] Qflush raw result:', JSON.stringify(qflushResult)?.slice(0, 1000));
 
     const qflushVerificationState = extractQflushVerificationState(qflushResult);
     if (qflushVerificationState && getA11QflushVerificationMode() !== 'pass') {
