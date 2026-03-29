@@ -32,7 +32,8 @@ module.exports = function({ app, openaiClient, uploadBufferToR2, detectImageInte
       }
       // Nouvelle logique : variables d'environnement et robustesse
       const enableSd = String(process.env.ENABLE_SD || '').toLowerCase() === 'true';
-      if (!enableSd) {
+      const isAdmin = typeof isAdminRequest === 'function' ? isAdminRequest(req) : false;
+      if (!enableSd && !isAdmin) {
         return res.status(503).json({ ok: false, error: 'sd_disabled', message: 'Stable Diffusion désactivé sur cet environnement' });
       }
       const scriptPath = String(process.env.SD_SCRIPT_PATH || '').trim();
