@@ -20,13 +20,6 @@ app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
     console.error('[A11][admin/run] error:', e?.message);
     return res.status(500).json({ ok: false, error: String(e?.message) });
   }
-    } catch (e) {
-      console.error('[A11][admin/run] error:', e?.message);
-      return res.status(500).json({ ok: false, error: String(e?.message) });
-    }
-    // ...existing code...
-    // (Fixed malformed log statement or removed if not needed)
-    // ...existing code...
 });
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
