@@ -24,6 +24,9 @@ app.post('/api/admin/run', express.json({ limit: '2mb' }), async (req, res) => {
 const { createFileStorage } = require('./lib/file-storage.cjs');
 const fileStorage = createFileStorage(require('./config/r2-config.cjs'));
 
+// Slack notification dashboard
+const { safeSlack, SlackDashboard } = require('./utils/slackNotify');
+
 
 // --- Dépendances OpenAI ---
 let OpenAI;
