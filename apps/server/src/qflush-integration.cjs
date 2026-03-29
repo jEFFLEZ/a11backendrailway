@@ -473,9 +473,9 @@ async function initQflush(options = {}) {
  */
 function getQflushRemoteToken() {
   return String(
-    process.env.QFLUSH_TOKEN ||
-    process.env.QFLUSH_REMOTE_TOKEN ||
-    process.env.NPZ_ADMIN_TOKEN ||
+    process.env.NEZ_ADMIN_TOKEN ||
+    process.env.NEZ_TOKENS ||
+    process.env.NEZ_ALLOWED_TOKEN ||
     ''
   ).trim();
 }
